@@ -832,8 +832,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             config.hidden_size,
             bias=False,
             dtype=config.torch_dtype,
-            skip_create_weights_in_init=model_config.
-            skip_create_weights_in_init,
+            skip_create_weights=model_config.skip_create_weights,
         )
 
         self.shared_head = DeepseekV3MTPHead(model_config)
