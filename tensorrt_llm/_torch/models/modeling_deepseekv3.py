@@ -1206,12 +1206,17 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
 
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
         all_named_modules = dict(self.named_modules())
+        # new_modules = OrderedDict()
 
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
             if len(module._parameters) > 0:
                 names = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
+                if "model.layers.0.self_attn.o_proj" in name:
+                    print(f"Loading weights for {name}")
+                if "model.layers.0.mlp.gate_up_proj" in name:
+                    print(f"Loading weights for {name}")
                 if "model.layers" in name and int(
                         names[2]) >= self.config.num_hidden_layers:
                     mtp_layer_idx = int(
@@ -1297,6 +1302,24 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                     continue
                 elif names[-1] == "next_layer_layernorm":
                     continue
+                elif names[-1] == "o_proj":
+                    print(f"Skipping weights for {name}")
+                    continue
+                    # def create_weights(prefix, weights: Dict, scale):
+                    #     result = {}
+                    #     for k, v in weights.items():
+                    #         if k.startswith(prefix):
+                    #             new_k = k[len(prefix) + 1:]
+                    #             new_shape = v.shape
+                    #             new_shape[1] /= scale
+                    #             result[new_k] = torch.ones(v.shape, dtype=torch.uint8)
+                    #     return result
+                    # module_weights = create_weights(name, weights, 2)
+                    # if hasattr(module, 'load_weights'):
+                    #     module.load_weights(weights=[module_weights])
+                    # else:
+                    #     for n, p in module.named_parameters():
+                    #         p.data.copy_(module_weights[n][:])
                 else:
                     module_weights = filter_weights(name, weights)
                     if hasattr(module, 'load_weights'):
@@ -1304,6 +1327,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                     else:
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
+                # new_modules[name] = module
 
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
@@ -1313,3 +1337,4 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 # layers[idx + 1] is MissingLayer for last layer in pp rank
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+        # self._modules = new_modules
