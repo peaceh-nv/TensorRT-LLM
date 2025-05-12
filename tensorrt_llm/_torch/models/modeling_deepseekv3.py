@@ -1297,6 +1297,9 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                     continue
                 elif names[-1] == "next_layer_layernorm":
                     continue
+                elif names[-1] == "o_proj":
+                    print(f"Skipping weights for {name}")
+                    continue
                 else:
                     module_weights = filter_weights(name, weights)
                     if hasattr(module, 'load_weights'):

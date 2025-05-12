@@ -7,11 +7,12 @@ import math
 import os
 import traceback
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Any, Dict, Optional, Tuple
 
 import safetensors
 import torch
+from tqdm import tqdm
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
@@ -773,6 +774,39 @@ class PyTorchModelEngine(ModelEngine):
         # Release model weights.
         release_gc()
 
+    def create_weights(self, prefix, weights: Dict):
+        result = {}
+        new_shape = []
+        new_scale_shape = []
+        for k, v in weights.items():
+            if k.startswith(prefix):
+                new_shape = list(v.shape)
+                new_shape[1] = new_shape[1] // 2
+                new_scale_shape = list(v.shape)
+                new_scale_shape[1] = new_scale_shape[1] // 16
+        result['weight'] = torch.ones(new_shape, dtype=torch.uint8)
+        result['weight_scale'] = torch.ones(new_scale_shape,
+                                            dtype=torch.float8_e4m3fn)
+        result['input_scale'] = torch.tensor(0.0003)
+        result['weight_scale_2'] = torch.tensor(0.0002)
+        return result
+
+    def refresh_model(self, model: torch.nn.Module, weights: Dict):
+        all_named_modules = dict(model.named_modules())
+        new_modules = OrderedDict()
+
+        for name, module in tqdm(all_named_modules.items(),
+                                 desc="Loading weights"):
+            names = name.split('.')
+            if names[-1] == "o_proj":
+                module_weights = self.create_weights(name, weights)
+                module.load_weights(weights=[module_weights])
+                new_modules[name] = module
+
+            else:
+                new_modules[name] = module
+        model._modules = new_modules
+
     def _load_model(self,
                     checkpoint_dir: str,
                     load_format: LoadFormat,
@@ -827,8 +861,11 @@ class PyTorchModelEngine(ModelEngine):
                     weights = load_weights(model.llm_checkpoint_dir)
                 else:
                     weights = load_weights(checkpoint_dir)
-
+                # if self.mapping.rank == 0:
+                #     for k, v in weights.items():
+                #         print(f"{k} : dtype {v.dtype} shape {v.shape}")
                 model.load_weights(weights)
+                self.refresh_model(model, weights)
 
             elif load_format == LoadFormat.DUMMY:
                 initialize_dummy_weights(model)
