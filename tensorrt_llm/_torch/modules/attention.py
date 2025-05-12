@@ -1007,7 +1007,8 @@ class MLA(nn.Module):
             attention_input_type=AttentionInputType.generation_only,
             out_scale=out_scale,
             latent_cache=latent_cache,  # kvcache and k_pe
-            q_pe=q_pe,  # used by `invokeMLARopeGeneration`
+            q_pe=q_pe.clone(memory_format=torch.contiguous_format
+                            ),  # used by `invokeMLARopeGeneration`
         )
         fused_q = None
 
