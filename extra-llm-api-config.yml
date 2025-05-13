@@ -1,4 +1,6 @@
 pytorch_backend_config:
+    moe_backend: "CUTLASS"
+    kv_cache_dtype: "fp8"
     use_cuda_graph: true
     cuda_graph_padding_enabled: true
     cuda_graph_batch_sizes:
@@ -11,7 +13,7 @@ pytorch_backend_config:
     - 64
     print_iter_log: true
     enable_overlap_scheduler: true
-    moe_max_num_tokens: 256
+    moe_max_num_tokens: 512
 enable_attention_dp: true
 # speculative_config:
 #     decoding_type: MTP
