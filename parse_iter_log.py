@@ -4,7 +4,8 @@ import re
 def parse_log(file: str, concurrency: int, enable_dp: bool, gpu_num: int = 8):
     batch_per_gpu = concurrency // gpu_num if enable_dp else concurrency
     pattern = re.compile(
-        f"elapsed_time = (.+?)s.+'num_generation_tokens': {batch_per_gpu}")
+        f"elapsed_time = (.+?)s.+num_scheduled_requests: {batch_per_gpu}.+'num_generation_tokens': {batch_per_gpu}"
+    )
     time_list = []
     with open(file, 'r') as f:
         skip = True  # only collect continuous pure-generation iterations
