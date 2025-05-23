@@ -2367,8 +2367,8 @@ int AttentionOp::initialize() noexcept
     if (mIsMLAEnabled)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "MLA(Deepseek v2) only support fmha");
-        TLLM_CHECK_WITH_INFO(
-            !mFP8ContextFMHA && !mDenseContextFMHA, "MLA(Deepseek v2) currently not support FP8 and dense fmha");
+        // TLLM_CHECK_WITH_INFO(
+        //     !mFP8ContextFMHA && !mDenseContextFMHA, "MLA(Deepseek v2) currently not support FP8 and dense fmha");
         TLLM_CHECK_WITH_INFO(
             mPagedKVCache && mUseKVCache && mRemovePadding, "MLA(Deepseek v2) only support paged kv cache");
         TLLM_CHECK_WITH_INFO(!mCrossAttention, "MLA(Deepseek v2) do not support cross attention right now");
@@ -2439,6 +2439,11 @@ int AttentionOp::initialize() noexcept
             // For FP8 MLA, currently context attention is performed in BF16.
             fmhaParams.dataTypeOut = DATA_TYPE_BF16;
             fmhaParams.dataTypeKv = DATA_TYPE_BF16;
+        }
+        std::cout << "mKVCacheQuantMode.hasFp8KvCache(): " << mKVCacheQuantMode.hasFp8KvCache() << std::endl;
+        if (mFP8ContextFMHA && mKVCacheQuantMode.hasFp8KvCache())
+        {
+            fmhaParams.dataTypeKv = DATA_TYPE_E4M3;
         }
         // TODO: remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
         // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.

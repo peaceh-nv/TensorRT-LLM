@@ -191,6 +191,7 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
         size_t const seq_len_loop_end
             = size_t((max_input_seq_len + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK;
         float quant_scale_kv_val = quant_scale_kv ? quant_scale_kv[0] : 1.f;
+        // float quant_scale_qkv_val = quant_scale_qkv ? quant_scale_qkv[0] : 1.f;
 
         // Mainloop.
         for (int local_token_idx = (threadIdx.x / VECS_PER_HEAD) + blockIdx.x * TOKENS_PER_BLOCK;
@@ -267,8 +268,18 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
                 auto const dst_k_idx
                     = static_cast<size_t>(global_token_idx) * head_num * ((head_size + ROPE_DIM) * 2 + head_size)
                     + head_num * (head_size + ROPE_DIM) + head_idx * (head_size + ROPE_DIM) + head_size + head_dim_idx;
+                // if (cache_type == KvCacheDataType::FP8 && quant_qkv_output)
+                // {
+                //     quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(quant_qkv_output) + dst_q_idx,
+                //         reinterpret_cast<T const*>(&q), quant_scale_qkv_val);
+                //     quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(quant_qkv_output) + dst_k_idx,
+                //         reinterpret_cast<T const*>(&k), quant_scale_qkv_val);
+                // }
+                // else
+                // {
                 reinterpret_cast<VecT*>(qkv_output)[dst_q_idx / ELTS_PER_VEC] = q;
                 reinterpret_cast<VecT*>(qkv_output)[dst_k_idx / ELTS_PER_VEC] = k;
+                // }
             }
         }
     }

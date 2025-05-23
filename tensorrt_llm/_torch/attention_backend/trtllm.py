@@ -813,7 +813,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     or self.has_fp8_block_wise) and self.has_fp8_kv_cache:
                 # TODO(qijun): revisit fp8_context_fmha logic
                 out_dtype = torch.float8_e4m3fn
-
+        if self.is_mla_enable and attention_input_type == AttentionInputType.context_only and self.has_fp8_kv_cache:
+            out_dtype = torch.float8_e4m3fn
         output = self.wrapper.run(q,
                                   k,
                                   v,
@@ -823,6 +824,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                   update_kv_cache=not metadata.is_cross
                                   or k is not None,
                                   attention_mask=attention_mask)
+        # torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor
+        # if out_dtype == torch.float8_e4m3fn:
+        #     s = torch.tensor({1.0}, dtype=torch.float32, device='cuda')
+        #     output = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(output, s)
         return output
 
     @classmethod

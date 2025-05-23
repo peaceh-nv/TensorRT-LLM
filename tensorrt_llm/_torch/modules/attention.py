@@ -765,6 +765,9 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        print(
+            f"compressed_kv.shape: {compressed_kv.shape}, compressed_kv.dtype: {compressed_kv.dtype} in forward_context_default"
+        )
         kv = self.kv_b_proj(compressed_kv)
         k_nope, v = kv.split(
             [
@@ -787,7 +790,20 @@ class MLA(nn.Module):
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Currently we use BF16 MHA for context phase
+        # input_scale = torch.tensor(1., dtype=torch.float32, device=q.device)
+        # q, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+        #     q, input_scale)
 
+        print(f"q.shape: {q.shape} in forward_context_default")
+        if k is not None:
+            print(f"k.shape: {k.shape} in forward_context_default")
+        if v is not None:
+            print(f"v.shape: {v.shape} in forward_context_default")
+        print(f"q.dtype: {q.dtype} in forward_context_default")
+        if k is not None:
+            print(f"k.dtype: {k.dtype} in forward_context_default")
+        if v is not None:
+            print(f"v.dtype: {v.dtype} in forward_context_default")
         attn_output = self.mha.forward(
             q,
             k,

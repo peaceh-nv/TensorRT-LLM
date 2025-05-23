@@ -12,9 +12,8 @@ pytorch_backend_config:
     - 32
     - 64
     print_iter_log: true
-    enable_overlap_scheduler: true
-    moe_max_num_tokens: 512
+    moe_max_num_tokens: 3072
 enable_attention_dp: true
 # speculative_config:
 #     decoding_type: MTP
-#     num_nextn_predict_layers: 3
+#     num_nextn_predict_layers: 1

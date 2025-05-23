@@ -87,6 +87,8 @@ struct MlaParams
     void* context_paged_kv_ptr = nullptr;
     void* context_kv_cache_block_offsets_ptr = nullptr;
     int32_t context_paged_kv_max_blocks_per_seq = 0;
+
+    // float const* quant_scale_qkv = nullptr;
 };
 
 template <typename T, typename KVCacheBuffer>
