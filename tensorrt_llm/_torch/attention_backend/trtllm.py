@@ -393,6 +393,10 @@ class TrtllmAttentionWrapper:
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
+        # if out_dtype == torch.float8_e4m3fn:
+        #     flat_tensor = output.flatten()
+        #     s = torch.ones(1, dtype=torch.float32, device='cuda')
+        #     output = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(output, s)
         return output
 
 
@@ -824,10 +828,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                   update_kv_cache=not metadata.is_cross
                                   or k is not None,
                                   attention_mask=attention_mask)
-        # torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor
-        # if out_dtype == torch.float8_e4m3fn:
-        #     s = torch.tensor({1.0}, dtype=torch.float32, device='cuda')
-        #     output = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(output, s)
+        if out_dtype == torch.float8_e4m3fn:
+            s = torch.ones((1, 1), dtype=torch.bfloat16, device='cuda')
+            # s = (output.flatten().float().abs().max().view(1, 1) /
+            #      torch.finfo(torch.float8_e4m3fn).max).to(torch.bfloat16)
+            output_fp16 = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(
+                output, s)
+            return output_fp16
         return output
 
     @classmethod
