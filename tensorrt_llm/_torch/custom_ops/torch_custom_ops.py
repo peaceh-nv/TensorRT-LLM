@@ -131,7 +131,7 @@ def fused_moe(
     tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
 
-    tuner = AutoTuner.get()
+    AutoTuner.get()
 
     tune_num_tokens_list = []
     tune_num_tokens = next_positive_power_of_2(tune_max_num_tokens)
@@ -147,7 +147,7 @@ def fused_moe(
     ))
 
     # TODO: set min_latency_mode always to False due to the error in the moe_kernels
-    min_latency_tensor = torch.empty(0)
+    torch.empty(0)
 
     # allocate workspace for profiling
     moe_runner = MoERunner(
@@ -165,21 +165,23 @@ def fused_moe(
         use_w4a8_group_scaling=use_w4a8_group_scaling,
     )
 
-    _, gemm_tactic_1 = tuner.choose_one(
-        "trtllm::fused_moe::gemm1",
-        [moe_runner],
-        tuning_config,
-        [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
-        gemm_idx=1,
-    )
+    # _, gemm_tactic_1 = tuner.choose_one(
+    #     "trtllm::fused_moe::gemm1",
+    #     [moe_runner],
+    #     tuning_config,
+    #     [input, fc2_expert_weights, min_latency_tensor],
+    #     gemm_idx=1,
+    # )
 
-    _, gemm_tactic_2 = tuner.choose_one(
-        "trtllm::fused_moe::gemm2",
-        [moe_runner],
-        tuning_config,
-        [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
-        gemm_idx=2,
-    )
+    # _, gemm_tactic_2 = tuner.choose_one(
+    #     "trtllm::fused_moe::gemm2",
+    #     [moe_runner],
+    #     tuning_config,
+    #     [input, fc2_expert_weights, min_latency_tensor],
+    #     gemm_idx=2,
+    # )
+    gemm_tactic_1 = 0
+    gemm_tactic_2 = 0
 
     run_moe = moe_runner._fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner._fused_moe_runner.run_moe
     output = run_moe(

@@ -198,22 +198,30 @@ public:
         // Commonly, cyclic_attention_window_size, and max_attention_window_size will be the same
         // unless each layer has different attention window sizes.
         // the kv_cache capacity.
-        int const max_attention_window_size
-            = beam_width == 1 ? attention_window_size : cache_indirection.value().size(2);
+        int const max_attention_window_size = beam_width == 1 ? attention_window_size
+            : cache_indirection.has_value()                   ? cache_indirection.value().size(2)
+                                                              : attention_window_size;
         // The cyclic_attention_window_size will determine the cyclic kv cache position of new tokens.
         // Note that this cyclic_attention_window_size might be smaller than the actual kv cache capactity.
         int const cyclic_attention_window_size = attention_window_size;
         bool const can_use_one_more_block = beam_width > 1;
 
-        int max_blocks_per_sequence = op.useKVCache() ? kv_cache_block_offsets.value().size(-1) : 0;
-        int32_t const pool_index
-            = op.useKVCache() ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 0}).item<int32_t>() : 0;
-        int32_t const layer_idx_in_cache_pool
-            = op.useKVCache() ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 1}).item<int32_t>() : 0;
-        KVBlockArray::DataType* block_offsets = static_cast<KVBlockArray::DataType*>(
-            op.useKVCache() ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr() : nullptr);
-        KVBlockArray::DataType* host_block_offsets = static_cast<KVBlockArray::DataType*>(
-            op.useKVCache() ? host_kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr() : nullptr);
+        int max_blocks_per_sequence
+            = op.useKVCache() && kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
+        int32_t const pool_index = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
+            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 0}).item<int32_t>()
+            : 0;
+        int32_t const layer_idx_in_cache_pool = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
+            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 1}).item<int32_t>()
+            : 0;
+        KVBlockArray::DataType* block_offsets
+            = static_cast<KVBlockArray::DataType*>(op.useKVCache() && kv_cache_block_offsets.has_value()
+                    ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
+                    : nullptr);
+        KVBlockArray::DataType* host_block_offsets
+            = static_cast<KVBlockArray::DataType*>(op.useKVCache() && host_kv_cache_block_offsets.has_value()
+                    ? host_kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
+                    : nullptr);
 
         auto const cache_elem_size = (op.mKVCacheQuantMode.hasKvCacheQuant() ? 1 : sizeof(T));
         auto const block_size = op.mTokensPerBlock * op.mNumKVHeads * op.mHeadSize;
@@ -221,12 +229,12 @@ public:
         int32_t const kv_factor = op.isMLAEnabled() ? 1 : 2;
         auto const intra_pool_offset = layer_idx_in_cache_pool * kv_factor * bytes_per_block;
 
-        void* host_primary_pool_pointer = op.useKVCache()
+        void* host_primary_pool_pointer = op.useKVCache() && host_kv_cache_pool_pointers.has_value()
             ? reinterpret_cast<void*>(
                 reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>())
                 + intra_pool_offset)
             : nullptr;
-        void* host_secondary_pool_pointer = op.useKVCache()
+        void* host_secondary_pool_pointer = op.useKVCache() && host_kv_cache_pool_pointers.has_value()
             ? reinterpret_cast<void*>(
                 reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1}).item<int64_t>())
                 + intra_pool_offset)
@@ -234,12 +242,19 @@ public:
 
         float const* kv_scale_orig_quant_ptr = nullptr;
         float const* kv_scale_quant_orig_ptr = nullptr;
-        if (op.mKVCacheQuantMode.hasKvCacheQuant())
+        if (op.mKVCacheQuantMode.hasKvCacheQuant() && kv_scale_orig_quant.has_value()
+            && kv_scale_quant_orig.has_value())
         {
             kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
             kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
         }
-        float const* out_scale_ptr = op.mFP8ContextFMHA ? out_scale.value().data_ptr<float>() : nullptr;
+        // std::cout << "out_scale.has_value() : " << out_scale.has_value() << std::endl;
+        if (!out_scale.has_value())
+        {
+            out_scale = torch::tensor({1.0}, at::TensorOptions().dtype(torch::kFloat32).device(qkv.device()));
+        }
+        float const* out_scale_ptr
+            = op.mFP8ContextFMHA && out_scale.has_value() ? out_scale.value().data_ptr<float>() : nullptr;
 
         AttentionOp::EnqueueParams<T> common_enqueue_params;
         common_enqueue_params.attention_input = attention_input;
@@ -283,6 +298,7 @@ public:
                     = static_cast<float2 const*>(mrope_rotary_cos_sin.value().data_ptr());
             }
             op.enqueueContext<T, KVBlockArray>(enqueue_params, stream);
+            // std::cout << "enqueueContext done" << std::endl;
         }
         else // generation stage
         {
@@ -432,6 +448,12 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
         }
     }
 #endif
+    // #ifdef ENABLE_FP8
+    //     else if (dtype == nvinfer1::DataType::kFP8)
+    //     {
+    //         runner.reset(new Runner<__nv_fp8_e4m3, __nv_bfloat16>());
+    //     }
+    // #endif
     runner->beam_width = beam_width;
     runner->max_num_requests = max_num_requests;
     runner->attention_window_size = attention_window_size;
@@ -440,6 +462,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     auto op = std::make_shared<AttentionOp>();
     op->mType = dtype;
     op->mFMHAForceFP32Acc = dtype == nvinfer1::DataType::kBF16;
+    // op->mFP8ContextFMHA = true;
     op->mFP8ContextFMHA = is_fp8_out;
     op->mLayerIdx = layer_idx;
     op->mNumHeads = num_heads;

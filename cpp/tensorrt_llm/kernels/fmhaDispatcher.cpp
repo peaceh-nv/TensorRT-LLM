@@ -55,6 +55,8 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     }
     else
     {
+        // std::cout << "mFixedParams.dataType: " << mFixedParams.dataType << std::endl;
+        // std::cout << "mFixedParams.dataTypeKv: " << mFixedParams.dataTypeKv << std::endl;
         TLLM_CHECK_WITH_INFO(mFixedParams.dataType == mFixedParams.dataTypeKv,
             "KV cache data type should be the same as input data type.");
 

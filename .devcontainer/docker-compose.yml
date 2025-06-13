@@ -20,6 +20,7 @@ services:
             - driver: nvidia
               count: "all"
               capabilities: [gpu]
+              # device_ids: ['5']
 
     volumes:
       - ..:/workspaces/tensorrt_llm:cached

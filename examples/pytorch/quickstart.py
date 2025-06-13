@@ -5,9 +5,9 @@ from tensorrt_llm._torch import LLM
 def main():
     prompts = [
         "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
+        # "The president of the United States is",
+        # "The capital of France is",
+        # "The future of AI is",
     ]
     sampling_params = SamplingParams(max_tokens=32)
 

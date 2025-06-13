@@ -427,6 +427,13 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 device=device,
             ).uniform_(-1, 1) for ctx_len in context_sequence_lengths
         ])
+        # ctx_q = torch.cat([
+        #     torch.empty(
+        #         [ctx_len, num_heads * qk_head_dim],
+        #         dtype=dtype,
+        #         device=device,
+        #     ).uniform_(-1, 1) for ctx_len in context_sequence_lengths
+        # ])
         ctx_q = torch.cat([
             torch.empty(
                 [ctx_len, num_heads * qk_head_dim],

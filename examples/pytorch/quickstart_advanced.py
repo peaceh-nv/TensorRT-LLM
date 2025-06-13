@@ -7,9 +7,9 @@ from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
 
 example_prompts = [
     "Hello, my name is",
-    "The president of the United States is",
-    "The capital of France is",
-    "The future of AI is",
+    # "The president of the United States is",
+    # "The capital of France is",
+    # "The future of AI is",
 ]
 
 
@@ -175,6 +175,7 @@ def setup_llm(args):
               moe_tensor_parallel_size=args.moe_tp_size,
               moe_cluster_parallel_size=args.moe_cluster_size,
               enable_chunked_prefill=args.enable_chunked_prefill,
+              tensor_parallel_size=args.tp_size,
               speculative_config=spec_config)
 
     sampling_params = SamplingParams(
