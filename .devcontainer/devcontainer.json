@@ -6,7 +6,7 @@
         "docker-compose.yml"
       ],
       "service": "tensorrt_llm-dev",
-      "remoteUser": "ubuntu",
+      "remoteUser": "tensorrt_llm",
       "containerEnv": {
         // "CCACHE_DIR" : "/home/coder/${localWorkspaceFolderBasename}/cpp/.ccache",
         // "CCACHE_BASEDIR" : "/home/coder/${localWorkspaceFolderBasename}",
@@ -18,8 +18,14 @@
       // "workspaceFolder": "/home/coder/${localWorkspaceFolderBasename}",
       // "workspaceMount": "source=${localWorkspaceFolder},target=/home/coder/${localWorkspaceFolderBasename},type=bind,consistency=consistent",
       "mounts": [
-        "source=${localEnv:HOME}/.cache/huggingface,target=/huggingface,type=bind", // HF cache
-        "source=/home/scratch.trt_llm_data/,target=/home/scratch.trt_llm_data/,type=bind,consistency=consistent"
+                "source=${localEnv:HOME}/.cache/huggingface,target=/huggingface,type=bind",
+                "source=/home/scratch.trt_llm_data/,target=/home/scratch.trt_llm_data/,type=bind,consistency=consistent,readonly",
+                "source=/home/scratch.weimingc_sw/models/,target=/home/scratch.weimingc_sw/models/,type=bind,consistency=consistent,readonly",
+                "source=/home/peaceh/.ssh,target=/home/tensorrt_llm/.ssh,type=bind,consistency=consistent",
+                "source=/home/peaceh/.gitconfig,target=/home/tensorrt_llm/.gitconfig,type=bind,consistency=consistent",
+                "source=/home/scratch.peaceh_inf_1/storage,target=/home/tensorrt_llm/storage,readonly,type=bind,consistency=consistent",
+                // "source=/home/scratch.kduan_sw/TensorRT-LLM-github/tensorrt_llm,target=/home/scratch.kduan_sw/TensorRT-LLM-github/tensorrt_llm,type=bind,consistency=consistent",
+                // "source=/home/scratch.crush_data/,target=/home/scratch.crush_data/,type=bind,consistency=consistent,readonly"
       ],
       // Note: sourcing .profile is required since we use a local user and the python interpreter is
       // global (/usr/bin/python). In this case, pip will default to a local user path which is not
@@ -57,15 +63,14 @@
             // "clang-format.executable": "/usr/local/bin/clang-format",
             "clangd.arguments": [
               // "--compile-commands-dir=${workspaceFolder}/cpp/build_RelWithDebInfo"
-              "--compile-commands-dir=${workspaceFolder}/cpp/build"
-            ],
-            "python.defaultInterpreterPath": "/usr/bin/python"
+              "--compile-commands-dir=${workspaceFolder}"
+            ]
           }
         }
       },
       "features": {
         "ghcr.io/devcontainers/features/common-utils:2": {
-          "username": "ubuntu",
+          "username": "tensorrt_llm",
           "installZsh": true,
           "installOhMyZsh": true,
           "configureZshAsDefaultShell": true,

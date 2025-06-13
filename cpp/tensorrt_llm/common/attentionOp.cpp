@@ -16,6 +16,7 @@
  */
 #include "attentionOp.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -23,6 +24,7 @@
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -723,9 +725,12 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     size_t const qkv_buf_2_size = mEnableContextFMHA ? 0 : size * max_num_tokens * local_hidden_units_qo;
     size_t const qk_buf_float_size
         = mEnableContextFMHA ? 0 : sizeof(float) * batch_size * mNumHeads * input_seq_length * kv_seq_length;
+    // std::cout << "max_num_tokens : " << max_num_tokens << std::endl;
+    // std::cout << "local_hidden_units_qo : " << local_hidden_units_qo << std::endl;
+    // std::cout << "local_hidden_units_kv : " << local_hidden_units_kv << std::endl;
     size_t const fp8_qkv_buffer_size
         = mFP8ContextFMHA && mEnableContextFMHA && !mFmhaDispatcher->isSeparateQAndKvInput()
-        ? max_num_tokens * size_t(local_hidden_units_qo + 2 * local_hidden_units_kv)
+        ? max_num_tokens * size_t(local_hidden_units_qo + 2 * local_hidden_units_kv) * 2
         : 0;
     size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * max_num_tokens;
     size_t const encoder_padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * max_num_tokens;
@@ -764,7 +769,27 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     workspaces[18] = fmha_bmm2_scale_size;
     workspaces[19] = cpWorkspaceSize;
     context_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
-
+    // std::cout << "CUBLAS_WORKSPACE_SIZE : " << workspaces[0] << std::endl;
+    // std::cout << "attention_mask_size : " << workspaces[1] << std::endl;
+    // std::cout << "cu_seqlens_size : " << workspaces[2] << std::endl;
+    // std::cout << "cu_seqlens_size : " << workspaces[3] << std::endl;
+    // std::cout << "cu_seqlens_size : " << workspaces[4] << std::endl;
+    // std::cout << "rotary_inv_freq_size : " << workspaces[5] << std::endl;
+    // std::cout << "q_buf_2_size : " << workspaces[6] << std::endl;
+    // std::cout << "k_buf_2_size : " << workspaces[7] << std::endl;
+    // std::cout << "v_buf_2_size : " << workspaces[8] << std::endl;
+    // std::cout << "qk_buf_size : " << workspaces[9] << std::endl;
+    // std::cout << "qkv_buf_2_size : " << workspaces[10] << std::endl;
+    // std::cout << "qk_buf_float_size : " << workspaces[11] << std::endl;
+    // std::cout << "fp8_qkv_buffer_size : " << workspaces[12] << std::endl;
+    // std::cout << "padding_offset_size : " << workspaces[13] << std::endl;
+    // std::cout << "encoder_padding_offset_size : " << workspaces[14] << std::endl;
+    // std::cout << "tokens_info_size : " << workspaces[15] << std::endl;
+    // std::cout << "fmha_scheduler_counter : " << workspaces[16] << std::endl;
+    // std::cout << "fmha_bmm1_scale_size : " << workspaces[17] << std::endl;
+    // std::cout << "fmha_bmm2_scale_size : " << workspaces[18] << std::endl;
+    // std::cout << "cpWorkspaceSize : " << workspaces[19] << std::endl;
+    // std::cout << "context_workspace_size : " << context_workspace_size << std::endl;
     return context_workspace_size;
 }
 
@@ -1335,6 +1360,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         = mEnableContextFMHA && mFP8ContextFMHA && !mFmhaDispatcher->isSeparateQAndKvInput()
         ? params.num_tokens * (local_hidden_units_qo + 2 * local_hidden_units_kv)
         : 0;
+    // std::cout << "fp8_qkv_buffer_size : " << fp8_qkv_buffer_size << std::endl;
+    // std::cout << "params.num_tokens : " << params.num_tokens << std::endl;
+    // std::cout << "local_hidden_units_qo : " << local_hidden_units_qo << std::endl;
+    // std::cout << "local_hidden_units_kv : " << local_hidden_units_kv << std::endl;
     size_t const padding_offset_size
         = mEnableContextFMHA ? 0 : sizeof(int) * params.batch_size * params.input_seq_length;
     size_t const encoder_padding_offset_size
@@ -1590,6 +1619,15 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             params.mla_param->cache_type = cache_type;
             params.mla_param->cu_q_seqlens = cu_q_seqlens;
             params.mla_param->quant_scale_kv = params.kv_scale_orig_quant;
+            // Set BMM scales for FP8 context computation
+            params.mla_param->bmm1_scale = fmha_bmm1_scale_ptr;
+            params.mla_param->bmm2_scale = fmha_bmm2_scale_ptr;
+            params.mla_param->host_bmm1_scale = decoder_params.fmhaHostBmm1Scale;
+            params.mla_param->quant_attention_input_buf = fp8_qkv_buffer;
+            // Set additional scales for context phase
+            params.mla_param->quant_scale_o = params.attention_output_orig_quant;
+            params.mla_param->dequant_scale_q = params.kv_scale_quant_orig;
+            params.mla_param->dequant_scale_kv = params.kv_scale_quant_orig;
             if (mPagedContextFMHA && mPagedKVCache)
             {
                 TLLM_CHECK_WITH_INFO(params.mla_param->context_paged_kv_ptr != nullptr,
@@ -1620,6 +1658,30 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             {
                 // compute RoPE and set compressed_kv + k_pe by invokeMLARopeContext if not using paged context FMHA
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
+
+                // Check for invalid numbers in fp8_qkv_buffer after MLA RoPE Context
+                if (mFP8ContextFMHA && fp8_qkv_buffer != nullptr)
+                {
+                    std::string const afterMLARopeStr
+                        = "MLA ctx attention fp8_qkv_buffer after RoPE at layer " + std::to_string(mLayerIdx);
+                    std::cout << "params.num_tokens: " << params.num_tokens << std::endl;
+                    std::cout << "local_hidden_units_qo: " << local_hidden_units_qo << std::endl;
+                    std::cout << "local_hidden_units_kv: " << local_hidden_units_kv << std::endl;
+                    int const dim_q_per_head
+                        = (params.mla_param->meta.qk_nope_head_dim + params.mla_param->meta.qk_rope_head_dim);
+                    int const dim_k_per_head
+                        = (params.mla_param->meta.qk_nope_head_dim + params.mla_param->meta.qk_rope_head_dim);
+                    int const dim_v_per_head = (params.mla_param->meta.v_head_dim);
+                    int const total_q_dim_all_heads = params.mla_param->head_num * dim_q_per_head;
+                    int const total_k_dim_all_heads = params.mla_param->head_num
+                        * dim_k_per_head; // Assuming effective num_kv_heads = head_num for layout
+                    int const total_v_dim_all_heads = params.mla_param->head_num
+                        * dim_v_per_head; // Assuming effective num_kv_heads = head_num for layout
+                    bool result = tensorrt_llm::runtime::utils::tensorHasInvalid(params.num_tokens,
+                        (total_q_dim_all_heads + total_k_dim_all_heads + total_v_dim_all_heads),
+                        nvinfer1::DataType::kFP8, fp8_qkv_buffer, stream, afterMLARopeStr);
+                    std::cout << "check result for fp8_qkv_buffer after MLA RoPE Context: " << result << std::endl;
+                }
             }
         }
         else
@@ -1671,6 +1733,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.qkvPtr = mFP8ContextFMHA ? reinterpret_cast<void const*>(fp8_qkv_buffer)
                                             : reinterpret_cast<void const*>(attention_input);
         fmhaParams.qPtr = reinterpret_cast<void const*>(q_buf_2_);
+        // fmhaParams.qPtr = mFP8ContextFMHA ? reinterpret_cast<void const*>(params.quant_attention_input_buf)
+        //                             : reinterpret_cast<void const*>(params.q_buf_2_);
         // TODO: add contiguous kv buffer (cross-attention).
         fmhaParams.kvPtr = nullptr;
         if (isCrossAttention() && !useKVCache())
@@ -2432,8 +2496,7 @@ int AttentionOp::initialize() noexcept
     if (mIsMLAEnabled)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "MLA(Deepseek v2) only support fmha");
-        TLLM_CHECK_WITH_INFO(
-            !mFP8ContextFMHA && !mDenseContextFMHA, "MLA(Deepseek v2) currently not support FP8 and dense fmha");
+        TLLM_CHECK_WITH_INFO(!mDenseContextFMHA, "MLA(Deepseek v2) currently not support dense fmha");
         TLLM_CHECK_WITH_INFO(
             mPagedKVCache && mUseKVCache && mRemovePadding, "MLA(Deepseek v2) only support paged kv cache");
         TLLM_CHECK_WITH_INFO(!mCrossAttention, "MLA(Deepseek v2) do not support cross attention right now");
@@ -2501,9 +2564,15 @@ int AttentionOp::initialize() noexcept
         }
         if (mIsMLAEnabled)
         {
-            // For FP8 MLA, currently context attention is performed in BF16.
+            // For non-FP8 MLA, context attention is performed in BF16.
             fmhaParams.dataTypeOut = DATA_TYPE_BF16;
             fmhaParams.dataTypeKv = DATA_TYPE_BF16;
+        }
+        // std::cout << "mKVCacheQuantMode.hasFp8KvCache(): " << mKVCacheQuantMode.hasFp8KvCache() << std::endl;
+        if (mFP8ContextFMHA && mKVCacheQuantMode.hasFp8KvCache())
+        {
+            fmhaParams.dataTypeKv = DATA_TYPE_E4M3;
+            fmhaParams.dataTypeOut = DATA_TYPE_E4M3;
         }
         // TODO: remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
         // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
@@ -2558,7 +2627,7 @@ int AttentionOp::initialize() noexcept
         // Deepseek-V2 Generation needs a differ fmha with different argumments
         if (mIsMLAEnabled)
         {
-            mEnableXQA = (mSM == kSM_120);
+            mEnableXQA = (mSM == kSM_120) && !mFP8ContextFMHA;
             if (mUseTllmGen)
             {
                 Data_type qDataType = DATA_TYPE_FP32;

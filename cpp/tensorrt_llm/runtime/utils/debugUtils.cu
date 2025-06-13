@@ -43,6 +43,7 @@ __global__ void checkTensorInvalidKernel(T const* data, std::size_t size, int* f
         auto value = static_cast<float>(data[idx]);
         if (isnan(value) || isinf(value))
         {
+            // printf("found invalid number at index %d: %f\n", idx, value);
             found = 1;
             break;
         }
