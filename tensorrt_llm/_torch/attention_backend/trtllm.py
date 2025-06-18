@@ -893,10 +893,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         #                           update_kv_cache=not metadata.is_cross
         #                           or k is not None,
         #                           attention_mask=attention_mask)
-        # flat_tensor = q.flatten()
-        # print(f"q.shape : {q.shape}")
-        # print(f"q first 100 elements : {flat_tensor[:100]}")
-        # print(f"q last 100 elements : {flat_tensor[-100:]}")
+        flat_tensor = q.flatten()
+        print(f"q.shape : {q.shape}")
+        print(f"q first 100 elements : {flat_tensor[:100]}")
+        print(f"q last 100 elements : {flat_tensor[-100:]}")
         # flat_tensor = output.flatten()
         # print(f"output first 100 elements after attention: {flat_tensor[:100]}")
         # print(f"output last 100 elements after attention: {flat_tensor[-100:]}")
@@ -928,12 +928,18 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             #      torch.finfo(torch.float8_e4m3fn).max).to(torch.bfloat16)
             output_fp16 = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(
                 output_act, s)
-            # flat_tensor = output_fp16.flatten()
-            # print(f"output_fp16 first 100 elements : {flat_tensor[:100]}")
+            flat_tensor = output_fp16.flatten()
+            print(f"output_fp16 shape : {output_fp16.shape}")
+            print(f"output_fp16 first 100 elements : {flat_tensor[:100]}")
+            print(f"output_fp16 last 100 elements : {flat_tensor[-100:]}")
             return output_fp16
 
         if out_dtype == torch.uint8:
             return Fp4QuantizedTensor(output_act, output_sf)
+        flat_tensor = output_act.flatten()
+        print(f"output_act shape : {output_act.shape}")
+        print(f"output_act first 100 elements : {flat_tensor[:100]}")
+        print(f"output_act last 100 elements : {flat_tensor[-100:]}")
         return output_act
 
     @classmethod

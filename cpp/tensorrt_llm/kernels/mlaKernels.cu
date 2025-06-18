@@ -1036,12 +1036,16 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 
         int const num_total_qkv_elements
             = params.acc_q_len * (total_q_dim_all_heads + total_k_dim_all_heads + total_v_dim_all_heads);
-        // printf("params.acc_q_len : %d\n", params.acc_q_len);
-        // printf("total_q_dim_all_heads : %d\n", total_q_dim_all_heads);
-        // printf("total_k_dim_all_heads : %d\n", total_k_dim_all_heads);
-        // printf("total_v_dim_all_heads : %d\n", total_v_dim_all_heads);
-        // printf("num_total_qkv_elements : %d\n", num_total_qkv_elements);
-
+        printf("params.head_num : %d\n", params.head_num);
+        printf("params.acc_q_len : %d\n", params.acc_q_len);
+        printf("total_q_dim_all_heads : %d\n", total_q_dim_all_heads);
+        printf("total_k_dim_all_heads : %d\n", total_k_dim_all_heads);
+        printf("total_v_dim_all_heads : %d\n", total_v_dim_all_heads);
+        size_t headDim = params.meta.kv_lora_rank + params.meta.qk_rope_head_dim;
+        printf("headDim : %d\n", headDim);
+        // int const num_total_qkv_elements
+        //     = params.acc_q_len * (headDim * params.head_num + 2 * 1 *headDim);
+        printf("num_total_qkv_elements : %d\n", num_total_qkv_elements);
         float const* device_qkv_scale_ptr = params.quant_scale_qkv;
 
         if (num_total_qkv_elements > 0)
@@ -1088,12 +1092,12 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 
     dim3 grid(int(tensorrt_llm::common::divUp(params.max_input_seq_len, 32)), params.batch_size, params.head_num + 8);
     auto head_size = params.meta.qk_nope_head_dim;
-    // std::cout << "params.head_num : " << params.head_num << std::endl;
-    // std::cout << "params.meta.kv_lora_rank : " << params.meta.kv_lora_rank << std::endl;
-    // std::cout << "head_size : " << head_size << std::endl;
-    // std::cout << "params.cu_q_seqlens : " << params.cu_q_seqlens << std::endl;
-    // std::cout << "params.cache_seq_lens : " << params.cache_seq_lens << std::endl;
-    // std::cout << "params.max_input_seq_len : " << params.max_input_seq_len << std::endl;
+    std::cout << "params.head_num : " << params.head_num << std::endl;
+    std::cout << "params.meta.kv_lora_rank : " << params.meta.kv_lora_rank << std::endl;
+    std::cout << "head_size in mlaKernels : " << head_size << std::endl;
+    std::cout << "params.cu_q_seqlens : " << params.cu_q_seqlens << std::endl;
+    std::cout << "params.cache_seq_lens : " << params.cache_seq_lens << std::endl;
+    std::cout << "params.max_input_seq_len : " << params.max_input_seq_len << std::endl;
     applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(
         params.attention_input_buf, params.latent_cache, kv_cache_buffer, params.cos_sin_cache, params.head_num,
         head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len,

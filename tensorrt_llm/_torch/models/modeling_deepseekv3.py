@@ -1025,6 +1025,11 @@ class DeepseekV3Model(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
             )
+        print("The end of decoder layers : ")
+        flat_tensor = hidden_states.flatten()
+        print(f"hidden_states shape : {hidden_states.shape}")
+        print(f"hidden_states first 100 elements : {flat_tensor[:100]}")
+        print(f"hidden_states last 100 elements : {flat_tensor[-100:]}")
 
         return hidden_states
 
@@ -1093,6 +1098,10 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         **kwargs,
     ) -> torch.Tensor:
         attn_metadata.num_generations_per_batch = self.model_nextn + 1
+        flat_tensor = input_ids.flatten()
+        print(f"input_ids shape : {input_ids.shape}")
+        print(f"input_ids first 100 elements : {flat_tensor[:100]}")
+        print(f"input_ids last 100 elements : {flat_tensor[-100:]}")
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,

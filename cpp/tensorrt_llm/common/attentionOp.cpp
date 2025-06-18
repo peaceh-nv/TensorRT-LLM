@@ -695,6 +695,9 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
 {
     int const local_hidden_units_qo = mNumAttnHeads * getHeadSize();
     int const local_hidden_units_kv = mNumAttnKVHeads * getHeadSize();
+    std::cout << "mNumAttnHeads - workspace: " << mNumAttnHeads << std::endl;
+    std::cout << "mNumAttnKVHeads - workspace: " << mNumAttnKVHeads << std::endl;
+    std::cout << "getHeadSize - workspace: " << getHeadSize() << std::endl;
 
     auto const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
 
@@ -725,13 +728,30 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     size_t const qkv_buf_2_size = mEnableContextFMHA ? 0 : size * max_num_tokens * local_hidden_units_qo;
     size_t const qk_buf_float_size
         = mEnableContextFMHA ? 0 : sizeof(float) * batch_size * mNumHeads * input_seq_length * kv_seq_length;
-    // std::cout << "max_num_tokens : " << max_num_tokens << std::endl;
-    // std::cout << "local_hidden_units_qo : " << local_hidden_units_qo << std::endl;
-    // std::cout << "local_hidden_units_kv : " << local_hidden_units_kv << std::endl;
+    std::cout << "max_num_tokens - workspace: " << max_num_tokens << std::endl;
+    std::cout << "local_hidden_units_qo - workspace: " << local_hidden_units_qo << std::endl;
+    std::cout << "local_hidden_units_kv - workspace: " << local_hidden_units_kv << std::endl;
+    int const dim_q_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
+    int const dim_k_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
+    int const dim_v_per_head = (mMLAParams.v_head_dim);
+
+    // Total dimension per token across all heads for Q, K, and V components respectively
+    int const total_q_dim_all_heads = mNumAttnHeads * dim_q_per_head;
+    int const total_k_dim_all_heads
+        = mNumAttnHeads * dim_k_per_head; // Assuming effective num_kv_heads = head_num for layout
+    int const total_v_dim_all_heads
+        = mNumAttnHeads * dim_v_per_head; // Assuming effective num_kv_heads = head_num for layout
+
+    int const num_total_qkv_elements
+        = max_num_tokens * (total_q_dim_all_heads + total_k_dim_all_heads + total_v_dim_all_heads);
+    std::cout << "num_total_qkv_elements - workspace: " << num_total_qkv_elements << std::endl;
+    // size_t const fp8_qkv_buffer_size
+    //     = mFP8ContextFMHA && mEnableContextFMHA && !mFmhaDispatcher->isSeparateQAndKvInput()
+    //     ? max_num_tokens * size_t(local_hidden_units_qo + 2 * local_hidden_units_kv)
+    //     : 0;
     size_t const fp8_qkv_buffer_size
-        = mFP8ContextFMHA && mEnableContextFMHA && !mFmhaDispatcher->isSeparateQAndKvInput()
-        ? max_num_tokens * size_t(local_hidden_units_qo + 2 * local_hidden_units_kv) * 2
-        : 0;
+        = mFP8ContextFMHA && mEnableContextFMHA && !mFmhaDispatcher->isSeparateQAndKvInput() ? num_total_qkv_elements
+                                                                                             : 0;
     size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * max_num_tokens;
     size_t const encoder_padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * max_num_tokens;
     // Each token holds (batch_idx, token_idx_in_seq) int2.
@@ -781,7 +801,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     // std::cout << "qk_buf_size : " << workspaces[9] << std::endl;
     // std::cout << "qkv_buf_2_size : " << workspaces[10] << std::endl;
     // std::cout << "qk_buf_float_size : " << workspaces[11] << std::endl;
-    // std::cout << "fp8_qkv_buffer_size : " << workspaces[12] << std::endl;
+    std::cout << "fp8_qkv_buffer_size - workspace: " << workspaces[12] << std::endl;
     // std::cout << "padding_offset_size : " << workspaces[13] << std::endl;
     // std::cout << "encoder_padding_offset_size : " << workspaces[14] << std::endl;
     // std::cout << "tokens_info_size : " << workspaces[15] << std::endl;
@@ -949,6 +969,11 @@ int AttentionOp::mlaGeneration(
     size_t const quant_q_buffer_size = mFP8GenerationMLA
         ? params.acc_q_len * size_t(mNumHeads * (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim))
         : 0;
+    // std::cout << "params.acc_q_len : " << params.acc_q_len << std::endl;
+    // std::cout << "mNumHeads : " << mNumHeads << std::endl;
+    // std::cout << "mMLAParams.kv_lora_rank : " << mMLAParams.kv_lora_rank << std::endl;
+    // std::cout << "mMLAParams.qk_rope_head_dim : " << mMLAParams.qk_rope_head_dim << std::endl;
+    // std::cout << "quant_q_buffer_size : " << quant_q_buffer_size << std::endl;
     int* cu_q_seqlens = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, cu_seqlens_size));
     int* cu_kv_seqlens = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, cu_seqlens_size));
     uint32_t* fmha_tile_counter_ptr
@@ -1356,14 +1381,34 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     size_t const qk_buf_float_size = mEnableContextFMHA
         ? 0
         : sizeof(float) * params.batch_size * mNumHeads * params.input_seq_length * kv_seq_length;
+    // size_t const fp8_qkv_buffer_size
+    //     = mEnableContextFMHA && mFP8ContextFMHA && !mFmhaDispatcher->isSeparateQAndKvInput()
+    //     ? params.num_tokens * (local_hidden_units_qo + 2 * local_hidden_units_kv)
+    //     : 0;
+    // std::cout << "fp8_qkv_buffer_size - ptr: " << fp8_qkv_buffer_size << std::endl;
+    std::cout << "params.num_tokens - ptr: " << params.num_tokens << std::endl;
+    std::cout << "local_hidden_units_qo - ptr: " << local_hidden_units_qo << std::endl;
+    std::cout << "local_hidden_units_kv - ptr: " << local_hidden_units_kv << std::endl;
+
+    int const dim_q_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
+    int const dim_k_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
+    int const dim_v_per_head = (mMLAParams.v_head_dim);
+
+    // Total dimension per token across all heads for Q, K, and V components respectively
+    int const total_q_dim_all_heads = mNumAttnHeads * dim_q_per_head;
+    int const total_k_dim_all_heads
+        = mNumAttnHeads * dim_k_per_head; // Assuming effective num_kv_heads = head_num for layout
+    int const total_v_dim_all_heads
+        = mNumAttnHeads * dim_v_per_head; // Assuming effective num_kv_heads = head_num for layout
+
+    int const num_total_qkv_elements
+        = params.num_tokens * (total_q_dim_all_heads + total_k_dim_all_heads + total_v_dim_all_heads);
+    std::cout << "num_total_qkv_elements - ptr: " << num_total_qkv_elements << std::endl;
+
     size_t const fp8_qkv_buffer_size
-        = mEnableContextFMHA && mFP8ContextFMHA && !mFmhaDispatcher->isSeparateQAndKvInput()
-        ? params.num_tokens * (local_hidden_units_qo + 2 * local_hidden_units_kv)
-        : 0;
-    // std::cout << "fp8_qkv_buffer_size : " << fp8_qkv_buffer_size << std::endl;
-    // std::cout << "params.num_tokens : " << params.num_tokens << std::endl;
-    // std::cout << "local_hidden_units_qo : " << local_hidden_units_qo << std::endl;
-    // std::cout << "local_hidden_units_kv : " << local_hidden_units_kv << std::endl;
+        = mEnableContextFMHA && mFP8ContextFMHA && !mFmhaDispatcher->isSeparateQAndKvInput() ? num_total_qkv_elements
+                                                                                             : 0;
+
     size_t const padding_offset_size
         = mEnableContextFMHA ? 0 : sizeof(int) * params.batch_size * params.input_seq_length;
     size_t const encoder_padding_offset_size
@@ -1660,28 +1705,28 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
 
                 // Check for invalid numbers in fp8_qkv_buffer after MLA RoPE Context
-                if (mFP8ContextFMHA && fp8_qkv_buffer != nullptr)
-                {
-                    std::string const afterMLARopeStr
-                        = "MLA ctx attention fp8_qkv_buffer after RoPE at layer " + std::to_string(mLayerIdx);
-                    std::cout << "params.num_tokens: " << params.num_tokens << std::endl;
-                    std::cout << "local_hidden_units_qo: " << local_hidden_units_qo << std::endl;
-                    std::cout << "local_hidden_units_kv: " << local_hidden_units_kv << std::endl;
-                    int const dim_q_per_head
-                        = (params.mla_param->meta.qk_nope_head_dim + params.mla_param->meta.qk_rope_head_dim);
-                    int const dim_k_per_head
-                        = (params.mla_param->meta.qk_nope_head_dim + params.mla_param->meta.qk_rope_head_dim);
-                    int const dim_v_per_head = (params.mla_param->meta.v_head_dim);
-                    int const total_q_dim_all_heads = params.mla_param->head_num * dim_q_per_head;
-                    int const total_k_dim_all_heads = params.mla_param->head_num
-                        * dim_k_per_head; // Assuming effective num_kv_heads = head_num for layout
-                    int const total_v_dim_all_heads = params.mla_param->head_num
-                        * dim_v_per_head; // Assuming effective num_kv_heads = head_num for layout
-                    bool result = tensorrt_llm::runtime::utils::tensorHasInvalid(params.num_tokens,
-                        (total_q_dim_all_heads + total_k_dim_all_heads + total_v_dim_all_heads),
-                        nvinfer1::DataType::kFP8, fp8_qkv_buffer, stream, afterMLARopeStr);
-                    std::cout << "check result for fp8_qkv_buffer after MLA RoPE Context: " << result << std::endl;
-                }
+                // if (mFP8ContextFMHA && fp8_qkv_buffer != nullptr)
+                // {
+                //     std::string const afterMLARopeStr
+                //         = "MLA ctx attention fp8_qkv_buffer after RoPE at layer " + std::to_string(mLayerIdx);
+                //     std::cout << "params.num_tokens: " << params.num_tokens << std::endl;
+                //     std::cout << "local_hidden_units_qo: " << local_hidden_units_qo << std::endl;
+                //     std::cout << "local_hidden_units_kv: " << local_hidden_units_kv << std::endl;
+                //     int const dim_q_per_head
+                //         = (params.mla_param->meta.qk_nope_head_dim + params.mla_param->meta.qk_rope_head_dim);
+                //     int const dim_k_per_head
+                //         = (params.mla_param->meta.qk_nope_head_dim + params.mla_param->meta.qk_rope_head_dim);
+                //     int const dim_v_per_head = (params.mla_param->meta.v_head_dim);
+                //     int const total_q_dim_all_heads = params.mla_param->head_num * dim_q_per_head;
+                //     int const total_k_dim_all_heads = params.mla_param->head_num
+                //         * dim_k_per_head; // Assuming effective num_kv_heads = head_num for layout
+                //     int const total_v_dim_all_heads = params.mla_param->head_num
+                //         * dim_v_per_head; // Assuming effective num_kv_heads = head_num for layout
+                //     bool result = tensorrt_llm::runtime::utils::tensorHasInvalid(params.num_tokens,
+                //         (total_q_dim_all_heads + total_k_dim_all_heads + total_v_dim_all_heads),
+                //         nvinfer1::DataType::kFP8, fp8_qkv_buffer, stream, afterMLARopeStr);
+                //     std::cout << "check result for fp8_qkv_buffer after MLA RoPE Context: " << result << std::endl;
+                // }
             }
         }
         else
