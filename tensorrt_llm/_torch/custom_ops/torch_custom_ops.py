@@ -429,6 +429,114 @@ def attention(
                                  dtype=out_dtype)
         # NOTE(tizheng): Does this introduce overhead?
         output_sf = torch.empty(())  # Create a placeholder, which is not used.
+    print("print arguments before attention_inplace")
+    print(f"q.shape: {q.shape}")
+    print(f"k.shape: {k.shape if k is not None else None}")
+    print(f"v.shape: {v.shape if v is not None else None}")
+    print(
+        f"output_act.shape: {output_act.shape if output_act is not None else None}"
+    )
+    print(
+        f"output_sf.shape: {output_sf.shape if output_sf is not None else None}"
+    )
+    print(f"out_dtype: {out_dtype}")
+    print(
+        f"workspace.shape: {workspace.shape if workspace is not None else None}"
+    )
+    print(
+        f"sequence_length.shape: {sequence_length.shape if sequence_length is not None else None}"
+    )
+    print(
+        f"host_past_key_value_lengths.shape: {host_past_key_value_lengths.shape}"
+    )
+    print(f"context_lengths.shape: {context_lengths.shape}")
+    print(f"host_context_lengths.shape: {host_context_lengths.shape}")
+    print(f"host_request_types.shape: {host_request_types.shape}")
+    print(
+        f"kv_cache_block_offsets.shape: {kv_cache_block_offsets.shape if kv_cache_block_offsets is not None else None}"
+    )
+    print(
+        f"host_kv_cache_block_offsets.shape: {host_kv_cache_block_offsets.shape if host_kv_cache_block_offsets is not None else None}"
+    )
+    print(
+        f"host_kv_cache_pool_pointers.shape: {host_kv_cache_pool_pointers.shape if host_kv_cache_pool_pointers is not None else None}"
+    )
+    print(
+        f"host_kv_cache_pool_mapping.shape: {host_kv_cache_pool_mapping.shape if host_kv_cache_pool_mapping is not None else None}"
+    )
+    print(
+        f"cache_indirection.shape: {cache_indirection.shape if cache_indirection is not None else None}"
+    )
+    print(
+        f"kv_scale_orig_quant.shape: {kv_scale_orig_quant.shape if kv_scale_orig_quant is not None else None}"
+    )
+    print(
+        f"kv_scale_quant_orig.shape: {kv_scale_quant_orig.shape if kv_scale_quant_orig is not None else None}"
+    )
+    print(
+        f"out_scale.shape: {out_scale.shape if out_scale is not None else None}"
+    )
+    print(
+        f"rotary_inv_freq.shape: {rotary_inv_freq.shape if rotary_inv_freq is not None else None}"
+    )
+    print(
+        f"rotary_cos_sin.shape: {rotary_cos_sin.shape if rotary_cos_sin is not None else None}"
+    )
+    print(
+        f"latent_cache.shape: {latent_cache.shape if latent_cache is not None else None}"
+    )
+    print(f"q_pe.shape: {q_pe.shape if q_pe is not None else None}")
+    print(
+        f"block_ids_per_seq.shape: {block_ids_per_seq.shape if block_ids_per_seq is not None else None}"
+    )
+    print(f"is_fused_qkv: {is_fused_qkv}")
+    print(f"update_kv_cache: {update_kv_cache}")
+    print(f"predicted_tokens_per_seq: {predicted_tokens_per_seq}")
+    print(f"layer_idx: {layer_idx}")
+    print(f"num_heads: {num_heads}")
+    print(f"num_kv_heads: {num_kv_heads}")
+    print(f"head_size: {head_size}")
+    print(f"tokens_per_block: {tokens_per_block}")
+    print(f"max_num_requests: {max_num_requests}")
+    print(f"max_context_length: {max_context_length}")
+    print(f"attention_window_size: {attention_window_size}")
+    print(f"sink_token_length: {sink_token_length}")
+    print(f"beam_width: {beam_width}")
+    print(f"mask_type: {mask_type}")
+    print(f"quant_mode: {quant_mode}")
+    print(f"q_scaling: {q_scaling}")
+    print(f"position_embedding_type: {position_embedding_type}")
+    print(f"rotary_embedding_dim: {rotary_embedding_dim}")
+    print(f"rotary_embedding_base: {rotary_embedding_base}")
+    print(f"rotary_embedding_scale_type: {rotary_embedding_scale_type}")
+    print(f"rotary_embedding_scale: {rotary_embedding_scale}")
+    print(f"rotary_embedding_short_m_scale: {rotary_embedding_short_m_scale}")
+    print(f"rotary_embedding_long_m_scale: {rotary_embedding_long_m_scale}")
+    print(f"rotary_embedding_max_positions: {rotary_embedding_max_positions}")
+    print(
+        f"rotary_embedding_original_max_positions: {rotary_embedding_original_max_positions}"
+    )
+    print(f"use_paged_context_fmha: {use_paged_context_fmha}")
+    print(f"attention_input_type: {attention_input_type}")
+    print(f"is_mla_enable: {is_mla_enable}")
+    print(f"q_lora_rank: {q_lora_rank}")
+    print(f"kv_lora_rank: {kv_lora_rank}")
+    print(f"qk_nope_head_dim: {qk_nope_head_dim}")
+    print(f"qk_rope_head_dim: {qk_rope_head_dim}")
+    print(f"v_head_dim: {v_head_dim}")
+    print(
+        f"mrope_rotary_cos_sin.shape: {mrope_rotary_cos_sin.shape if mrope_rotary_cos_sin is not None else None}"
+    )
+    print(
+        f"mrope_position_deltas.shape: {mrope_position_deltas.shape if mrope_position_deltas is not None else None}"
+    )
+    print(
+        f"mla_context_paged_kv.shape: {mla_context_paged_kv.shape if mla_context_paged_kv is not None else None}"
+    )
+    print(
+        f"mla_context_kv_cache_block_offsets.shape: {mla_context_kv_cache_block_offsets.shape if mla_context_kv_cache_block_offsets is not None else None}"
+    )
+    print(f"attention_chunk_size: {attention_chunk_size}")
 
     torch.ops.trtllm.attention_inplace(
         q, k, v, output_act, output_sf, out_dtype, workspace, sequence_length,

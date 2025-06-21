@@ -303,6 +303,44 @@ public:
                 enqueue_params.mrope_rotary_cos_sin
                     = static_cast<float2 const*>(mrope_rotary_cos_sin.value().data_ptr());
             }
+            std::cout << "enqueueContext before" << std::endl;
+            std::cout << "enqueue_params.mla_param->meta.kv_lora_rank: " << enqueue_params.mla_param->meta.kv_lora_rank
+                      << std::endl;
+            std::cout << "enqueue_params.mla_param->meta.q_lora_rank: " << enqueue_params.mla_param->meta.q_lora_rank
+                      << std::endl;
+            std::cout << "enqueue_params.mla_param->meta.qk_nope_head_dim: "
+                      << enqueue_params.mla_param->meta.qk_nope_head_dim << std::endl;
+            std::cout << "enqueue_params.mla_param->meta.qk_rope_head_dim: "
+                      << enqueue_params.mla_param->meta.qk_rope_head_dim << std::endl;
+            std::cout << "enqueue_params.mla_param->meta.v_head_dim: " << enqueue_params.mla_param->meta.v_head_dim
+                      << std::endl;
+            std::cout << "enqueue_params.mla_param->latent_cache: " << enqueue_params.mla_param->latent_cache
+                      << std::endl;
+            std::cout << "enqueue_params.mla_param->attention_input_buf: "
+                      << enqueue_params.mla_param->attention_input_buf << std::endl;
+            std::cout << "enqueue_params.mla_param->context_buf: " << enqueue_params.mla_param->context_buf
+                      << std::endl;
+            std::cout << "enqueue_params.mla_param->q_pe: " << enqueue_params.mla_param->q_pe << std::endl;
+            std::cout << "enqueue_params.mla_param->cos_sin_cache: " << enqueue_params.mla_param->cos_sin_cache
+                      << std::endl;
+            std::cout << "enqueue_params.mla_param->batch_size: " << enqueue_params.mla_param->batch_size << std::endl;
+            std::cout << "enqueue_params.mla_param->acc_q_len: " << enqueue_params.mla_param->acc_q_len << std::endl;
+            std::cout << "enqueue_params.mla_param->head_num: " << enqueue_params.mla_param->head_num << std::endl;
+            std::cout << "enqueue_params.mla_param->workspace: " << enqueue_params.mla_param->workspace << std::endl;
+            std::cout << "enqueue_params.mla_param->cache_seq_lens: " << enqueue_params.mla_param->cache_seq_lens
+                      << std::endl;
+            std::cout << "enqueue_params.mla_param->seqQOffset: " << enqueue_params.mla_param->seqQOffset << std::endl;
+            std::cout << "enqueue_params.mla_param->fmha_tile_counter: " << enqueue_params.mla_param->fmha_tile_counter
+                      << std::endl;
+            std::cout << "enqueue_params.mla_param->max_input_seq_len: " << enqueue_params.mla_param->max_input_seq_len
+                      << std::endl;
+            std::cout << "enqueue_params.mla_param->cu_q_seqlens: " << enqueue_params.mla_param->cu_q_seqlens
+                      << std::endl;
+            std::cout << "enqueue_params.mla_param->cu_kv_seqlens: " << enqueue_params.mla_param->cu_kv_seqlens
+                      << std::endl;
+            std::cout << "enqueue_params.mla_param->q_pe_ld: " << enqueue_params.mla_param->q_pe_ld << std::endl;
+            std::cout << "enqueue_params.mla_param->q_pe_stride: " << enqueue_params.mla_param->q_pe_stride
+                      << std::endl;
             op.enqueueContext<T, KVBlockArray>(enqueue_params, stream);
             std::cout << "enqueueContext done" << std::endl;
         }
@@ -423,7 +461,8 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     }
 
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(qkv.scalar_type());
-    bool const is_fp8_out = out_dtype.has_value() && out_dtype.value() == torch::kFloat8_e4m3fn;
+    // bool const is_fp8_out = out_dtype.has_value() && out_dtype.value() == torch::kFloat8_e4m3fn;
+    bool const is_fp8_out = false;
     bool const is_fp4_out = out_dtype.has_value() && out_dtype.value() == torch::kUInt8;
 
     RunnerPtr runner;
@@ -480,7 +519,9 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     auto op = std::make_shared<AttentionOp>();
     op->mType = dtype;
     op->mFMHAForceFP32Acc = dtype == nvinfer1::DataType::kBF16;
-    op->mFP8ContextFMHA = is_fp8_out || is_fp4_out;
+    // op->mFP8ContextFMHA = is_fp8_out || is_fp4_out;
+    op->mFP8ContextFMHA = true;
+    // op->mFP8ContextFMHA = false;
     op->mLayerIdx = layer_idx;
     op->mNumHeads = num_heads;
     op->mNumKVHeads = num_kv_heads;

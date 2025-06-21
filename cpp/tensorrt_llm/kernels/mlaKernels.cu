@@ -266,7 +266,7 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
         size_t const seq_len_loop_end
             = size_t((max_input_seq_len + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK;
         float quant_scale_kv_val = quant_scale_kv ? quant_scale_kv[0] : 1.f;
-        // float quant_scale_qkv_val = quant_scale_qkv ? quant_scale_qkv[0] : 1.f;
+        float quant_scale_qkv_val = quant_scale_qkv ? quant_scale_qkv[0] : 1.f;
         // printf("seq_len_loop_end : %d\n", seq_len_loop_end);
 
         // Mainloop.
@@ -336,13 +336,13 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
                 // {
                 //     if (head_idx == 0)
                 //     {
-                //         printf("dst_q_idx when head_idx is 0 inside kernel : %d, global_token_idx : %d,
-                //         local_token_idx : %d\n", dst_q_idx, global_token_idx, local_token_idx);
+                //         // printf("dst_q_idx when head_idx is 0 inside kernel : %d, global_token_idx : %d,
+                //         // local_token_idx : %d\n", dst_q_idx, global_token_idx, local_token_idx);
                 //     }
                 //     if (head_idx == head_num - 1)
                 //     {
-                //         printf("dst_q_idx when head_idx is head_num - 1 inside kernel : %d, global_token_idx : %d,
-                //         local_token_idx : %d\n", dst_q_idx, global_token_idx, local_token_idx);
+                //         // printf("dst_q_idx when head_idx is head_num - 1 inside kernel : %d, global_token_idx : %d,
+                //         // local_token_idx : %d\n", dst_q_idx, global_token_idx, local_token_idx);
                 //     }
                 //     // Quantize Q tensor to quant_qkv_output
                 //     quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(quant_qkv_output) + dst_q_idx,
@@ -353,7 +353,8 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
                 //         reinterpret_cast<T const*>(&k), quant_scale_qkv_val);
 
                 //     // Quantize V tensor to quant_qkv_output (V tensor doesn't need RoPE, copy from original
-                //     qkv_output) auto const dst_v_idx
+                //     // qkv_output)
+                // auto const dst_v_idx
                 //         = static_cast<size_t>(global_token_idx) * head_num * ((head_size + ROPE_DIM) * 2 + head_size)
                 //         + head_num * (head_size + ROPE_DIM) * 2 + head_idx * head_size + head_dim_idx;
 
@@ -381,7 +382,7 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
         size_t const seq_len_loop_end
             = size_t((max_input_seq_len + K_TOKENS_PER_BLOCK - 1) / K_TOKENS_PER_BLOCK) * K_TOKENS_PER_BLOCK;
         float quant_scale_kv_val = quant_scale_kv ? quant_scale_kv[0] : 1.0f;
-        // float quant_scale_qkv_val = quant_scale_qkv ? quant_scale_qkv[0] : 1.0f;
+        float quant_scale_qkv_val = quant_scale_qkv ? quant_scale_qkv[0] : 1.0f;
 
         // Mainloop.
         for (int local_token_idx = (threadIdx.x / K_VECS_PER_HEAD) + gridDim.x * K_TOKENS_PER_BLOCK * block_id
@@ -445,7 +446,8 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
             //             reinterpret_cast<T const*>(&k), quant_scale_qkv_val);
 
             //         // Quantize V tensor to quant_qkv_output (V tensor doesn't need RoPE, copy from original
-            //         qkv_output) auto const dst_v_idx
+            //         // qkv_output)
+            //         auto const dst_v_idx
             //             = static_cast<size_t>(global_token_idx) * head_num * ((head_size + ROPE_DIM) * 2 + head_size)
             //             + head_num * (head_size + ROPE_DIM) * 2 + head_idx * head_size + head_dim_idx;
 
@@ -1012,6 +1014,99 @@ template <typename T, typename KVCacheBuffer>
 void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream)
 {
     // Quantize params.attention_input_buf to params.quant_attention_input_buf (FP8)
+    // if (params.attention_input_buf != nullptr && params.quant_attention_input_buf != nullptr
+    //     && params.cache_type == KvCacheDataType::FP8)
+    // {
+    //     TLLM_LOG_DEBUG("MLA RoPE Context: Quantizing attention_input_buf to FP8");
+
+    //     // Calculate total elements for the QKV buffer
+    //     // Assumes params.attention_input_buf is a packed QKV buffer: [tokens, total_hidden_dim_for_qkv_projection]
+    //     // params.acc_q_len is total tokens (batch_size * seq_len)
+    //     // params.head_num is number of Q heads
+    //     // We assume for the input buffer, K and V also effectively have params.head_num components before RoPE
+    //     // processing.
+    //     int const dim_q_per_head = (params.meta.qk_nope_head_dim + params.meta.qk_rope_head_dim);
+    //     int const dim_k_per_head = (params.meta.qk_nope_head_dim + params.meta.qk_rope_head_dim);
+    //     int const dim_v_per_head = (params.meta.v_head_dim);
+
+    //     // Total dimension per token across all heads for Q, K, and V components respectively
+    //     int const total_q_dim_all_heads = params.head_num * dim_q_per_head;
+    //     int const total_k_dim_all_heads
+    //         = params.head_num * dim_k_per_head; // Assuming effective num_kv_heads = head_num for layout
+    //     int const total_v_dim_all_heads
+    //         = params.head_num * dim_v_per_head; // Assuming effective num_kv_heads = head_num for layout
+
+    //     int const num_total_qkv_elements
+    //         = params.acc_q_len * (total_q_dim_all_heads + total_k_dim_all_heads + total_v_dim_all_heads);
+    //     printf("params.head_num : %d\n", params.head_num);
+    //     printf("params.acc_q_len : %d\n", params.acc_q_len);
+    //     printf("total_q_dim_all_heads : %d\n", total_q_dim_all_heads);
+    //     printf("total_k_dim_all_heads : %d\n", total_k_dim_all_heads);
+    //     printf("total_v_dim_all_heads : %d\n", total_v_dim_all_heads);
+    //     size_t headDim = params.meta.kv_lora_rank + params.meta.qk_rope_head_dim;
+    //     printf("headDim : %d\n", headDim);
+    //     // int const num_total_qkv_elements
+    //     //     = params.acc_q_len * (headDim * params.head_num + 2 * 1 *headDim);
+    //     printf("num_total_qkv_elements : %d\n", num_total_qkv_elements);
+    //     float const* device_qkv_scale_ptr = params.quant_scale_qkv;
+
+    //     if (num_total_qkv_elements > 0)
+    //     {
+    //         // int const threads_per_block = 256;
+    //         // int const num_blocks = (num_total_qkv_elements + threads_per_block - 1) / threads_per_block;
+
+    //         // TLLM_LOG_DEBUG(
+    //         //     "Launching QuantizeCopyInputToFp8Kernel with num_blocks: %d, threads_per_block: %d, elements: %d",
+    //         //     num_blocks, threads_per_block, num_total_qkv_elements);
+
+    //         // tensorrt_llm::kernels::QuantizeCopyInputToFp8Kernel<T><<<num_blocks, threads_per_block, 0, stream>>>(
+    //         //     static_cast<T const*>(params.attention_input_buf),             // Source
+    //         //     static_cast<__nv_fp8_e4m3*>(params.quant_attention_input_buf), // Destination
+    //         //     num_total_qkv_elements, device_qkv_scale_ptr);
+    //         // sync_check_cuda_error(stream);
+
+    //         // Debug: Print first 100 items from quant_attention_input_buf
+    //         // {
+    //         //     cudaStreamSynchronize(stream);
+    //         //     constexpr int debug_print_count = 100;
+    //         //     int actual_print_count = std::min(debug_print_count, num_total_qkv_elements);
+
+    //         //     std::vector<__nv_fp8_e4m3> host_buffer(actual_print_count);
+    //         //     cudaMemcpy(host_buffer.data(), params.quant_attention_input_buf,
+    //         //               actual_print_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+
+    //         //     printf("DEBUG: First %d items from quant_attention_input_buf after
+    //         QuantizeCopyInputToFp8Kernel:\n",
+    //         //     actual_print_count); for (int i = 0; i < actual_print_count; ++i) {
+    //         //         float val = static_cast<float>(host_buffer[i]);
+    //         //         printf("[%d]: %.6f", i, val);
+    //         //         if ((i + 1) % 10 == 0) printf("\n");
+    //         //         else printf("  ");
+    //         //     }
+    //         //     if (actual_print_count % 10 != 0) printf("\n");
+    //         //     printf("DEBUG: End of quant_attention_input_buf dump\n");
+    //         // }
+    //     }
+    //     else
+    //     {
+    //         TLLM_LOG_WARNING("MLA RoPE Context: num_total_qkv_elements is 0, skipping quantization.");
+    //     }
+    // }
+
+    dim3 grid(int(tensorrt_llm::common::divUp(params.max_input_seq_len, 32)), params.batch_size, params.head_num + 8);
+    auto head_size = params.meta.qk_nope_head_dim;
+    std::cout << "params.head_num : " << params.head_num << std::endl;
+    std::cout << "params.meta.kv_lora_rank : " << params.meta.kv_lora_rank << std::endl;
+    std::cout << "head_size in mlaKernels : " << head_size << std::endl;
+    std::cout << "params.cu_q_seqlens : " << params.cu_q_seqlens << std::endl;
+    std::cout << "params.cache_seq_lens : " << params.cache_seq_lens << std::endl;
+    std::cout << "params.max_input_seq_len : " << params.max_input_seq_len << std::endl;
+    applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(
+        params.attention_input_buf, params.latent_cache, kv_cache_buffer, params.cos_sin_cache, params.head_num,
+        head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len,
+        params.cache_type, params.quant_scale_kv, params.quant_attention_input_buf, params.quant_scale_qkv,
+        params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, params.dequant_scale_kv, params.host_bmm1_scale);
+
     if (params.attention_input_buf != nullptr && params.quant_attention_input_buf != nullptr
         && params.cache_type == KvCacheDataType::FP8)
     {
@@ -1063,26 +1158,437 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
                 num_total_qkv_elements, device_qkv_scale_ptr);
             sync_check_cuda_error(stream);
 
-            // Debug: Print first 100 items from quant_attention_input_buf
-            // {
-            //     cudaStreamSynchronize(stream);
-            //     constexpr int debug_print_count = 100;
-            //     int actual_print_count = std::min(debug_print_count, num_total_qkv_elements);
+            // Wait for kernel to complete before dumping
+            cudaStreamSynchronize(stream);
 
-            //     std::vector<__nv_fp8_e4m3> host_buffer(actual_print_count);
-            //     cudaMemcpy(host_buffer.data(), params.quant_attention_input_buf,
-            //               actual_print_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+            // === DEBUG: Dump split QKV from quant_attention_input_buf ===
+            printf("=== DEBUG: Dumping split QKV from quant_attention_input_buf ===\n");
 
-            //     printf("DEBUG: First %d items from quant_attention_input_buf after QuantizeCopyInputToFp8Kernel:\n",
-            //     actual_print_count); for (int i = 0; i < actual_print_count; ++i) {
-            //         float val = static_cast<float>(host_buffer[i]);
-            //         printf("[%d]: %.6f", i, val);
-            //         if ((i + 1) % 10 == 0) printf("\n");
-            //         else printf("  ");
-            //     }
-            //     if (actual_print_count % 10 != 0) printf("\n");
-            //     printf("DEBUG: End of quant_attention_input_buf dump\n");
-            // }
+            // Calculate offsets for Q, K, V in the concatenated buffer
+            int const q_total_elements = params.acc_q_len * total_q_dim_all_heads;
+            int const k_total_elements = params.acc_q_len * total_k_dim_all_heads;
+            int const v_total_elements = params.acc_q_len * total_v_dim_all_heads;
+
+            __nv_fp8_e4m3* quant_q_ptr = static_cast<__nv_fp8_e4m3*>(params.quant_attention_input_buf);
+            __nv_fp8_e4m3* quant_k_ptr = quant_q_ptr + q_total_elements;
+            __nv_fp8_e4m3* quant_v_ptr = quant_k_ptr + k_total_elements;
+
+            // Dump Q matrix (quantized)
+            {
+                int debug_count = std::min(100, q_total_elements);
+                std::vector<__nv_fp8_e4m3> host_q_buffer(debug_count * 2); // first 100 + last 100
+
+                // Copy first 100 elements
+                cudaMemcpy(
+                    host_q_buffer.data(), quant_q_ptr, debug_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+
+                // Copy last 100 elements if there are enough elements
+                if (q_total_elements > debug_count)
+                {
+                    cudaMemcpy(host_q_buffer.data() + debug_count, quant_q_ptr + q_total_elements - debug_count,
+                        debug_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+                }
+
+                printf("DEBUG: Q matrix (quantized) - Shape: (%d, %d), Total elements: %d\n", params.acc_q_len,
+                    total_q_dim_all_heads, q_total_elements);
+                printf("First %d elements:\n", debug_count);
+                for (int i = 0; i < debug_count; ++i)
+                {
+                    float val = static_cast<float>(host_q_buffer[i]);
+                    printf("Q[%d]: %.6f", i, val);
+                    if ((i + 1) % 10 == 0)
+                        printf("\n");
+                    else
+                        printf("  ");
+                }
+                if (debug_count % 10 != 0)
+                    printf("\n");
+
+                if (q_total_elements > debug_count)
+                {
+                    printf("Last %d elements:\n", debug_count);
+                    for (int i = 0; i < debug_count; ++i)
+                    {
+                        float val = static_cast<float>(host_q_buffer[debug_count + i]);
+                        printf("Q[%d]: %.6f", q_total_elements - debug_count + i, val);
+                        if ((i + 1) % 10 == 0)
+                            printf("\n");
+                        else
+                            printf("  ");
+                    }
+                    if (debug_count % 10 != 0)
+                        printf("\n");
+                }
+            }
+
+            // Dump K matrix (quantized)
+            {
+                int debug_count = std::min(100, k_total_elements);
+                std::vector<__nv_fp8_e4m3> host_k_buffer(debug_count * 2);
+
+                cudaMemcpy(
+                    host_k_buffer.data(), quant_k_ptr, debug_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+                if (k_total_elements > debug_count)
+                {
+                    cudaMemcpy(host_k_buffer.data() + debug_count, quant_k_ptr + k_total_elements - debug_count,
+                        debug_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+                }
+
+                printf("DEBUG: K matrix (quantized) - Shape: (%d, %d), Total elements: %d\n", params.acc_q_len,
+                    total_k_dim_all_heads, k_total_elements);
+                printf("First %d elements:\n", debug_count);
+                for (int i = 0; i < debug_count; ++i)
+                {
+                    float val = static_cast<float>(host_k_buffer[i]);
+                    printf("K[%d]: %.6f", i, val);
+                    if ((i + 1) % 10 == 0)
+                        printf("\n");
+                    else
+                        printf("  ");
+                }
+                if (debug_count % 10 != 0)
+                    printf("\n");
+
+                if (k_total_elements > debug_count)
+                {
+                    printf("Last %d elements:\n", debug_count);
+                    for (int i = 0; i < debug_count; ++i)
+                    {
+                        float val = static_cast<float>(host_k_buffer[debug_count + i]);
+                        printf("K[%d]: %.6f", k_total_elements - debug_count + i, val);
+                        if ((i + 1) % 10 == 0)
+                            printf("\n");
+                        else
+                            printf("  ");
+                    }
+                    if (debug_count % 10 != 0)
+                        printf("\n");
+                }
+            }
+
+            // Dump V matrix (quantized)
+            {
+                int debug_count = std::min(100, v_total_elements);
+                std::vector<__nv_fp8_e4m3> host_v_buffer(debug_count * 2);
+
+                cudaMemcpy(
+                    host_v_buffer.data(), quant_v_ptr, debug_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+                if (v_total_elements > debug_count)
+                {
+                    cudaMemcpy(host_v_buffer.data() + debug_count, quant_v_ptr + v_total_elements - debug_count,
+                        debug_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+                }
+
+                printf("DEBUG: V matrix (quantized) - Shape: (%d, %d), Total elements: %d\n", params.acc_q_len,
+                    total_v_dim_all_heads, v_total_elements);
+                printf("First %d elements:\n", debug_count);
+                for (int i = 0; i < debug_count; ++i)
+                {
+                    float val = static_cast<float>(host_v_buffer[i]);
+                    printf("V[%d]: %.6f", i, val);
+                    if ((i + 1) % 10 == 0)
+                        printf("\n");
+                    else
+                        printf("  ");
+                }
+                if (debug_count % 10 != 0)
+                    printf("\n");
+
+                if (v_total_elements > debug_count)
+                {
+                    printf("Last %d elements:\n", debug_count);
+                    for (int i = 0; i < debug_count; ++i)
+                    {
+                        float val = static_cast<float>(host_v_buffer[debug_count + i]);
+                        printf("V[%d]: %.6f", v_total_elements - debug_count + i, val);
+                        if ((i + 1) % 10 == 0)
+                            printf("\n");
+                        else
+                            printf("  ");
+                    }
+                    if (debug_count % 10 != 0)
+                        printf("\n");
+                }
+            }
+
+            // === DEBUG: Dump split QKV from original attention_input_buf ===
+            printf("=== DEBUG: Dumping split QKV from original attention_input_buf ===\n");
+
+            T* orig_q_ptr = static_cast<T*>(params.attention_input_buf);
+            T* orig_k_ptr = orig_q_ptr + q_total_elements;
+            T* orig_v_ptr = orig_k_ptr + k_total_elements;
+
+            // Dump original Q matrix
+            {
+                int debug_count = std::min(100, q_total_elements);
+                std::vector<T> host_q_buffer(debug_count * 2);
+
+                cudaMemcpy(host_q_buffer.data(), orig_q_ptr, debug_count * sizeof(T), cudaMemcpyDeviceToHost);
+                if (q_total_elements > debug_count)
+                {
+                    cudaMemcpy(host_q_buffer.data() + debug_count, orig_q_ptr + q_total_elements - debug_count,
+                        debug_count * sizeof(T), cudaMemcpyDeviceToHost);
+                }
+
+                printf("DEBUG: Q matrix (original) - Shape: (%d, %d), Total elements: %d\n", params.acc_q_len,
+                    total_q_dim_all_heads, q_total_elements);
+                printf("First %d elements:\n", debug_count);
+                for (int i = 0; i < debug_count; ++i)
+                {
+                    float val = static_cast<float>(host_q_buffer[i]);
+                    printf("Q_orig[%d]: %.6f", i, val);
+                    if ((i + 1) % 10 == 0)
+                        printf("\n");
+                    else
+                        printf("  ");
+                }
+                if (debug_count % 10 != 0)
+                    printf("\n");
+
+                if (q_total_elements > debug_count)
+                {
+                    printf("Last %d elements:\n", debug_count);
+                    for (int i = 0; i < debug_count; ++i)
+                    {
+                        float val = static_cast<float>(host_q_buffer[debug_count + i]);
+                        printf("Q_orig[%d]: %.6f", q_total_elements - debug_count + i, val);
+                        if ((i + 1) % 10 == 0)
+                            printf("\n");
+                        else
+                            printf("  ");
+                    }
+                    if (debug_count % 10 != 0)
+                        printf("\n");
+                }
+            }
+
+            // Dump original K matrix
+            {
+                int debug_count = std::min(100, k_total_elements);
+                std::vector<T> host_k_buffer(debug_count * 2);
+
+                cudaMemcpy(host_k_buffer.data(), orig_k_ptr, debug_count * sizeof(T), cudaMemcpyDeviceToHost);
+                if (k_total_elements > debug_count)
+                {
+                    cudaMemcpy(host_k_buffer.data() + debug_count, orig_k_ptr + k_total_elements - debug_count,
+                        debug_count * sizeof(T), cudaMemcpyDeviceToHost);
+                }
+
+                printf("DEBUG: K matrix (original) - Shape: (%d, %d), Total elements: %d\n", params.acc_q_len,
+                    total_k_dim_all_heads, k_total_elements);
+                printf("First %d elements:\n", debug_count);
+                for (int i = 0; i < debug_count; ++i)
+                {
+                    float val = static_cast<float>(host_k_buffer[i]);
+                    printf("K_orig[%d]: %.6f", i, val);
+                    if ((i + 1) % 10 == 0)
+                        printf("\n");
+                    else
+                        printf("  ");
+                }
+                if (debug_count % 10 != 0)
+                    printf("\n");
+
+                if (k_total_elements > debug_count)
+                {
+                    printf("Last %d elements:\n", debug_count);
+                    for (int i = 0; i < debug_count; ++i)
+                    {
+                        float val = static_cast<float>(host_k_buffer[debug_count + i]);
+                        printf("K_orig[%d]: %.6f", k_total_elements - debug_count + i, val);
+                        if ((i + 1) % 10 == 0)
+                            printf("\n");
+                        else
+                            printf("  ");
+                    }
+                    if (debug_count % 10 != 0)
+                        printf("\n");
+                }
+            }
+
+            // Dump original V matrix
+            {
+                int debug_count = std::min(100, v_total_elements);
+                std::vector<T> host_v_buffer(debug_count * 2);
+
+                cudaMemcpy(host_v_buffer.data(), orig_v_ptr, debug_count * sizeof(T), cudaMemcpyDeviceToHost);
+                if (v_total_elements > debug_count)
+                {
+                    cudaMemcpy(host_v_buffer.data() + debug_count, orig_v_ptr + v_total_elements - debug_count,
+                        debug_count * sizeof(T), cudaMemcpyDeviceToHost);
+                }
+
+                printf("DEBUG: V matrix (original) - Shape: (%d, %d), Total elements: %d\n", params.acc_q_len,
+                    total_v_dim_all_heads, v_total_elements);
+                printf("First %d elements:\n", debug_count);
+                for (int i = 0; i < debug_count; ++i)
+                {
+                    float val = static_cast<float>(host_v_buffer[i]);
+                    printf("V_orig[%d]: %.6f", i, val);
+                    if ((i + 1) % 10 == 0)
+                        printf("\n");
+                    else
+                        printf("  ");
+                }
+                if (debug_count % 10 != 0)
+                    printf("\n");
+
+                if (v_total_elements > debug_count)
+                {
+                    printf("Last %d elements:\n", debug_count);
+                    for (int i = 0; i < debug_count; ++i)
+                    {
+                        float val = static_cast<float>(host_v_buffer[debug_count + i]);
+                        printf("V_orig[%d]: %.6f", v_total_elements - debug_count + i, val);
+                        if ((i + 1) % 10 == 0)
+                            printf("\n");
+                        else
+                            printf("  ");
+                    }
+                    if (debug_count % 10 != 0)
+                        printf("\n");
+                }
+            }
+
+            printf("=== End of QKV split debugging ===\n");
+            {
+                int debug_count = std::min(100, q_total_elements);
+                std::vector<__nv_fp8_e4m3> host_q_buffer(debug_count * 2); // first 100 + last 100
+
+                // Copy first 100 elements
+                cudaMemcpy(
+                    host_q_buffer.data(), quant_q_ptr, debug_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+
+                // Copy last 100 elements if there are enough elements
+                if (q_total_elements > debug_count)
+                {
+                    cudaMemcpy(host_q_buffer.data() + debug_count, quant_q_ptr + q_total_elements - debug_count,
+                        debug_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+                }
+
+                printf("DEBUG: Q matrix (quantized) - Shape: (%d, %d), Total elements: %d\n", params.acc_q_len,
+                    total_q_dim_all_heads, q_total_elements);
+                printf("First %d elements:\n", debug_count);
+                for (int i = 0; i < debug_count; ++i)
+                {
+                    float val = static_cast<float>(host_q_buffer[i]);
+                    printf("Q[%d]: %.6f", i, val);
+                    if ((i + 1) % 10 == 0)
+                        printf("\n");
+                    else
+                        printf("  ");
+                }
+                if (debug_count % 10 != 0)
+                    printf("\n");
+
+                if (q_total_elements > debug_count)
+                {
+                    printf("Last %d elements:\n", debug_count);
+                    for (int i = 0; i < debug_count; ++i)
+                    {
+                        float val = static_cast<float>(host_q_buffer[debug_count + i]);
+                        printf("Q[%d]: %.6f", q_total_elements - debug_count + i, val);
+                        if ((i + 1) % 10 == 0)
+                            printf("\n");
+                        else
+                            printf("  ");
+                    }
+                    if (debug_count % 10 != 0)
+                        printf("\n");
+                }
+            }
+
+            // Dump K matrix (quantized)
+            {
+                int debug_count = std::min(100, k_total_elements);
+                std::vector<__nv_fp8_e4m3> host_k_buffer(debug_count * 2);
+
+                cudaMemcpy(
+                    host_k_buffer.data(), quant_k_ptr, debug_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+                if (k_total_elements > debug_count)
+                {
+                    cudaMemcpy(host_k_buffer.data() + debug_count, quant_k_ptr + k_total_elements - debug_count,
+                        debug_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+                }
+
+                printf("DEBUG: K matrix (quantized) - Shape: (%d, %d), Total elements: %d\n", params.acc_q_len,
+                    total_k_dim_all_heads, k_total_elements);
+                printf("First %d elements:\n", debug_count);
+                for (int i = 0; i < debug_count; ++i)
+                {
+                    float val = static_cast<float>(host_k_buffer[i]);
+                    printf("K[%d]: %.6f", i, val);
+                    if ((i + 1) % 10 == 0)
+                        printf("\n");
+                    else
+                        printf("  ");
+                }
+                if (debug_count % 10 != 0)
+                    printf("\n");
+
+                if (k_total_elements > debug_count)
+                {
+                    printf("Last %d elements:\n", debug_count);
+                    for (int i = 0; i < debug_count; ++i)
+                    {
+                        float val = static_cast<float>(host_k_buffer[debug_count + i]);
+                        printf("K[%d]: %.6f", k_total_elements - debug_count + i, val);
+                        if ((i + 1) % 10 == 0)
+                            printf("\n");
+                        else
+                            printf("  ");
+                    }
+                    if (debug_count % 10 != 0)
+                        printf("\n");
+                }
+            }
+
+            // Dump V matrix (quantized)
+            {
+                int debug_count = std::min(100, v_total_elements);
+                std::vector<__nv_fp8_e4m3> host_v_buffer(debug_count * 2);
+
+                cudaMemcpy(
+                    host_v_buffer.data(), quant_v_ptr, debug_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+                if (v_total_elements > debug_count)
+                {
+                    cudaMemcpy(host_v_buffer.data() + debug_count, quant_v_ptr + v_total_elements - debug_count,
+                        debug_count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+                }
+
+                printf("DEBUG: V matrix (quantized) - Shape: (%d, %d), Total elements: %d\n", params.acc_q_len,
+                    total_v_dim_all_heads, v_total_elements);
+                printf("First %d elements:\n", debug_count);
+                for (int i = 0; i < debug_count; ++i)
+                {
+                    float val = static_cast<float>(host_v_buffer[i]);
+                    printf("V[%d]: %.6f", i, val);
+                    if ((i + 1) % 10 == 0)
+                        printf("\n");
+                    else
+                        printf("  ");
+                }
+                if (debug_count % 10 != 0)
+                    printf("\n");
+
+                if (v_total_elements > debug_count)
+                {
+                    printf("Last %d elements:\n", debug_count);
+                    for (int i = 0; i < debug_count; ++i)
+                    {
+                        float val = static_cast<float>(host_v_buffer[debug_count + i]);
+                        printf("V[%d]: %.6f", v_total_elements - debug_count + i, val);
+                        if ((i + 1) % 10 == 0)
+                            printf("\n");
+                        else
+                            printf("  ");
+                    }
+                    if (debug_count % 10 != 0)
+                        printf("\n");
+                }
+            }
+
+            printf("=== End of QKV split debugging ===\n");
         }
         else
         {
@@ -1090,19 +1596,55 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
         }
     }
 
-    dim3 grid(int(tensorrt_llm::common::divUp(params.max_input_seq_len, 32)), params.batch_size, params.head_num + 8);
-    auto head_size = params.meta.qk_nope_head_dim;
-    std::cout << "params.head_num : " << params.head_num << std::endl;
-    std::cout << "params.meta.kv_lora_rank : " << params.meta.kv_lora_rank << std::endl;
-    std::cout << "head_size in mlaKernels : " << head_size << std::endl;
-    std::cout << "params.cu_q_seqlens : " << params.cu_q_seqlens << std::endl;
-    std::cout << "params.cache_seq_lens : " << params.cache_seq_lens << std::endl;
-    std::cout << "params.max_input_seq_len : " << params.max_input_seq_len << std::endl;
-    applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(
-        params.attention_input_buf, params.latent_cache, kv_cache_buffer, params.cos_sin_cache, params.head_num,
-        head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len,
-        params.cache_type, params.quant_scale_kv, params.quant_attention_input_buf, params.quant_scale_qkv,
-        params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, params.dequant_scale_kv, params.host_bmm1_scale);
+    // === DEBUG: Add FMHA output dumping placeholder ===
+    // Note: This should be added after mFmhaDispatcher->run(fmhaParams) call in the file that contains it
+    // The following code shows how to dump fmhaParams.outputPtr with shape (params.acc_q_len, total_v_dim_all_heads)
+    /*
+    if (fmhaParams.outputPtr != nullptr) {
+        cudaStreamSynchronize(stream);
+        int const v_output_elements = params.acc_q_len * total_v_dim_all_heads;
+
+        // Dump first 100 and last 100 elements of FMHA output
+        {
+            int debug_count = std::min(100, v_output_elements);
+            std::vector<T> host_output_buffer(debug_count * 2);
+
+            // Copy first 100 elements
+            cudaMemcpy(host_output_buffer.data(), static_cast<T*>(fmhaParams.outputPtr),
+                      debug_count * sizeof(T), cudaMemcpyDeviceToHost);
+
+            // Copy last 100 elements if there are enough elements
+            if (v_output_elements > debug_count) {
+                cudaMemcpy(host_output_buffer.data() + debug_count,
+                          static_cast<T*>(fmhaParams.outputPtr) + v_output_elements - debug_count,
+                          debug_count * sizeof(T), cudaMemcpyDeviceToHost);
+            }
+
+            printf("DEBUG: FMHA output - Shape: (%d, %d), Total elements: %d\n",
+                   params.acc_q_len, total_v_dim_all_heads, v_output_elements);
+            printf("First %d elements:\n", debug_count);
+            for (int i = 0; i < debug_count; ++i) {
+                float val = static_cast<float>(host_output_buffer[i]);
+                printf("FMHA_out[%d]: %.6f", i, val);
+                if ((i + 1) % 10 == 0) printf("\n");
+                else printf("  ");
+            }
+            if (debug_count % 10 != 0) printf("\n");
+
+            if (v_output_elements > debug_count) {
+                printf("Last %d elements:\n", debug_count);
+                for (int i = 0; i < debug_count; ++i) {
+                    float val = static_cast<float>(host_output_buffer[debug_count + i]);
+                    printf("FMHA_out[%d]: %.6f", v_output_elements - debug_count + i, val);
+                    if ((i + 1) % 10 == 0) printf("\n");
+                    else printf("  ");
+                }
+                if (debug_count % 10 != 0) printf("\n");
+            }
+        }
+        printf("=== End of FMHA output debugging ===\n");
+    }
+    */
 }
 
 template <typename T, typename KVCacheBuffer>

@@ -878,8 +878,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 # TODO(qijun): revisit fp8_context_fmha logic
                 out_dtype = torch.float8_e4m3fn
 
-        if self.is_mla_enable and attention_input_type == AttentionInputType.context_only and self.has_fp8_kv_cache:
-            out_dtype = torch.float8_e4m3fn
+        # if self.is_mla_enable and attention_input_type == AttentionInputType.context_only and self.has_fp8_kv_cache:
+        #     out_dtype = torch.float8_e4m3fn
         # print(f"attention_input_type : {attention_input_type}")
         # flat_tensor = q.flatten()
         # print(f"q shape : {q.shape}")
@@ -922,17 +922,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             update_kv_cache=not metadata.is_cross or k is not None,
             attention_mask=attention_mask)
 
-        if out_dtype == torch.float8_e4m3fn:
-            s = torch.ones((1, 1), dtype=torch.bfloat16, device='cuda')
-            # s = (output.flatten().float().abs().max().view(1, 1) /
-            #      torch.finfo(torch.float8_e4m3fn).max).to(torch.bfloat16)
-            output_fp16 = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(
-                output_act, s)
-            flat_tensor = output_fp16.flatten()
-            print(f"output_fp16 shape : {output_fp16.shape}")
-            print(f"output_fp16 first 100 elements : {flat_tensor[:100]}")
-            print(f"output_fp16 last 100 elements : {flat_tensor[-100:]}")
-            return output_fp16
+        # if out_dtype == torch.float8_e4m3fn:
+        #     s = torch.ones((1, 1), dtype=torch.bfloat16, device='cuda')
+        #     # s = (output.flatten().float().abs().max().view(1, 1) /
+        #     #      torch.finfo(torch.float8_e4m3fn).max).to(torch.bfloat16)
+        #     output_fp16 = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(
+        #         output_act, s)
+        #     flat_tensor = output_fp16.flatten()
+        #     print(f"output_fp16 shape : {output_fp16.shape}")
+        #     print(f"output_fp16 first 100 elements : {flat_tensor[:100]}")
+        #     print(f"output_fp16 last 100 elements : {flat_tensor[-100:]}")
+        #     return output_fp16
 
         if out_dtype == torch.uint8:
             return Fp4QuantizedTensor(output_act, output_sf)

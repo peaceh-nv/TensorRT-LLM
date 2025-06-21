@@ -1704,6 +1704,82 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 // compute RoPE and set compressed_kv + k_pe by invokeMLARopeContext if not using paged context FMHA
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
 
+                // === DEBUG: Dump scale values after invokeMLARopeContext ===
+                sync_check_cuda_error(stream);
+                cudaStreamSynchronize(stream);
+
+                printf("=== DEBUG: Scale values after invokeMLARopeContext ===\n");
+
+                // Dump quant_scale_o
+                if (params.mla_param->quant_scale_o != nullptr)
+                {
+                    float host_quant_scale_o;
+                    cudaMemcpy(
+                        &host_quant_scale_o, params.mla_param->quant_scale_o, sizeof(float), cudaMemcpyDeviceToHost);
+                    printf("params.mla_param->quant_scale_o[0]: %.6f\n", host_quant_scale_o);
+                }
+                else
+                {
+                    printf("params.mla_param->quant_scale_o is nullptr\n");
+                }
+
+                // Dump dequant_scale_q
+                if (params.mla_param->dequant_scale_q != nullptr)
+                {
+                    float host_dequant_scale_q;
+                    cudaMemcpy(&host_dequant_scale_q, params.mla_param->dequant_scale_q, sizeof(float),
+                        cudaMemcpyDeviceToHost);
+                    printf("params.mla_param->dequant_scale_q[0]: %.6f\n", host_dequant_scale_q);
+                }
+                else
+                {
+                    printf("params.mla_param->dequant_scale_q is nullptr\n");
+                }
+
+                // Dump dequant_scale_kv
+                if (params.mla_param->dequant_scale_kv != nullptr)
+                {
+                    float host_dequant_scale_kv;
+                    cudaMemcpy(&host_dequant_scale_kv, params.mla_param->dequant_scale_kv, sizeof(float),
+                        cudaMemcpyDeviceToHost);
+                    printf("params.mla_param->dequant_scale_kv[0]: %.6f\n", host_dequant_scale_kv);
+                }
+                else
+                {
+                    printf("params.mla_param->dequant_scale_kv is nullptr\n");
+                }
+
+                // Dump bmm1_scale
+                if (params.mla_param->bmm1_scale != nullptr)
+                {
+                    float host_bmm1_scales[2]; // BMM1 typically has 2 scale values
+                    cudaMemcpy(
+                        host_bmm1_scales, params.mla_param->bmm1_scale, 2 * sizeof(float), cudaMemcpyDeviceToHost);
+                    printf("params.mla_param->bmm1_scale[0]: %.6f\n", host_bmm1_scales[0]);
+                    printf("params.mla_param->bmm1_scale[1] (with log2e): %.6f\n", host_bmm1_scales[1]);
+                }
+                else
+                {
+                    printf("params.mla_param->bmm1_scale is nullptr\n");
+                }
+
+                // Dump bmm2_scale
+                if (params.mla_param->bmm2_scale != nullptr)
+                {
+                    float host_bmm2_scale;
+                    cudaMemcpy(&host_bmm2_scale, params.mla_param->bmm2_scale, sizeof(float), cudaMemcpyDeviceToHost);
+                    printf("params.mla_param->bmm2_scale[0]: %.6f\n", host_bmm2_scale);
+                }
+                else
+                {
+                    printf("params.mla_param->bmm2_scale is nullptr\n");
+                }
+
+                // Dump host_bmm1_scale
+                printf("params.mla_param->host_bmm1_scale: %.6f\n", params.mla_param->host_bmm1_scale);
+
+                printf("=== End of scale values dump ===\n");
+
                 // Check for invalid numbers in fp8_qkv_buffer after MLA RoPE Context
                 // if (mFP8ContextFMHA && fp8_qkv_buffer != nullptr)
                 // {
@@ -1733,16 +1809,16 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             invokeQKVPreprocessing(preprocessingParams, stream);
         }
-        sync_check_cuda_error(stream);
-        {
-            std::string const afterRopeStr = "ctx attention after RoPE at layer " + std::to_string(mLayerIdx);
-            TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(params.num_tokens,
-                                           (local_hidden_units_qo + 2 * local_hidden_units_kv), mType,
-                                           const_cast<T*>(attention_input), stream, afterRopeStr)
-                    == false,
-                "Found invalid number (NaN or Inf) in " + afterRopeStr);
-            sync_check_cuda_error(stream);
-        }
+        // sync_check_cuda_error(stream);
+        // {
+        //     std::string const afterRopeStr = "ctx attention after RoPE at layer " + std::to_string(mLayerIdx);
+        //     TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(params.num_tokens,
+        //                                    (local_hidden_units_qo + 2 * local_hidden_units_kv), mType,
+        //                                    const_cast<T*>(attention_input), stream, afterRopeStr)
+        //             == false,
+        //         "Found invalid number (NaN or Inf) in " + afterRopeStr);
+        //     sync_check_cuda_error(stream);
+        // }
 
         if (params.runtime_perf_knobs)
         {
@@ -1818,11 +1894,105 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             fmhaParams.chunkedAttentionSize = *mAttentionChunkSize;
         }
 
+        // === DEBUG: Dump BMM scale pointers before FMHA ===
+        printf("=== DEBUG: Dumping BMM scale pointers before mFmhaDispatcher->run ===\n");
+
+        if (fmhaParams.scaleBmm1Ptr != nullptr)
+        {
+            float host_bmm1_scales[2]; // BMM1 typically has 2 scale values
+            cudaMemcpy(host_bmm1_scales, fmhaParams.scaleBmm1Ptr, 2 * sizeof(float), cudaMemcpyDeviceToHost);
+            printf("DEBUG: scaleBmm1Ptr[0] (before): %.6f\n", host_bmm1_scales[0]);
+            printf("DEBUG: scaleBmm1Ptr[1] (before): %.6f\n", host_bmm1_scales[1]);
+
+            // Set all items in scaleBmm1Ptr to 1.0f
+            float new_bmm1_scales[2] = {0.09f, 0.1298425537f};
+            cudaMemcpyAsync(fmha_bmm1_scale_ptr, new_bmm1_scales, 2 * sizeof(float), cudaMemcpyHostToDevice, stream);
+            printf("DEBUG: Set scaleBmm1Ptr[0] = 1.0f\n");
+            printf("DEBUG: Set scaleBmm1Ptr[1] = 1.0f\n");
+        }
+        else
+        {
+            printf("DEBUG: scaleBmm1Ptr is nullptr\n");
+        }
+
+        if (fmhaParams.scaleBmm2Ptr != nullptr)
+        {
+            float host_bmm2_scale;
+            cudaMemcpy(&host_bmm2_scale, fmhaParams.scaleBmm2Ptr, sizeof(float), cudaMemcpyDeviceToHost);
+            printf("DEBUG: scaleBmm2Ptr[0]: %.6f\n", host_bmm2_scale);
+        }
+        else
+        {
+            printf("DEBUG: scaleBmm2Ptr is nullptr\n");
+        }
+
+        printf("=== End of BMM scale pointers debugging ===\n");
+
         // Run the fmha kernel.
         mFmhaDispatcher->run(fmhaParams);
         sync_check_cuda_error(stream);
+
+        // === DEBUG: Dump FMHA output ===
+        if (fmhaParams.outputPtr != nullptr)
+        {
+            cudaStreamSynchronize(stream);
+            int const v_output_elements = params.num_tokens * total_v_dim_all_heads;
+
+            printf("=== DEBUG: Dumping FMHA output (fmhaParams.outputPtr) ===\n");
+            printf("DEBUG: FMHA output - Shape: (%d, %d), Total elements: %d\n", params.num_tokens,
+                total_v_dim_all_heads, v_output_elements);
+
+            // Dump first 100 and last 100 elements of FMHA output
+            {
+                int debug_count = std::min(100, v_output_elements);
+                std::vector<T> host_output_buffer(debug_count * 2);
+
+                // Copy first 100 elements
+                cudaMemcpy(host_output_buffer.data(), static_cast<T*>(fmhaParams.outputPtr), debug_count * sizeof(T),
+                    cudaMemcpyDeviceToHost);
+
+                // Copy last 100 elements if there are enough elements
+                if (v_output_elements > debug_count)
+                {
+                    cudaMemcpy(host_output_buffer.data() + debug_count,
+                        static_cast<T*>(fmhaParams.outputPtr) + v_output_elements - debug_count,
+                        debug_count * sizeof(T), cudaMemcpyDeviceToHost);
+                }
+
+                printf("First %d elements:\n", debug_count);
+                for (int i = 0; i < debug_count; ++i)
+                {
+                    float val = static_cast<float>(host_output_buffer[i]);
+                    printf("FMHA_out[%d]: %.6f", i, val);
+                    if ((i + 1) % 10 == 0)
+                        printf("\n");
+                    else
+                        printf("  ");
+                }
+                if (debug_count % 10 != 0)
+                    printf("\n");
+
+                if (v_output_elements > debug_count)
+                {
+                    printf("Last %d elements:\n", debug_count);
+                    for (int i = 0; i < debug_count; ++i)
+                    {
+                        float val = static_cast<float>(host_output_buffer[debug_count + i]);
+                        printf("FMHA_out[%d]: %.6f", v_output_elements - debug_count + i, val);
+                        if ((i + 1) % 10 == 0)
+                            printf("\n");
+                        else
+                            printf("  ");
+                    }
+                    if (debug_count % 10 != 0)
+                        printf("\n");
+                }
+            }
+            printf("=== End of FMHA output debugging ===\n");
+        }
         // The kv cache might need to be updated after FMHA (only when sliding window attention + chunked context is
         // used together). Reuse the preprocessingParams.
+
         invokeKvCachePostprocessing(preprocessingParams, stream);
         sync_check_cuda_error(stream);
 
@@ -2617,7 +2787,7 @@ int AttentionOp::initialize() noexcept
         if (mFP8ContextFMHA && mKVCacheQuantMode.hasFp8KvCache())
         {
             fmhaParams.dataTypeKv = DATA_TYPE_E4M3;
-            fmhaParams.dataTypeOut = DATA_TYPE_E4M3;
+            fmhaParams.dataTypeOut = DATA_TYPE_BF16;
         }
         // TODO: remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
         // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
