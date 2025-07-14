@@ -1188,6 +1188,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if out_dtype == torch.uint8:
             assert output_sf is not None
             return Fp4QuantizedTensor(output, output_sf)
+        # flat_tensor = output.flatten()
+        # print(f"output_act shape : {output.shape}")
+        # print(f"output_act first 100 elements : {flat_tensor[:100]}")
+        # print(f"output_act last 100 elements : {flat_tensor[-100:]}")
         return output
 
     @classmethod

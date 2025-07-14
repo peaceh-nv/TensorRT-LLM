@@ -592,7 +592,7 @@ class WideEPMoE(MoE):
                 x = x.view(torch.bfloat16)
                 assert x.shape[0] == token_num and x.shape[1] == hidden_size // 4
                 # DeepEP LL dispatch only supports bf16 tensors with a hidden size of 2560, 4096, 5120, or 7168 as input. A hidden size of 2560 is sufficient to accommodate packed FP4 data.
-                packed_hidden_size = 2560
+                packed_hidden_size = 7168
                 assert x.shape[1] + x_sf.shape[1] <= packed_hidden_size
                 fp4_packed_tensor = torch.empty((token_num, packed_hidden_size),
                                                 dtype=torch.bfloat16,
