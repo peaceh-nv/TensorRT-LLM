@@ -1,0 +1,412 @@
+import array
+import atexit
+import ctypes
+import os
+import traceback
+from collections import deque
+from ctypes.util import find_library
+from typing import Any, BinaryIO, Callable, ClassVar, Generic, Sequence, TypeVar
+
+import cuda.bindings.driver as drv
+
+
+def _unwrap(ret: drv.CUresult | tuple[drv.CUresult, Any]):
+    if isinstance(ret, drv.CUresult):
+        if ret != drv.CUDA_SUCCESS:
+            raise RuntimeError(f"CUDA driver error: {ret}")
+    else:
+        _unwrap(ret[0])
+        return ret[1]
+
+
+def div_up(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+def round_up(x: int, y: int) -> int:
+    return div_up(x, y) * y
+
+
+def round_down(x: int, y: int) -> int:
+    return x // y * y
+
+
+mem_alignment = 2 << 20  # 2MB
+
+_libc = ctypes.CDLL(find_library('c'))
+
+
+def _posix_memalign(alignment: int, size: int) -> int:
+    """
+    Allocates size bytes of uninitialized storage whose alignment is specified by alignment.
+    Returns the address as an integer.
+    Raises OSError on failure.
+    """
+    memptr = ctypes.c_void_p()
+    ret = _libc.posix_memalign(ctypes.byref(memptr), alignment, size)
+    if ret != 0:
+        raise MemoryError("posix_memalign failed")
+    assert memptr.value is not None and memptr.value != 0
+    return memptr.value
+
+
+def _realloc(ptr: int, size: int) -> int:
+    """
+    Reallocates size bytes of storage whose alignment is specified by alignment.
+    Returns the address as an integer.
+    Raises OSError on failure.
+    """
+    ret = _libc.realloc(ptr, size)
+    if ret == ctypes.c_void_p(0):
+        raise MemoryError(
+            "realloc failed. Please report a bug to https://github.com/NVIDIA/tensorrt-llm/issues"
+        )
+    return ret
+
+
+class HostMem:
+    """
+    Host memory aligned to 2MB, reallocable for low-cost resizing and registered to CUDA as page-locked memory.
+    Resizing will keep the original memory content, like `realloc` in C.
+    Note that we did not enable CU_MEMHOSTREGISTER_DEVICEMAP so the memory may not be accessible from kernels.
+    We do not intend to use this memory in CUDA kernels.
+    """
+    _address: int
+    _size: int
+
+    @property
+    def address(self) -> int:
+        return self._address
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def __init__(self, size: int):
+        if size == 0:
+            self._address = 0
+            self._size = 0
+            return
+        self._address = _posix_memalign(mem_alignment, size)
+        self._size = size
+
+    def resize(self, new_size: int):
+        self._unregister_from_cuda()
+        try:
+            self._address = _realloc(self._address, new_size)
+            self._size = new_size
+        finally:
+            self._register_to_cuda()
+
+    def destroy(self):
+        self._unregister_from_cuda()
+        _libc.free(self._address)
+        self._address = 0
+        self._size = 0
+
+    def __del__(self):
+        if self._address != 0:
+            self.destroy()
+
+    def _register_to_cuda(self):
+        _unwrap(
+            drv.cuMemHostRegister(self._address, self._size,
+                                  drv.CU_MEMHOSTREGISTER_PORTABLE))
+
+    def _unregister_from_cuda(self):
+        _unwrap(drv.cuMemHostUnregister(self._address))
+
+
+def _posix_fallocate(fd: int, offset: int, length: int):
+    ret = _libc.posix_fallocate(fd, offset, length)
+    if ret != 0:
+        raise OSError(ret, "posix_fallocate failed")
+
+
+def get_file_size(file: BinaryIO) -> int:
+    file.seek(0, os.SEEK_END)
+    return file.tell()
+
+
+def resize_file(file: BinaryIO, new_size: int):
+    old_size = get_file_size(file)
+    if new_size > old_size:
+        _posix_fallocate(file.fileno(), old_size, new_size - old_size)
+    elif new_size < old_size:
+        file.truncate(new_size)
+
+
+class DynamicBitset:
+    """
+    A memory efficient bitset that can be resized.
+    """
+    _bits: array.array
+    _num_set_bits: int
+
+    ALL_SET_MASK = (1 << 64) - 1
+
+    def __init__(self, capacity: int):
+        self._bits = array.array('Q', [0] * ((capacity + 63) // 64))
+        self._num_set_bits = 0
+
+    def set(self, index: int):
+        if not self.get(index):
+            self._bits[index // 64] |= 1 << (index % 64)
+            self._num_set_bits += 1
+
+    def get(self, index: int) -> bool:
+        return self._bits[index // 64] & (1 << (index % 64)) != 0
+
+    def clear(self, index: int):
+        if self.get(index):
+            self._bits[index // 64] &= ~(1 << (index % 64))
+            self._num_set_bits -= 1
+
+    @property
+    def num_set_bits(self) -> int:
+        return self._num_set_bits
+
+    def resize(self, new_capacity: int):
+        extra_elems = (new_capacity + 63) // 64 - len(self._bits)
+        if extra_elems > 0:
+            self._bits.extend(array.array('Q', [0] * extra_elems))
+        else:
+            self._bits = self._bits[:extra_elems]
+
+    # check if any bit in the range [start, end) is set
+    def any_set(self, start: int, end: int) -> bool:
+        if start >= end:
+            return False
+        start_word_mask = self.ALL_SET_MASK << (start % 64)
+        end_word_mask = self.ALL_SET_MASK >> (64 - (end % 64))
+        if start // 64 == end // 64:
+            if (start_word_mask & end_word_mask & self._bits[start // 64]) != 0:
+                return True
+        else:
+            if (start_word_mask & self._bits[start // 64]) != 0 or (
+                    end_word_mask & self._bits[end // 64]) != 0:
+                return True
+        return any(self._bits[i] != 0
+                   for i in range(start // 64 + 1, end // 64))
+
+
+T = TypeVar('T')
+U = TypeVar('U')
+
+
+class SimplePool(Generic[T]):
+    __slots__ = ('_create_func', '_destroy_func', '_items', '_max_size')
+    _create_func: Callable[[], T]
+    _destroy_func: Callable[[T], None]
+    _items: deque[T]
+    _max_size: int
+
+    def __init__(self,
+                 create_func: Callable[[], T],
+                 destroy_func: Callable[[T], None],
+                 init_size: int = 0,
+                 max_size: int = 1024):
+        self._create_func = create_func
+        self._destroy_func = destroy_func
+        self._items = deque[T]((create_func() for _ in range(init_size)),
+                               maxlen=max_size)
+        self._max_size = max_size
+
+    def clear(self):
+        while True:
+            self._destroy_func(self._items.popleft())
+
+    def __del__(self):
+        self.clear()
+
+    def get(self) -> T:
+        return self._items.popleft() if self._items else self._create_func()
+
+    def put(self, item: T):
+        if len(self._items) >= self._max_size:
+            self._destroy_func(item)
+        self._items.appendleft(item)
+
+
+class ItemHolder(Generic[T]):
+    # Registry to hold pools per subclass
+    _pool: SimplePool[T] | None = None
+
+    __slots__ = ('_item', )
+    _item: T | None
+
+    def __init__(self):
+        self._item = self.pool.get()
+
+    def close(self):
+        if not self.is_closed():
+            self.pool.put(self._item)  # type: ignore
+            self._item = None
+
+    def __del__(self):
+        self.close()
+
+    @property
+    def pool(self) -> SimplePool[T]:
+        assert self._pool is not None
+        return self._pool
+
+    def is_closed(self) -> bool:
+        return self._item is None
+
+    @classmethod
+    def register_pool(cls, pool: SimplePool[T]):
+        cls._pool = pool
+        atexit.register(cls.clear_pool)
+
+    @classmethod
+    def clear_pool(cls):
+        if cls._pool is not None:
+            cls._pool.clear()
+
+    def get(self) -> T:
+        assert not self.is_closed()
+        return self._item  # type: ignore
+
+
+class CachedCudaEvent(ItemHolder[drv.CUevent]):
+    """
+    A cached CUDA event without support for timing. Recorded to a stream when created.
+    """
+    NULL: ClassVar['_NullCudaEvent']
+
+    __slots__ = ()
+
+    def __init__(self, stream: drv.CUstream):
+        super().__init__()
+        self._record(stream)
+
+    def query_complete(self) -> bool:
+        """
+        Query the event. If complete, also close the event. Closed events are always considered complete.
+        """
+        if self.is_closed():
+            return True
+        err = drv.cuEventQuery(self.get())
+        if err == drv.CUDA_SUCCESS:
+            self.close()
+            return True
+        elif err == drv.CUDA_ERROR_NOT_READY:
+            return False
+        else:
+            raise RuntimeError(f"CUDA driver error: {err}")
+
+    def synchronize(self):
+        if self.is_closed():
+            return
+        _unwrap(drv.cuEventSynchronize(self.get()))
+        self.close()
+
+    def wait_in_stream(self, stream: drv.CUstream):
+        if self.is_closed():
+            return
+        _unwrap(
+            drv.cuStreamWaitEvent(stream, self.get(),
+                                  drv.CU_STREAM_WAIT_VALUE_COMPLETED))
+
+    def _record(self, stream: drv.CUstream):
+        """
+        Prefer new event instead of recording an existing event.
+        """
+        _unwrap(drv.cuEventRecord(self.get(), stream))
+
+
+CachedCudaEvent.register_pool(
+    SimplePool[drv.CUevent](lambda: _unwrap(
+        drv.cuEventCreate(drv.CUevent_flags.CU_EVENT_DISABLE_TIMING)),
+                            lambda ev: _unwrap(drv.cuEventDestroy(ev)),
+                            init_size=64))
+
+
+class _NullCudaEvent(CachedCudaEvent):
+    """
+    A null CUDA event that is closed (and always complete).
+    """
+
+    def __init__(self):
+        # do not call super().__init__(). We don't need an event here.
+        self._item = None
+
+
+CachedCudaEvent.NULL = _NullCudaEvent()
+
+
+class CachedCudaStream(ItemHolder[drv.CUstream]):
+    """
+    A cached non-blocking CUDA stream.
+    """
+    __slots__ = ()
+
+    def wait_event(self, event: drv.CUevent) -> None:
+        _unwrap(
+            drv.cuStreamWaitEvent(self.get(), event,
+                                  drv.CU_STREAM_WAIT_VALUE_COMPLETED))
+
+    def wait_events(
+            self,
+            events: Sequence[CachedCudaEvent] | set[CachedCudaEvent]) -> None:
+        '''
+        Wait for events with deduplication first.
+        '''
+        for ev in (set(events) if isinstance(events, Sequence) else events):
+            ev.wait_in_stream(self.get())
+
+    def record_event(self) -> CachedCudaEvent:
+        return CachedCudaEvent(self.get())
+
+
+CachedCudaStream.register_pool(SimplePool[drv.CUstream](
+    lambda: _unwrap(
+        drv.cuStreamCreate(drv.CUstream_flags.CU_STREAM_NON_BLOCKING)),
+    lambda stream: _unwrap(drv.cuStreamDestroy(stream)),
+    init_size=128))
+
+
+class TemporaryCudaStream(CachedCudaStream):
+    """
+    A cached non-blocking CUDA stream. Mainly used as temporary worker streams.
+    Requires a list of prior events to wait for dependencies, and a finish event must be recorded before closing.
+    """
+    __slots__ = ('_finish_event_recorded', )
+    _finish_event_recorded: bool
+
+    def __init__(self, prior_events: Sequence[CachedCudaEvent]
+                 | set[CachedCudaEvent]):
+        super().__init__()
+        self.wait_events(prior_events)
+        self._finish_event_recorded = False
+
+    def close(self):
+        if not self._finish_event_recorded:
+            raise RuntimeError("finish event not recorded" +
+                               "".join(traceback.format_stack()))
+        super().close()
+
+    def finish(self) -> CachedCudaEvent:
+        if self._finish_event_recorded:
+            raise RuntimeError("finish event already recorded")
+        self._finish_event_recorded = True
+        return self.record_event()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
+def merge_events(
+    events: Sequence[CachedCudaEvent] | set[CachedCudaEvent]
+) -> CachedCudaEvent:
+    if len(events) == 0:
+        return CachedCudaEvent.NULL
+    if len(events) == 1:
+        ev = next(iter(events))
+        return ev if not ev.is_closed() else CachedCudaEvent.NULL
+    with TemporaryCudaStream(events) as stream:
+        return stream.finish()
