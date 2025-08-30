@@ -2,97 +2,19 @@ import abc
 import os
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import BinaryIO, override
 
-from . import CacheLevel, DataRole, KVCacheManagerConfig, LayerId
-from ._common import Address, DiskAddress, MemAddress, SlidingWinSize
-from ._copy_engine import CopyTask, batched_copy
-from ._cuda_virt_mem import PhysMem, VirtMem
-from ._life_cycle_registry import LifeCycle, LifeCycleId, LifeCycleRegistry
-from ._utils import (CachedCudaEvent, DynamicBitset, HostMem,
-                     TemporaryCudaStream, div_up, get_file_size, resize_file,
-                     round_down, round_up)
-
-
-@dataclass
-class _BufferId:
-    layer_id: LayerId
-    role: DataRole
-
-
-@dataclass
-class _CoalescedBuffer:
-    life_cycle_id: LifeCycleId
-    single_buffer_size: int  # identical for all buffers in the same coalesced buffer
-    buffer_ids: list[_BufferId]
-
-    @property
-    def size(self) -> int:
-        return self.single_buffer_size * len(self.buffer_ids)
-
-
-@dataclass
-class _PoolConfig:
-    coalesced_size: int
-    coalesced_buffers: list[_CoalescedBuffer] = field(default_factory=list)
-
-    def __post_init__(self):
-        assert all(buffer.size == self.coalesced_size
-                   for buffer in self.coalesced_buffers)
-        assert len(self.coalesced_buffers) > 0
-
-
-# A group of mirrored pools. Each pool has different page size, but they have the same number
-# of slots and allocation/free is mirrored.
-@dataclass
-class _PoolGroupConfig:
-    pools: list[_PoolConfig] = field(default_factory=list)
-
-
-@dataclass
-class _StorageConfig:
-    gpu_mem_quota: int
-    host_mem_quota: int
-    disk_quota: int
-    disk_path: str
-    pool_groups: list[_PoolGroupConfig] = field(default_factory=list)
-
-
-def _create_storage_config(config: KVCacheManagerConfig) -> _StorageConfig:
-    # group buffers first by sliding window size, then by buffer size.
-    buffer_groups = dict[SlidingWinSize, dict[int, list[_BufferId]]]()
-    life_cycle_registry = LifeCycleRegistry(config)
-    for layer in config.layers:
-        window_size = layer.sliding_win_size
-        size_to_buffers = buffer_groups.setdefault(window_size,
-                                                   dict[int, list[_BufferId]]())
-        for buffer in layer.buffers:
-            size_to_buffers.setdefault(buffer.size, []).append(
-                _BufferId(layer.layer_id, buffer.role))
-    pool_size_to_coalesced_buffers = dict[int, list[_CoalescedBuffer]]()
-    for window_size, size_to_buffers in buffer_groups.items():
-        life_cycle_id = life_cycle_registry.get_id(
-            LifeCycle(sliding_win_size=window_size))
-        for size, buffer_ids in size_to_buffers.items():
-            pool_size = size * len(buffer_ids)
-            pool_size_to_coalesced_buffers.setdefault(pool_size, []).append(
-                _CoalescedBuffer(life_cycle_id=life_cycle_id,
-                                 single_buffer_size=size,
-                                 buffer_ids=buffer_ids))
-    # create _StorageConfig from pool_size_to_coalesced_buffers. Group coalesced buffers by the coalesced size.
-    storage_config = _StorageConfig(gpu_mem_quota=config.gpu_mem_quota,
-                                    host_mem_quota=config.host_mem_quota,
-                                    disk_quota=config.disk_quota,
-                                    disk_path=config.disk_path,
-                                    pool_groups=[])
-    for pool_size, coalesced_buffers in pool_size_to_coalesced_buffers.items():
-        pool_group = _PoolGroupConfig(pools=[])
-        pool_group.pools.append(
-            _PoolConfig(coalesced_size=pool_size,
-                        coalesced_buffers=coalesced_buffers))
-        storage_config.pool_groups.append(pool_group)
-    return storage_config
+from .. import CacheLevel, KVCacheManagerConfig
+from .._common import Address, DiskAddress, MemAddress
+from .._copy_engine import CopyTask, batched_copy
+from .._cuda_virt_mem import PhysMem, VirtMem
+from .._exceptions import LogicError, ResourceBusy
+from .._life_cycle_registry import LifeCycleId
+from .._utils import (CachedCudaEvent, DynamicBitset, HostMem,
+                      TemporaryCudaStream, div_up, get_file_size,
+                      query_total_gpu_memory, resize_file, round_down, round_up)
+from ._config import StorageConfig, create_storage_config
 
 
 class PhysMemPool:
@@ -128,7 +50,7 @@ class PhysMemPool:
         elif increase < 0:
             delta = -increase
             if len(self._phys_mem_pool) < delta:
-                raise RuntimeError(
+                raise ResourceBusy(
                     f"Not enough unused physical memory to shrink. Current {len(self._phys_mem_pool)} physical memory, need {delta}"
                 )
             for _ in range(delta):
@@ -200,7 +122,9 @@ class GpuSlotPool(SlotPoolBase):
         if new_mapped_size > self._vm.mapped_size(
         ) and self._shared_phys_mem_pool.num_free_phys_mem * PhysMem.SIZE < new_mapped_size - self._vm.mapped_size(
         ):
-            raise RuntimeError("Not enough physical memory to resize")
+            raise LogicError(
+                "Physical memory preparation is done but not enough physical memory is available"
+            )
         while self._vm.mapped_size() < new_mapped_size:
             self._vm.push(self._shared_phys_mem_pool.pop())
         while self._vm.mapped_size() - new_mapped_size > PhysMem.SIZE:
@@ -333,7 +257,7 @@ class SlotAllocator:
 
     def free(self, slot: Slot):
         if not self._occupied_mask.get(slot.id):
-            raise RuntimeError(f"Slot {slot.id} is not occupied")
+            raise LogicError(f"Slot {slot.id} is not occupied")
         self._recycled_slots.append(slot)
         self._occupied_mask.clear(slot.id)
         self._scrub_events()
@@ -347,7 +271,7 @@ class SlotAllocator:
         assert self._check()
         if new_num_slots < self.num_slots and self._occupied_mask.any_set(
                 new_num_slots, self.num_slots):
-            raise RuntimeError("resize cannot remove occupied slots")
+            raise ResourceBusy("resize cannot remove occupied slots")
         self._occupied_mask.resize(new_num_slots)
         self._capacity = new_num_slots
         self._num_active_slots = min(self._num_active_slots, self._capacity)
@@ -437,9 +361,12 @@ class GpuPoolGroup(PoolGroup):
     def __init__(self, num_slots: int, slot_size_list: Sequence[int],
                  phys_mem_pool: PhysMemPool):
         super().__init__(num_slots)
+        total_gpu_memory = query_total_gpu_memory()
+        max_slot_size = max(slot_size_list)
         self._pools = [
-            GpuSlotPool(slot_size, num_slots, slot_size, phys_mem_pool)
-            for slot_size in slot_size_list
+            GpuSlotPool(slot_size, num_slots,
+                        int(total_gpu_memory * slot_size / max_slot_size),
+                        phys_mem_pool) for slot_size in slot_size_list
         ]
 
 
@@ -647,14 +574,14 @@ class CacheStorage:
         pool_group_index: PoolGroupIndex
         cache_level: CacheLevel
 
-    _config: _StorageConfig
     # different life cycle variants may map to the same pool group
     _life_cycle_id_to_pool_group_index: dict[LifeCycleId, int]
     # sorted by cache levels, None means no storage for this cache level
     _cache_levels: dict[CacheLevel, CacheLevelStorage]
 
-    def __init__(self, config: _StorageConfig):
-        self._config = config
+    def __init__(self, config: StorageConfig | KVCacheManagerConfig):
+        if isinstance(config, KVCacheManagerConfig):
+            config = create_storage_config(config)
         slot_size_lists = [[p.coalesced_size for p in pg.pools]
                            for pg in config.pool_groups]
         # accept an optional avg_seq_len param and consider sliding window.
@@ -679,7 +606,7 @@ class CacheStorage:
                 for cb in pool.coalesced_buffers:
                     if cb.life_cycle_id in self._life_cycle_id_to_pool_group_index and self._life_cycle_id_to_pool_group_index[
                             cb.life_cycle_id] != pg_index:
-                        raise RuntimeError(
+                        raise LogicError(
                             f"Life cycle variant {cb.life_cycle_id} is already mapped to pool group {self._life_cycle_id_to_pool_group_index[cb.life_cycle_id]}"
                         )
                     self._life_cycle_id_to_pool_group_index[
@@ -754,19 +681,28 @@ class CacheStorage:
             s.slot_size(pool_group_index) == result for s in storage_iterator)
         return result
 
+    def resize(self, cache_level: CacheLevel, new_quota: int) -> bool:
+        ...
+
+    def update_ratio(self, cache_level: CacheLevel,
+                     ratio_list: Sequence[float]) -> bool:
+        ...
+
     @property
     def num_pool_groups(self) -> int:
-        ret = len(self._config.pool_groups)
+        iterator = iter(self._cache_levels.values())
+        ret = len(next(iterator)._pool_groups)
         assert all(
-            len(s._pool_groups) == ret for s in self._cache_levels.values()
+            len(s._pool_groups) == ret for s in iterator
         ), "All cache levels must have the same number of pool groups"
         return ret
 
     def num_pools_in_group(self, pool_group_index: PoolGroupIndex) -> int:
-        ret = len(self._config.pool_groups[pool_group_index].pools)
+        iterator = iter(self._cache_levels.values())
+        ret = len(next(iterator)._pool_groups[pool_group_index]._pools)
         assert all(
             len(s._pool_groups[pool_group_index]._pools) == ret
-            for s in self._cache_levels.values()
+            for s in iterator
         ), "All cache levels must have the same number of pools in each pool group"
         return ret
 

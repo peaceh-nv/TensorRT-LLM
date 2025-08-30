@@ -9,14 +9,18 @@ from typing import Any, BinaryIO, Callable, ClassVar, Generic, Sequence, TypeVar
 
 import cuda.bindings.driver as drv
 
+from ._exceptions import (CudaDriverError, LogicError, OutOfDiskSpace,
+                          OutOfHostMemory)
 
-def _unwrap(ret: drv.CUresult | tuple[drv.CUresult, Any]):
+
+def _unwrap(ret: drv.CUresult | tuple[drv.CUresult, Any]
+            | tuple[drv.CUresult, Any, Any]):
     if isinstance(ret, drv.CUresult):
         if ret != drv.CUDA_SUCCESS:
-            raise RuntimeError(f"CUDA driver error: {ret}")
+            raise CudaDriverError(ret)
     else:
         _unwrap(ret[0])
-        return ret[1]
+        return ret[1:]
 
 
 def div_up(x: int, y: int) -> int:
@@ -45,7 +49,7 @@ def _posix_memalign(alignment: int, size: int) -> int:
     memptr = ctypes.c_void_p()
     ret = _libc.posix_memalign(ctypes.byref(memptr), alignment, size)
     if ret != 0:
-        raise MemoryError("posix_memalign failed")
+        raise OutOfHostMemory("posix_memalign failed")
     assert memptr.value is not None and memptr.value != 0
     return memptr.value
 
@@ -58,9 +62,7 @@ def _realloc(ptr: int, size: int) -> int:
     """
     ret = _libc.realloc(ptr, size)
     if ret == ctypes.c_void_p(0):
-        raise MemoryError(
-            "realloc failed. Please report a bug to https://github.com/NVIDIA/tensorrt-llm/issues"
-        )
+        raise OutOfHostMemory("realloc failed.")
     return ret
 
 
@@ -120,7 +122,7 @@ class HostMem:
 def _posix_fallocate(fd: int, offset: int, length: int):
     ret = _libc.posix_fallocate(fd, offset, length)
     if ret != 0:
-        raise OSError(ret, "posix_fallocate failed")
+        raise OutOfDiskSpace(ret, "posix_fallocate failed")
 
 
 def get_file_size(file: BinaryIO) -> int:
@@ -143,10 +145,11 @@ class DynamicBitset:
     _bits: array.array
     _num_set_bits: int
 
+    TYPE_CODE = 'Q'
     ALL_SET_MASK = (1 << 64) - 1
 
     def __init__(self, capacity: int):
-        self._bits = array.array('Q', [0] * ((capacity + 63) // 64))
+        self._bits = array.array(self.TYPE_CODE, [0] * ((capacity + 63) // 64))
         self._num_set_bits = 0
 
     def set(self, index: int):
@@ -169,7 +172,7 @@ class DynamicBitset:
     def resize(self, new_capacity: int):
         extra_elems = (new_capacity + 63) // 64 - len(self._bits)
         if extra_elems > 0:
-            self._bits.extend(array.array('Q', [0] * extra_elems))
+            self._bits.extend(array.array(self.TYPE_CODE, [0] * extra_elems))
         else:
             self._bits = self._bits[:extra_elems]
 
@@ -294,7 +297,7 @@ class CachedCudaEvent(ItemHolder[drv.CUevent]):
         elif err == drv.CUDA_ERROR_NOT_READY:
             return False
         else:
-            raise RuntimeError(f"CUDA driver error: {err}")
+            raise CudaDriverError(err)
 
     def synchronize(self):
         if self.is_closed():
@@ -316,11 +319,11 @@ class CachedCudaEvent(ItemHolder[drv.CUevent]):
         _unwrap(drv.cuEventRecord(self.get(), stream))
 
 
-CachedCudaEvent.register_pool(
-    SimplePool[drv.CUevent](lambda: _unwrap(
-        drv.cuEventCreate(drv.CUevent_flags.CU_EVENT_DISABLE_TIMING)),
-                            lambda ev: _unwrap(drv.cuEventDestroy(ev)),
-                            init_size=64))
+CachedCudaEvent.register_pool(SimplePool[drv.CUevent](
+    lambda: _unwrap(drv.cuEventCreate(drv.CUevent_flags.CU_EVENT_DISABLE_TIMING)
+                    ),
+    lambda ev: _unwrap(drv.cuEventDestroy(ev)),  # type: ignore[arg-type]
+    init_size=64))
 
 
 class _NullCudaEvent(CachedCudaEvent):
@@ -363,7 +366,8 @@ class CachedCudaStream(ItemHolder[drv.CUstream]):
 CachedCudaStream.register_pool(SimplePool[drv.CUstream](
     lambda: _unwrap(
         drv.cuStreamCreate(drv.CUstream_flags.CU_STREAM_NON_BLOCKING)),
-    lambda stream: _unwrap(drv.cuStreamDestroy(stream)),
+    lambda stream: _unwrap(drv.cuStreamDestroy(stream)
+                           ),  # type: ignore[arg-type]
     init_size=128))
 
 
@@ -383,13 +387,13 @@ class TemporaryCudaStream(CachedCudaStream):
 
     def close(self):
         if not self._finish_event_recorded:
-            raise RuntimeError("finish event not recorded" +
-                               "".join(traceback.format_stack()))
+            raise LogicError("finish event not recorded" +
+                             "".join(traceback.format_stack()))
         super().close()
 
     def finish(self) -> CachedCudaEvent:
         if self._finish_event_recorded:
-            raise RuntimeError("finish event already recorded")
+            raise LogicError("finish event already recorded")
         self._finish_event_recorded = True
         return self.record_event()
 
@@ -410,3 +414,13 @@ def merge_events(
         return ev if not ev.is_closed() else CachedCudaEvent.NULL
     with TemporaryCudaStream(events) as stream:
         return stream.finish()
+
+
+def query_total_gpu_memory() -> int:
+    _, total = _unwrap(drv.cuMemGetInfo())  # type: ignore[assignment]
+    return total
+
+
+def query_free_gpu_memory() -> int:
+    free, _ = _unwrap(drv.cuMemGetInfo())  # type: ignore[assignment]
+    return free
