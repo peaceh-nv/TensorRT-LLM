@@ -1,23 +1,29 @@
 import array
 import atexit
 import ctypes
+import functools
 import os
 import traceback
+from abc import ABC, abstractmethod
 from collections import deque
 from ctypes.util import find_library
-from typing import Any, BinaryIO, Callable, ClassVar, Generic, Sequence, TypeVar
+from typing import (Any, BinaryIO, Callable, ClassVar, Generic, Iterable,
+                    MutableSequence, Sequence, TypeVar)
 
 import cuda.bindings.driver as drv
+from typing_extensions import Type
 
-from ._exceptions import (CudaDriverError, LogicError, OutOfDiskSpace,
-                          OutOfHostMemory)
+from ._exceptions import (CuError, CuOOMError, DiskOOMError, HostOOMError,
+                          LogicError)
 
 
 def _unwrap(ret: drv.CUresult | tuple[drv.CUresult, Any]
             | tuple[drv.CUresult, Any, Any]):
     if isinstance(ret, drv.CUresult):
         if ret != drv.CUDA_SUCCESS:
-            raise CudaDriverError(ret)
+            if ret == drv.CUresult.CUDA_ERROR_OUT_OF_MEMORY:
+                raise CuOOMError()
+            raise CuError(ret)
     else:
         _unwrap(ret[0])
         return ret[1:]
@@ -35,6 +41,51 @@ def round_down(x: int, y: int) -> int:
     return x // y * y
 
 
+def in_range(x: int, lower: int, upper: int) -> bool:
+    return lower <= x < upper
+
+
+T = TypeVar('T')
+U = TypeVar('U')
+
+
+def coalesce(value: T | None, fallback: T) -> T:
+    return value if value is not None else fallback
+
+
+def remove_if(original: MutableSequence[T],
+              predicate: Callable[[T], bool]) -> list[T]:
+    'Remove items from original that satisfy the predicate and return the removed items.'
+    removed = []
+    for idx, item in enumerate(original):
+        if predicate(item):
+            removed.append(item)
+        else:
+            original[idx - len(removed)] = item
+    del original[len(original) - len(removed):]
+    return removed
+
+
+def get_uniform_attribute(iterable: Iterable[T],
+                          attribute_func: Callable[[T], U]) -> U:
+    ret = attribute_func(next(iter(iterable)))
+    assert all(attribute_func(item) == ret for item in iterable)
+    return ret
+
+
+def noexcept(func: Callable[..., Any]) -> Callable[..., Any]:
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            raise AssertionError(
+                f"Function {func.__name__} raised an exception: {e}") from e
+
+    return wrapper
+
+
 mem_alignment = 2 << 20  # 2MB
 
 _libc = ctypes.CDLL(find_library('c'))
@@ -49,7 +100,7 @@ def _posix_memalign(alignment: int, size: int) -> int:
     memptr = ctypes.c_void_p()
     ret = _libc.posix_memalign(ctypes.byref(memptr), alignment, size)
     if ret != 0:
-        raise OutOfHostMemory("posix_memalign failed")
+        raise HostOOMError("posix_memalign failed")
     assert memptr.value is not None and memptr.value != 0
     return memptr.value
 
@@ -62,7 +113,7 @@ def _realloc(ptr: int, size: int) -> int:
     """
     ret = _libc.realloc(ptr, size)
     if ret == ctypes.c_void_p(0):
-        raise OutOfHostMemory("realloc failed.")
+        raise HostOOMError("realloc failed.")
     return ret
 
 
@@ -73,6 +124,7 @@ class HostMem:
     Note that we did not enable CU_MEMHOSTREGISTER_DEVICEMAP so the memory may not be accessible from kernels.
     We do not intend to use this memory in CUDA kernels.
     """
+    __slots__ = ('_address', '_size')
     _address: int
     _size: int
 
@@ -122,12 +174,15 @@ class HostMem:
 def _posix_fallocate(fd: int, offset: int, length: int):
     ret = _libc.posix_fallocate(fd, offset, length)
     if ret != 0:
-        raise OutOfDiskSpace(ret, "posix_fallocate failed")
+        raise DiskOOMError(ret, "posix_fallocate failed")
 
 
 def get_file_size(file: BinaryIO) -> int:
+    pos = file.tell()
     file.seek(0, os.SEEK_END)
-    return file.tell()
+    size = file.tell()
+    file.seek(pos)
+    return size
 
 
 def resize_file(file: BinaryIO, new_size: int):
@@ -142,6 +197,7 @@ class DynamicBitset:
     """
     A memory efficient bitset that can be resized.
     """
+    __slots__ = ('_bits', '_num_set_bits')
     _bits: array.array
     _num_set_bits: int
 
@@ -170,10 +226,10 @@ class DynamicBitset:
         return self._num_set_bits
 
     def resize(self, new_capacity: int):
-        extra_elems = (new_capacity + 63) // 64 - len(self._bits)
+        extra_elems = div_up(new_capacity, 64) - len(self._bits)
         if extra_elems > 0:
             self._bits.extend(array.array(self.TYPE_CODE, [0] * extra_elems))
-        else:
+        elif extra_elems < 0:
             self._bits = self._bits[:extra_elems]
 
     # check if any bit in the range [start, end) is set
@@ -193,22 +249,20 @@ class DynamicBitset:
                    for i in range(start // 64 + 1, end // 64))
 
 
-T = TypeVar('T')
-U = TypeVar('U')
-
-
 class SimplePool(Generic[T]):
-    __slots__ = ('_create_func', '_destroy_func', '_items', '_max_size')
+    __slots__ = ('_create_func', '_destroy_func', '_items', '_max_size',
+                 '_outstanding_count')
     _create_func: Callable[[], T]
     _destroy_func: Callable[[T], None]
     _items: deque[T]
-    _max_size: int
+    _max_size: int | None
+    _outstanding_count: int  # number of items currently we gave out but not returned, i.e. get() but not put()
 
     def __init__(self,
                  create_func: Callable[[], T],
                  destroy_func: Callable[[T], None],
                  init_size: int = 0,
-                 max_size: int = 1024):
+                 max_size: int | None = None):
         self._create_func = create_func
         self._destroy_func = destroy_func
         self._items = deque[T]((create_func() for _ in range(init_size)),
@@ -223,39 +277,35 @@ class SimplePool(Generic[T]):
         self.clear()
 
     def get(self) -> T:
-        return self._items.popleft() if self._items else self._create_func()
+        ret = self._items.popleft() if self._items else self._create_func()
+        self._outstanding_count += 1
+        return ret
 
     def put(self, item: T):
-        if len(self._items) >= self._max_size:
+        self._outstanding_count -= 1
+        if self._max_size is not None and len(self._items) >= self._max_size:
             self._destroy_func(item)
         self._items.appendleft(item)
 
-
-class ItemHolder(Generic[T]):
-    # Registry to hold pools per subclass
-    _pool: SimplePool[T] | None = None
-
-    __slots__ = ('_item', )
-    _item: T | None
-
-    def __init__(self):
-        self._item = self.pool.get()
-
-    def close(self):
-        if not self.is_closed():
-            self.pool.put(self._item)  # type: ignore
-            self._item = None
-
-    def __del__(self):
-        self.close()
+    @property
+    def outstanding_count(self) -> int:
+        'number of items currently we get() but not put()'
+        return self._outstanding_count
 
     @property
-    def pool(self) -> SimplePool[T]:
-        assert self._pool is not None
-        return self._pool
+    def cached_count(self) -> int:
+        'number of items currently in the pool'
+        return len(self._items)
 
-    def is_closed(self) -> bool:
-        return self._item is None
+    @property
+    def total_count(self) -> int:
+        'total number of items created, including both outstanding and cached'
+        return self.outstanding_count + self.cached_count
+
+
+class GlobalPoolProvider(Generic[T]):
+    __slots__ = ()
+    _pool: ClassVar[SimplePool]
 
     @classmethod
     def register_pool(cls, pool: SimplePool[T]):
@@ -267,12 +317,46 @@ class ItemHolder(Generic[T]):
         if cls._pool is not None:
             cls._pool.clear()
 
+    def pool(self) -> SimplePool[T]:
+        return self._pool
+
+
+class ItemHolderBase(Generic[T], ABC):
+    __slots__ = ('_item', )
+    _item: T | None
+
+    def __init__(self):
+        self._item = self.pool().get()
+
+    def close(self):
+        if not self.is_closed():
+            self.pool().put(self._item)  # type: ignore
+            self._item = None
+
+    def __del__(self):
+        self.close()
+
+    def is_closed(self) -> bool:
+        return self._item is None
+
     def get(self) -> T:
         assert not self.is_closed()
         return self._item  # type: ignore
 
+    @property
+    def handle(self) -> T:
+        return self.get()
 
-class CachedCudaEvent(ItemHolder[drv.CUevent]):
+    @abstractmethod
+    def pool(self) -> SimplePool[T]:
+        ...
+
+
+class ItemHolderWithGlobalPool(GlobalPoolProvider[T], ItemHolderBase[T]):
+    __slots__ = ()
+
+
+class CachedCudaEvent(ItemHolderWithGlobalPool[drv.CUevent]):
     """
     A cached CUDA event without support for timing. Recorded to a stream when created.
     """
@@ -297,7 +381,7 @@ class CachedCudaEvent(ItemHolder[drv.CUevent]):
         elif err == drv.CUDA_ERROR_NOT_READY:
             return False
         else:
-            raise CudaDriverError(err)
+            raise CuError(err)
 
     def synchronize(self):
         if self.is_closed():
@@ -323,13 +407,14 @@ CachedCudaEvent.register_pool(SimplePool[drv.CUevent](
     lambda: _unwrap(drv.cuEventCreate(drv.CUevent_flags.CU_EVENT_DISABLE_TIMING)
                     ),
     lambda ev: _unwrap(drv.cuEventDestroy(ev)),  # type: ignore[arg-type]
-    init_size=64))
+    init_size=1024))
 
 
 class _NullCudaEvent(CachedCudaEvent):
     """
     A null CUDA event that is closed (and always complete).
     """
+    __slots__ = ()
 
     def __init__(self):
         # do not call super().__init__(). We don't need an event here.
@@ -339,7 +424,7 @@ class _NullCudaEvent(CachedCudaEvent):
 CachedCudaEvent.NULL = _NullCudaEvent()
 
 
-class CachedCudaStream(ItemHolder[drv.CUstream]):
+class CachedCudaStream(ItemHolderWithGlobalPool[drv.CUstream]):
     """
     A cached non-blocking CUDA stream.
     """
@@ -414,6 +499,62 @@ def merge_events(
         return ev if not ev.is_closed() else CachedCudaEvent.NULL
     with TemporaryCudaStream(events) as stream:
         return stream.finish()
+
+
+class SharedPoolProvider(Generic[T]):
+    __slots__ = ('_pool', )
+    _pool: SimplePool[T]
+
+    def __init__(self, pool: SimplePool[T]):
+        self._pool = pool
+
+    def pool(self) -> SimplePool[T]:
+        return self._pool
+
+
+class ItemHolderWithSharedPool(SharedPoolProvider[T], ItemHolderBase[T]):
+    __slots__ = ()
+
+    def __init__(self, pool: SimplePool[T]):
+        SharedPoolProvider.__init__(self, pool)
+        ItemHolderBase.__init__(self)
+
+
+HolderT = TypeVar('HolderT', bound=ItemHolderWithSharedPool)
+
+
+# For subclassing if holder needs to be customized
+class PooledFactoryBase(Generic[T, HolderT]):
+    _Holder: Type[HolderT]  # subclasses must initialize this static attribute
+    __slots__ = ('_pool', )
+    _pool: SimplePool[T]
+
+    def __init__(self,
+                 create_func: Callable[[], T],
+                 destroy_func: Callable[[T], None],
+                 init_size: int = 0,
+                 max_cache_size: int | None = None):
+        self._pool = SimplePool[T](create_func, destroy_func, init_size,
+                                   max_cache_size)
+
+    def create(self) -> HolderT:
+        return self._Holder(self._pool)
+
+    def clear(self):
+        self._pool.clear()
+
+
+# For directly use
+class PooledFactory(PooledFactoryBase[T, ItemHolderWithSharedPool]):
+    _Holder = ItemHolderWithSharedPool
+    __slots__ = ()
+
+    def __init__(self,
+                 create_func: Callable[[], T],
+                 destroy_func: Callable[[T], None],
+                 init_size: int = 0,
+                 max_cache_size: int | None = None):
+        super().__init__(create_func, destroy_func, init_size, max_cache_size)
 
 
 def query_total_gpu_memory() -> int:

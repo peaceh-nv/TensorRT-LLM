@@ -1,90 +1,41 @@
 import abc
 import os
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import BinaryIO, override
+from typing import BinaryIO, ClassVar, final, override
 
-from .. import CacheLevel, KVCacheManagerConfig
-from .._common import Address, DiskAddress, MemAddress
+from .._common import Address, CacheLevel, DiskAddress, MemAddress
+from .._config import KVCacheManagerConfig
 from .._copy_engine import CopyTask, batched_copy
-from .._cuda_virt_mem import PhysMem, VirtMem
-from .._exceptions import LogicError, ResourceBusy
+from .._cuda_virt_mem import PhysMem, PooledPhysMemAllocator, VirtMem
+from .._exceptions import LogicError, ResourceBusyError
 from .._life_cycle_registry import LifeCycleId
 from .._utils import (CachedCudaEvent, DynamicBitset, HostMem,
                       TemporaryCudaStream, div_up, get_file_size,
-                      query_total_gpu_memory, resize_file, round_down, round_up)
+                      get_uniform_attribute, query_total_gpu_memory, remove_if,
+                      resize_file, round_down)
 from ._config import StorageConfig, create_storage_config
-
-
-class PhysMemPool:
-    _total_num_phys_mem: int
-    _phys_mem_pool: deque[PhysMem]
-
-    def __init__(self, total_num_phys_mem: int):
-        self._total_num_phys_mem = total_num_phys_mem
-        self._phys_mem_pool = deque(PhysMem()
-                                    for _ in range(self._total_num_phys_mem))
-
-    def destroy(self):
-        assert len(
-            self._phys_mem_pool
-        ) == self._total_num_phys_mem, "Some PhysMem are still in use"
-        for phys_mem in self._phys_mem_pool:
-            phys_mem.destroy()
-        self._phys_mem_pool.clear()
-        self._total_num_phys_mem = 0
-
-    def push(self, phys_mem: PhysMem):
-        self._phys_mem_pool.append(phys_mem)
-
-    def pop(self) -> PhysMem:
-        return self._phys_mem_pool.popleft()
-
-    # raise exception if failed
-    def resize(self, new_total_num_phys_mem: int) -> None:
-        increase = new_total_num_phys_mem - self._total_num_phys_mem
-        if increase > 0:
-            # the [] is compulsory to avoid partial extension in case of exception
-            self._phys_mem_pool.extend([PhysMem() for _ in range(increase)])
-        elif increase < 0:
-            delta = -increase
-            if len(self._phys_mem_pool) < delta:
-                raise ResourceBusy(
-                    f"Not enough unused physical memory to shrink. Current {len(self._phys_mem_pool)} physical memory, need {delta}"
-                )
-            for _ in range(delta):
-                self._phys_mem_pool.pop().destroy()
-        self._total_num_phys_mem = new_total_num_phys_mem
-
-    @property
-    def num_free_phys_mem(self) -> int:
-        return len(self._phys_mem_pool)
-
-    @property
-    def total_num_phys_mem(self) -> int:
-        return self._total_num_phys_mem
 
 
 class SlotPoolBase(abc.ABC):
     _slot_size: int
-    _num_slots: int
 
     @property
     def slot_size(self) -> int:
         return self._slot_size
 
     @property
+    @abc.abstractmethod
     def num_slots(self) -> int:
-        return self._num_slots
+        ...
 
     @property
     def num_bytes(self) -> int:
         return self.slot_size * self.num_slots
 
-    def __init__(self, slot_size: int, num_slots: int):
+    def __init__(self, slot_size: int):
         self._slot_size = slot_size
-        self._num_slots = num_slots
 
     @abc.abstractmethod
     def destroy(self):
@@ -99,49 +50,58 @@ class SlotPoolBase(abc.ABC):
         pass
 
 
+@final
 class GpuSlotPool(SlotPoolBase):
-    _shared_phys_mem_pool: PhysMemPool
+    __slots__ = ('_vm', )
     _vm: VirtMem
 
-    def __init__(self, slot_size: int, num_slots: int, vm_size: int,
-                 shared_phys_mem_pool: PhysMemPool):
-        super().__init__(slot_size, num_slots)
-        self._shared_phys_mem_pool = shared_phys_mem_pool
-        self._vm = VirtMem(vm_size)
-        while self._vm.mapped_size() < self.num_bytes:
-            self._vm.push(self._shared_phys_mem_pool.pop())
+    def __init__(self, slot_size: int, vm_size: int,
+                 shared_phys_mem_pool: PooledPhysMemAllocator, num_slots: int):
+        super().__init__(slot_size)
+        assert vm_size % PhysMem.SIZE == 0
+        self._vm = VirtMem(vm_size, shared_phys_mem_pool)
+        self.resize(num_slots)
 
     @override
     def destroy(self):
         self._vm.destroy()
-        self._shared_phys_mem_pool.destroy()
 
     @override
     def resize(self, new_num_slots: int) -> None:
-        new_mapped_size = round_up(new_num_slots * self.slot_size, PhysMem.SIZE)
-        if new_mapped_size > self._vm.mapped_size(
-        ) and self._shared_phys_mem_pool.num_free_phys_mem * PhysMem.SIZE < new_mapped_size - self._vm.mapped_size(
-        ):
-            raise LogicError(
-                "Physical memory preparation is done but not enough physical memory is available"
-            )
-        while self._vm.mapped_size() < new_mapped_size:
-            self._vm.push(self._shared_phys_mem_pool.pop())
-        while self._vm.mapped_size() - new_mapped_size > PhysMem.SIZE:
-            self._shared_phys_mem_pool.push(self._vm.pop())
-        self._num_slots = new_num_slots
+        new_num_phys_mem = self._compute_num_phys_mem(self.slot_size,
+                                                      new_num_slots)
+        self._vm.realloc(PhysMem.SIZE * new_num_phys_mem)
+
+    def extend_by_one_phys_mem(self) -> int:
+        self._vm.extend(1)
+        return self.num_slots
 
     @override
     def slot_address(self, slot: int) -> MemAddress:
         return int(self._vm.address) + self.slot_size * slot
 
+    @property
+    @override
+    def num_slots(self) -> int:
+        return self._compute_num_slots(self.slot_size, self._vm.num_phys_mem)
+
+    @staticmethod
+    def _compute_num_phys_mem(slot_size: int, num_slots: int) -> int:
+        return div_up(num_slots * slot_size, PhysMem.SIZE)
+
+    @staticmethod
+    def _compute_num_slots(slot_size: int, num_phys_mem: int) -> int:
+        return num_phys_mem * PhysMem.SIZE // slot_size
+
 
 class HostSlotPool(SlotPoolBase):
+    __slots__ = ('_host_mem', )
     _host_mem: HostMem
 
     def __init__(self, slot_size: int, num_slots: int):
-        super().__init__(slot_size, num_slots)
-        self._host_mem = HostMem(self.num_bytes)
+        super().__init__(slot_size)
+        self._host_mem = HostMem(0)
+        self.resize(num_slots)
 
     @override
     def destroy(self):
@@ -150,19 +110,24 @@ class HostSlotPool(SlotPoolBase):
     @override
     def resize(self, new_num_slots: int) -> None:
         self._host_mem.resize(new_num_slots * self.slot_size)
-        self._num_slots = new_num_slots
 
     @override
     def slot_address(self, slot: int) -> MemAddress:
         return self._host_mem._address + self.slot_size * slot
 
+    @property
+    @override
+    def num_slots(self) -> int:
+        return self._host_mem.size // self.slot_size
+
 
 class DiskSlotPool(SlotPoolBase):
+    __slots__ = ('_filename', '_file')
     filename: str
     file: BinaryIO
 
     def __init__(self, filename: str, slot_size: int, num_slots: int):
-        super().__init__(slot_size, num_slots)
+        super().__init__(slot_size)
         self.filename = filename
         self.file = open(filename, "wb+")
         self.resize(num_slots)
@@ -179,12 +144,16 @@ class DiskSlotPool(SlotPoolBase):
     @override
     def resize(self, new_num_slots: int) -> None:
         resize_file(self.file, new_num_slots * self.slot_size)
-        self._num_slots = new_num_slots
 
     @override
     def slot_address(self, slot: int) -> DiskAddress:
         assert slot < self.num_slots
         return DiskAddress(self.file, slot * self.slot_size)
+
+    @property
+    @override
+    def num_slots(self) -> int:
+        return self.file_size // self.slot_size
 
 
 SlotId = int
@@ -195,11 +164,16 @@ class SlotAllocator:
     @dataclass(slots=True)
     class Slot:
         # ready_event indicates whether the slot is ready for use.
-        #  For newly allocated BlockData, it indicates finish of the last usage by the previous owner of the slot (who returned the slot to the pool).
-        #  When used in free(), it indicates finish of usage by the current owner of the slot.
+        #  For newly allocated BlockData, it indicates finish of the last usage by the previous owners of the slot (who returned the slot to the pool).
+        #  After data migration, it indicates finish of data migration.
+        #  When passed to free(), it indicates finish of usage by the current owners of the slot.
         id: SlotId
         ready_event: CachedCudaEvent
 
+    __slots__ = ('_capacity', '_num_active_slots', '_recycled_slots',
+                 '_num_ready_recycled_slots', '_occupied_mask',
+                 '_target_capacity', '_overflow_slots',
+                 '_num_ready_overflow_slots')
     _capacity: int
     _num_active_slots: int  # active slots are either in use or recycled.
     _recycled_slots: deque[
@@ -207,22 +181,32 @@ class SlotAllocator:
     _num_ready_recycled_slots: int  # number of recycled slots that are ready to be used immediately (no need for sync or wait in stream), i.e. their ready events are triggered.
     _occupied_mask: DynamicBitset
 
+    # for scheduled shrinking resize
+    _target_capacity: int  # _target_capacity <= _capacity. Inequal if a shrinking resize is in progress.
+    _overflow_slots: list[
+        Slot]  # slots that will be out-of-range after a in-progress resize. scheduled for removal.
+    _num_ready_overflow_slots: int  # similar to _num_ready_recycled_slots, but for _overflow_slots.
+
     def __init__(self, capacity: int):
         self._capacity = capacity
         self._num_active_slots = 0
         self._recycled_slots = deque[self.Slot]()
         self._num_ready_recycled_slots = 0
         self._occupied_mask = DynamicBitset(capacity)
+        self._target_capacity = capacity
+        self._overflow_slots = []
 
     def __del__(self):
+        assert (self._target_capacity == self._capacity
+                and not self._overflow_slots), "resize is in progress"
         assert self._occupied_mask.num_set_bits == 0, "some slots are still in use"
-        assert len(self._recycled_slots
-                   ) == self._num_active_slots, "some slots are not free"
+        assert (len(self._recycled_slots) == self._num_active_slots
+                ), "some slots are not free"
 
     @property
     def num_free_slots(self) -> int:
-        return len(
-            self._recycled_slots) + self._capacity - self._num_active_slots
+        return (len(self._recycled_slots) +
+                max(self._target_capacity - self._num_active_slots, 0))
 
     @property
     def num_occupied_slots(self) -> int:
@@ -256,9 +240,13 @@ class SlotAllocator:
         return slots
 
     def free(self, slot: Slot):
-        if not self._occupied_mask.get(slot.id):
+        if slot.id >= self._capacity or not self._occupied_mask.get(slot.id):
             raise LogicError(f"Slot {slot.id} is not occupied")
-        self._recycled_slots.append(slot)
+        if slot.id < self._target_capacity:
+            self._recycled_slots.append(slot)
+        else:
+            self._overflow_slots.append(slot)
+            self._try_trigger_shrink()
         self._occupied_mask.clear(slot.id)
         self._scrub_events()
         assert self._check()
@@ -271,44 +259,116 @@ class SlotAllocator:
         assert self._check()
         if new_num_slots < self.num_slots and self._occupied_mask.any_set(
                 new_num_slots, self.num_slots):
-            raise ResourceBusy("resize cannot remove occupied slots")
+            raise ResourceBusyError("resize cannot remove occupied slots")
         self._occupied_mask.resize(new_num_slots)
         self._capacity = new_num_slots
         self._num_active_slots = min(self._num_active_slots, self._capacity)
         if new_num_slots < self._capacity:
             new_recycled_slots = deque[self.Slot]()
-            for slot in self._recycled_slots:
+            new_num_ready_recycled_slots = 0
+            for idx_recycled, slot in enumerate(self._recycled_slots):
                 if slot.id >= new_num_slots:
                     slot.ready_event.synchronize()
                     slot.ready_event = CachedCudaEvent.NULL
                 else:
                     new_recycled_slots.append(slot)
+                    if idx_recycled < self._num_ready_recycled_slots:
+                        new_num_ready_recycled_slots += 1
             self._recycled_slots = new_recycled_slots
-            self._num_ready_recycled_slots = 0
+            self._num_ready_recycled_slots = new_num_ready_recycled_slots
             self._scrub_events()
         assert self._check()
 
-    def _scrub_events(self) -> None:
-        assert self._num_ready_recycled_slots <= len(self._recycled_slots)
-        for i in range(self._num_ready_recycled_slots,
-                       len(self._recycled_slots)):
-            slot = self._recycled_slots[i]
-            if slot.ready_event.query_complete():
+    def schedule_resize(self, new_num_slots: int) -> None:
+        assert self._check()
+        if new_num_slots >= self.num_slots:
+            self.cancel_scheduled_resize()
+            self.resize(new_num_slots)
+            return
+        old_target_capacity = self._target_capacity
+        if new_num_slots > old_target_capacity:
+            self._recycled_slots.extend(
+                remove_if(
+                    self._overflow_slots, lambda slot: old_target_capacity <=
+                    slot.id < new_num_slots))
+            self._num_ready_overflow_slots = 0
+        if new_num_slots < old_target_capacity:
+            self._overflow_slots.extend(
+                remove_if(self._recycled_slots,
+                          lambda slot: slot.id >= new_num_slots))
+            self._num_ready_recycled_slots = 0
+        self._target_capacity = new_num_slots
+        self._try_trigger_shrink()
+        self._scrub_events()
+        assert self._check()
+
+    def cancel_scheduled_resize(self) -> None:
+        assert self._check()
+        self._target_capacity = self._capacity
+        self._recycled_slots.extend(
+            remove_if(self._overflow_slots, lambda slot: True))
+        self._num_ready_overflow_slots = 0
+
+    def shrink_in_progress(self) -> bool:
+        'Indicates if a scheduled shrink is in progress.'
+        assert self._target_capacity <= self._capacity
+        return self._target_capacity < self._capacity
+
+    def get_slots_blocking_shrink(self) -> Iterable[SlotId]:
+        return (id for id in range(self._target_capacity, self._capacity)
+                if self._occupied_mask.get(id))
+
+    def _try_trigger_shrink(self) -> bool:
+        assert self._check()
+        if self.shrink_in_progress() and self._target_capacity + len(
+                self._overflow_slots) == self._capacity:
+            assert len(set(s.id for s in self._overflow_slots)) == len(
+                self._overflow_slots)
+            for slot in self._overflow_slots:
+                slot.ready_event.synchronize()
                 slot.ready_event = CachedCudaEvent.NULL
-                self._num_ready_recycled_slots += 1
-            else:
-                break
+            self._overflow_slots.clear()
+            self._num_ready_overflow_slots = 0
+            self._capacity = self._target_capacity
+            self._num_active_slots = min(self._num_active_slots, self._capacity)
+            self._scrub_events()
+            assert self._check()
+            return True
+        return False
+
+    def _scrub_events(self) -> None:
+        self._num_ready_recycled_slots = self._scrub_events_impl(
+            self._recycled_slots, self._num_ready_recycled_slots)
+        self._num_ready_overflow_slots = self._scrub_events_impl(
+            self._overflow_slots, self._num_ready_overflow_slots)
 
     def _check(self) -> bool:
-        return self.num_free_slots + self.num_occupied_slots == self.num_slots and self._num_active_slots == self._occupied_mask.num_set_bits + len(
-            self._recycled_slots)
+        return (self._num_active_slots <= self._capacity
+                and self._target_capacity <= self._capacity and
+                (self.shrink_in_progress() or len(self._overflow_slots) == 0)
+                and all(self._target_capacity <= slot.id < self._capacity
+                        for slot in self._overflow_slots)
+                and len(self._recycled_slots) + len(self._overflow_slots) +
+                self.num_occupied_slots == self._num_active_slots)
+
+    @staticmethod
+    def _scrub_events_impl(slots: Sequence[Slot], num_ready: int) -> int:
+        assert num_ready <= len(slots)
+        for i in range(num_ready, len(slots)):
+            slot = slots[i]
+            if slot.ready_event.query_complete():
+                slot.ready_event = CachedCudaEvent.NULL
+                num_ready += 1
+            else:
+                break
+        return num_ready
 
 
-class PoolGroup:
+class PoolGroupBase:
     __slots__ = ('_slot_allocator', '_pools')
 
     _slot_allocator: SlotAllocator
-    _pools: list[SlotPoolBase]
+    _pools: tuple[SlotPoolBase, ...]
 
     def __init__(self, num_slots: int):
         self._slot_allocator = SlotAllocator(num_slots)
@@ -316,14 +376,12 @@ class PoolGroup:
     def destroy(self):
         for pool in self._pools:
             pool.destroy()
-        self._pools.clear()
         self._slot_allocator.resize(0)
 
     @property
     def num_slots(self) -> int:
         num_slots = self._slot_allocator._capacity
-        for pool in self._pools:
-            assert pool.num_slots == num_slots, f"Pool num_slots {pool.num_slots} does not match expected {num_slots}"
+        assert num_slots <= self._get_num_slots_from_pools()
         return num_slots
 
     @property
@@ -334,10 +392,25 @@ class PoolGroup:
     def num_bytes(self) -> int:
         return sum(pool.num_bytes for pool in self._pools)
 
-    def resize(self, new_num_slots: int) -> None:
+    def resize_slot_allocator(self, new_num_slots: int | None) -> None:
+        """
+        Resize the slot allocator, but not pools. If new_num_slots is None, make slot allocator match the pool sizes.
+        """
+        if new_num_slots is None:
+            new_num_slots = self._get_num_slots_from_pools()
         self._slot_allocator.resize(new_num_slots)
+        assert self._check(True)
+
+    def resize_pools(self, new_num_slots: int | None) -> None:
+        """
+        Resize the pools, but not the slot allocator. If new_num_slots is None, make pool sizes match the slot allocator.
+        If exception is raised, size of pools may be imbalanced. Call resize_pools() again with None or self._get_num_slots_from_pools() to fix it.
+        """
+        if new_num_slots is None:
+            new_num_slots = self._slot_allocator.num_slots
         for pool in self._pools:
             pool.resize(new_num_slots)
+        assert self._check(True)
 
     def allocate(self) -> SlotAllocator.Slot | None:
         return self._slot_allocator.allocate()
@@ -355,39 +428,56 @@ class PoolGroup:
     def slot_size(self) -> tuple[int, ...]:
         return tuple(pool.slot_size for pool in self._pools)
 
+    def _check(self, allow_mismatch: bool = False) -> bool:
+        pool_num_slots = self._get_num_slots_from_pools()
+        return (self._slot_allocator.num_slots <= pool_num_slots
+                if allow_mismatch else self._slot_allocator.num_slots
+                == pool_num_slots)
 
-class GpuPoolGroup(PoolGroup):
+    def _get_num_slots_from_pools(self) -> int:
+        return min(p.num_slots for p in self._pools)
+
+    @staticmethod
+    def _compute_num_phys_mem(slot_size_list: Sequence[int],
+                              num_slots: int) -> tuple[int, ...]:
+        return tuple(
+            GpuSlotPool._compute_num_phys_mem(slot_size, num_slots)
+            for slot_size in slot_size_list)
+
+
+class GpuPoolGroup(PoolGroupBase):
+    __slots__ = ()
 
     def __init__(self, num_slots: int, slot_size_list: Sequence[int],
-                 phys_mem_pool: PhysMemPool):
+                 shared_phys_mem_pool: PooledPhysMemAllocator):
         super().__init__(num_slots)
         total_gpu_memory = query_total_gpu_memory()
         max_slot_size = max(slot_size_list)
-        self._pools = [
-            GpuSlotPool(slot_size, num_slots,
-                        int(total_gpu_memory * slot_size / max_slot_size),
-                        phys_mem_pool) for slot_size in slot_size_list
-        ]
+        self._pools = tuple(
+            GpuSlotPool(slot_size,
+                        int(total_gpu_memory * slot_size /
+                            max_slot_size), shared_phys_mem_pool, num_slots)
+            for slot_size in slot_size_list)
 
 
-class HostPoolGroup(PoolGroup):
+class HostPoolGroup(PoolGroupBase):
+    __slots__ = ()
 
     def __init__(self, num_slots: int, slot_size_list: Sequence[int]):
         super().__init__(num_slots)
-        self._pools = [
-            HostSlotPool(slot_size, num_slots) for slot_size in slot_size_list
-        ]
+        self._pools = tuple(
+            HostSlotPool(slot_size, num_slots) for slot_size in slot_size_list)
 
 
-class DiskPoolGroup(PoolGroup):
+class DiskPoolGroup(PoolGroupBase):
+    __slots__ = ()
 
     def __init__(self, num_slots: int, slot_size_list: Sequence[int],
                  filename_template: str):
         super().__init__(num_slots)
-        self._pools = [
+        self._pools = tuple(
             DiskSlotPool(filename_template.format(i), slot_size, num_slots)
-            for i, slot_size in enumerate(slot_size_list)
-        ]
+            for i, slot_size in enumerate(slot_size_list))
 
 
 PoolGroupIndex = int
@@ -395,10 +485,11 @@ PoolIndex = int
 
 
 class CacheLevelStorage:
-    _total_quota: int
+    POOL_SIZE_GRANULARITY: ClassVar[int] = 1  # derived class can override this
+    __slots__ = ('_total_quota', '_ratio_list', '_pool_groups')
+    _total_quota: int  # fixme: remove _total_quota and _ratio_list and compute from _pool_groups
     _ratio_list: tuple[float, ...]
-    _pool_groups: list[PoolGroup]
-    POOL_SIZE_GRANULARITY: int = 1  # derived class can override this
+    _pool_groups: tuple[PoolGroupBase, ...]
 
     def __init__(self, total_quota: int, ratio_list: Sequence[float]):
         self._total_quota = total_quota
@@ -407,7 +498,6 @@ class CacheLevelStorage:
     def destroy(self):
         for pg in self._pool_groups:
             pg.destroy()
-        self._pool_groups.clear()
         self._total_quota = 0
         self._ratio_list = ()
 
@@ -432,52 +522,82 @@ class CacheLevelStorage:
     @property
     def slot_count_list(self) -> tuple[int, ...]:
         """
-        Return a tuple of the number of slots in each pool group.
+        The number of slots in each pool group.
         """
         return tuple(pg.num_slots for pg in self._pool_groups)
 
     def slot_size(self, pool_group_index: PoolGroupIndex) -> tuple[int, ...]:
         """
-        Return a tuple of the slot sizes of each pool in the pool group.
+        The slot sizes of each pool in the pool group.
         """
         return self._pool_groups[pool_group_index].slot_size()
 
     @property
     def slot_size_lists(self) -> tuple[tuple[int, ...], ...]:
         """
-        Return a tuple of tuples, each containing the slot sizes for a pool group.
+        A tuple of tuples, each containing the slot sizes for a pool group.
         """
         return tuple(
             tuple(p.slot_size for p in pg._pools) for pg in self._pool_groups)
 
+    @property
+    def num_pool_groups(self) -> int:
+        return len(self._pool_groups)
+
+    def resize(self,
+               new_total_quota: int | None = None,
+               new_ratio_list: Sequence[float] | None = None) -> None:
+        new_slot_count_list = self._compute_slot_count_list(
+            new_total_quota, new_ratio_list)
+        self._resize_impl(new_slot_count_list)
+        if new_total_quota is not None:
+            self._total_quota = new_total_quota
+        if new_ratio_list is not None:
+            self._ratio_list = tuple(new_ratio_list)
+
+    def _resize_impl(self, new_slot_count_list: Sequence[int]):
+        success = False
+        old_slot_count_list = self.slot_count_list
+        assert old_slot_count_list == self._compute_slot_count_list(
+            self.total_quota, self.ratio_list)
+        try:
+            # shrink first to avoid intermediate state with excessive memory usage
+            for pg, new_slot_count, old_slot_count in zip(
+                    self._pool_groups, new_slot_count_list,
+                    old_slot_count_list):
+                if new_slot_count < old_slot_count:
+                    pg.resize_slot_allocator(
+                        new_slot_count
+                    )  # shrink slot allocators first as it can fail for shrinking
+                    pg.resize_pools(new_slot_count)
+            for pg, new_slot_count, old_slot_count in zip(
+                    self._pool_groups, new_slot_count_list,
+                    old_slot_count_list):
+                if new_slot_count > old_slot_count:
+                    pg.resize_pools(
+                        new_slot_count
+                    )  # expand pools first as it can fail for expanding
+                    pg.resize_slot_allocator(new_slot_count)
+            success = True
+        finally:
+            if not success:
+                self._resize_impl(old_slot_count_list)
+
     # Calculate how many slots will there be in each pool group with the given total_quota and ratio_list. Use _ratio_to_slot_count_list for initialization.
-    def compute_slot_count_list(
+    def _compute_slot_count_list(
             self,
             total_quota: int | None = None,
             ratio_list: Sequence[float] | None = None) -> tuple[int, ...]:
-        total_quota = total_quota or self.total_quota
-        ratio_list = ratio_list or self.ratio_list
+        if total_quota is None:
+            total_quota = self.total_quota
+        if ratio_list is None:
+            ratio_list = self.ratio_list
         assert len(ratio_list) == len(
             self._pool_groups
         ), f"Wrong ratio_list length. Expected {len(self._pool_groups)}, got {len(ratio_list)}"
         return self._ratio_to_slot_count_list(total_quota, self.slot_size_lists,
                                               ratio_list,
                                               self.POOL_SIZE_GRANULARITY)
-
-    def resize(self,
-               new_total_quota: int | None = None,
-               new_ratio_list: Sequence[float] | None = None) -> None:
-        new_slot_count_list = self.compute_slot_count_list(
-            new_total_quota, new_ratio_list)
-        self._pre_resize(new_slot_count_list)
-        for pg, new_slot_count in zip(self._pool_groups, new_slot_count_list):
-            pg.resize(new_slot_count)
-        self._total_quota = new_total_quota or self.total_quota
-        if new_ratio_list is not None:
-            self._ratio_list = tuple(new_ratio_list)
-
-    def _pre_resize(self, new_slot_count_list: Sequence[int]):
-        return
 
     @staticmethod
     def _ratio_to_slot_count_list(
@@ -502,8 +622,9 @@ class CacheLevelStorage:
 
 
 class GpuCacheLevelStorage(CacheLevelStorage):
-    _phys_mem_pool: PhysMemPool
-    POOL_SIZE_GRANULARITY: int = PhysMem.SIZE
+    POOL_SIZE_GRANULARITY: ClassVar[int] = PhysMem.SIZE
+    __slots__ = ('shared_phys_mem_pool', )
+    shared_phys_mem_pool: PooledPhysMemAllocator
 
     def __init__(self, total_quota: int,
                  slot_size_lists: Sequence[Sequence[int]],
@@ -513,61 +634,54 @@ class GpuCacheLevelStorage(CacheLevelStorage):
         ), "slot_size_lists and init_ratio must have the same length"
         super().__init__(total_quota, init_ratio)
         slot_count_list = self._ratio_to_slot_count_list(
-            total_quota, slot_size_lists, init_ratio, PhysMem.SIZE)
-        self._phys_mem_pool = PhysMemPool(0)
-        self._pre_resize(slot_count_list)
-        assert self._phys_mem_pool.total_num_phys_mem * PhysMem.SIZE <= total_quota
-        self._pool_groups = [
-            GpuPoolGroup(num_slots, slot_size_list, self._phys_mem_pool) for
-            slot_size_list, num_slots in zip(slot_size_lists, slot_count_list)
-        ]
+            total_quota, slot_size_lists, init_ratio,
+            self.POOL_SIZE_GRANULARITY)
+        self.shared_phys_mem_pool = PooledPhysMemAllocator()
+        self._pool_groups = tuple(
+            GpuPoolGroup(num_slots, slot_size_list, self.shared_phys_mem_pool)
+            for slot_size_list, num_slots in zip(slot_size_lists,
+                                                 slot_count_list))
 
     @override
-    def destroy(self):
-        self._phys_mem_pool.destroy()
-        super().destroy()
-
-    @override
-    def _pre_resize(self, new_slot_count_list: Sequence[int]):
-        num_required_phys_mem = sum(
-            sum(
-                div_up(num_slots * slot_size, PhysMem.SIZE)
-                for slot_size in slot_size_list) for num_slots, slot_size_list
-            in zip(new_slot_count_list, self.slot_size_lists))
-        if num_required_phys_mem > self._phys_mem_pool.total_num_phys_mem:
-            self._phys_mem_pool.resize(num_required_phys_mem)
+    def resize(self,
+               new_total_quota: int | None = None,
+               new_ratio_list: Sequence[float] | None = None):
+        super().resize(new_total_quota, new_ratio_list)
+        self.shared_phys_mem_pool.clear()  # clear cached unused phys mem
 
 
 class HostCacheLevelStorage(CacheLevelStorage):
+    __slots__ = ()
 
     def __init__(self, total_quota: int,
                  slot_size_lists: Sequence[Sequence[int]],
                  init_ratio: Sequence[float]):
         super().__init__(total_quota, init_ratio)
         slot_count_list = self._ratio_to_slot_count_list(
-            total_quota, slot_size_lists, init_ratio, 1)
-        self._pool_groups = [
-            HostPoolGroup(num_slots,
-                          slot_size_list) for slot_size_list, num_slots in zip(
-                              slot_size_lists, slot_count_list)
-        ]
+            total_quota, slot_size_lists, init_ratio,
+            self.POOL_SIZE_GRANULARITY)
+        self._pool_groups = tuple(
+            HostPoolGroup(num_slots, slot_size_list) for slot_size_list,
+            num_slots in zip(slot_size_lists, slot_count_list))
 
 
 class DiskCacheLevelStorage(CacheLevelStorage):
+    __slots__ = ()
 
     def __init__(self, total_quota: int,
                  slot_size_lists: Sequence[Sequence[int]],
                  init_ratio: Sequence[float], filename_template: str):
         super().__init__(total_quota, init_ratio)
         slot_count_list = self._ratio_to_slot_count_list(
-            total_quota, slot_size_lists, init_ratio, 1)
-        self._pool_groups = [
+            total_quota, slot_size_lists, init_ratio,
+            self.POOL_SIZE_GRANULARITY)
+        self._pool_groups = tuple(
             DiskPoolGroup(num_slots, slot_size_list, filename_template) for
-            slot_size_list, num_slots in zip(slot_size_lists, slot_count_list)
-        ]
+            slot_size_list, num_slots in zip(slot_size_lists, slot_count_list))
 
 
 class CacheStorage:
+    __slots__ = ('_life_cycle_id_to_pool_group_index', '_cache_levels')
 
     @dataclass(slots=True)
     class Slot(SlotAllocator.Slot):
@@ -640,25 +754,25 @@ class CacheStorage:
                       cache_level=cache_level) for slot in slots
         ]
 
-    def allocate_multiple_by_pool_group(
+    def allocate_multiple_for_all_pool_groups(
             self, cache_level: CacheLevel,
-            num_slots_by_pool_group: list[int]) -> list[list[Slot]] | None:
+            num_slots_per_pool_group: list[int]) -> list[list[Slot]] | None:
         assert cache_level in self._cache_levels, f"Cache level {cache_level} is not supported"
         assert len(
-            num_slots_by_pool_group
-        ) == self.num_pool_groups, f"num_slots_by_pool_group must have {self.num_pool_groups} elements"
+            num_slots_per_pool_group
+        ) == self.num_pool_groups, f"num_slots_per_pool_group must have {self.num_pool_groups} elements"
         if any(
                 self._pool_group(cache_level, pg_idx).num_free_slots < num_slots
-                for pg_idx, num_slots in enumerate(num_slots_by_pool_group)):
+                for pg_idx, num_slots in enumerate(num_slots_per_pool_group)):
             return None
-        slots_by_group: list[list[CacheStorage.Slot]] = [
+        slots_per_group: list[list[CacheStorage.Slot]] = [
             self.allocate_multiple(pg_idx, cache_level, num_slots)
-            for pg_idx, num_slots in enumerate(num_slots_by_pool_group)
+            for pg_idx, num_slots in enumerate(num_slots_per_pool_group)
         ]  # type: ignore[assignment]
         assert all(
-            slots is not None for slots in slots_by_group
+            slots is not None for slots in slots_per_group
         ), "we have enough free slots but allocate_multiple returned None"
-        return slots_by_group
+        return slots_per_group
 
     def free(self, page: Slot):
         self._cache_levels[page.cache_level]._pool_groups[
@@ -675,39 +789,30 @@ class CacheStorage:
 
     def slot_size(self, pool_group_index: PoolGroupIndex) -> tuple[int, ...]:
         assert self._cache_levels
-        storage_iterator = iter(self._cache_levels.values())
-        result = next(storage_iterator).slot_size(pool_group_index)
-        assert all(
-            s.slot_size(pool_group_index) == result for s in storage_iterator)
-        return result
+        return get_uniform_attribute(self._cache_levels.values(),
+                                     lambda s: s.slot_size(pool_group_index))
 
     def resize(self, cache_level: CacheLevel, new_quota: int) -> bool:
-        ...
+        self._cache_levels[cache_level].resize(new_quota, None)
+        raise NotImplementedError("Not implemented")
 
     def update_ratio(self, cache_level: CacheLevel,
                      ratio_list: Sequence[float]) -> bool:
-        ...
+        self._cache_levels[cache_level].resize(None, ratio_list)
+        raise NotImplementedError("Not implemented")
 
     @property
     def num_pool_groups(self) -> int:
-        iterator = iter(self._cache_levels.values())
-        ret = len(next(iterator)._pool_groups)
-        assert all(
-            len(s._pool_groups) == ret for s in iterator
-        ), "All cache levels must have the same number of pool groups"
-        return ret
+        return get_uniform_attribute(self._cache_levels.values(),
+                                     lambda s: len(s._pool_groups))
 
     def num_pools_in_group(self, pool_group_index: PoolGroupIndex) -> int:
-        iterator = iter(self._cache_levels.values())
-        ret = len(next(iterator)._pool_groups[pool_group_index]._pools)
-        assert all(
-            len(s._pool_groups[pool_group_index]._pools) == ret
-            for s in iterator
-        ), "All cache levels must have the same number of pools in each pool group"
-        return ret
+        return get_uniform_attribute(
+            self._cache_levels.values(),
+            lambda s: len(s._pool_groups[pool_group_index]._pools))
 
     def _pool_group(self, cache_level: CacheLevel,
-                    pool_group_index: PoolGroupIndex) -> PoolGroup:
+                    pool_group_index: PoolGroupIndex) -> PoolGroupBase:
         assert cache_level in self._cache_levels, f"Cache level {cache_level} is not supported"
         return self._cache_levels[cache_level]._pool_groups[pool_group_index]
 
@@ -764,20 +869,20 @@ class Page:
         assert all(p._cache_storage is cache_storage for p in page_list)
         # classify pages by source cache level and pool group index.
         page_grouping: dict[CacheLevel, dict[PoolGroupIndex, list[Page]]] = {}
-        num_pages_by_group: list[int] = [0] * cache_storage.num_pool_groups
+        num_pages_per_group: list[int] = [0] * cache_storage.num_pool_groups
         for p in page_list:
             if p.slot.cache_level == dst_cache_level:
                 continue
             page_grouping.setdefault(p.slot.cache_level,
                                      {}).setdefault(p.slot.pool_group_index,
                                                     []).append(p)
-            num_pages_by_group[p.slot.pool_group_index] += 1
+            num_pages_per_group[p.slot.pool_group_index] += 1
         assert dst_cache_level not in page_grouping
         # allocate new slots for pages in dst_cache_level. indexed by pool group index.
-        all_new_slots: list[
-            list[CacheStorage.
-                 Slot]] | None = cache_storage.allocate_multiple_by_pool_group(
-                     dst_cache_level, num_pages_by_group)
+        all_new_slots: list[list[
+            CacheStorage.
+            Slot]] | None = cache_storage.allocate_multiple_for_all_pool_groups(
+                dst_cache_level, num_pages_per_group)
         if all_new_slots is None:
             return False
         # transfer data from src_cache_level to dst_cache_level.
@@ -787,7 +892,7 @@ class Page:
                 assert len(dst_slots) == len(pages)
                 # must use the same stream for one pool group as a page has only one ready_event for buffers in all pools.
                 prior_events: set[CachedCudaEvent] = set()
-                tasks_by_pool: list[list[CopyTask]] = [
+                tasks_per_pool: list[list[CopyTask]] = [
                     []
                 ] * cache_storage.num_pools_in_group(pg_idx)
                 for i, page in enumerate(pages):
@@ -797,12 +902,12 @@ class Page:
                     src_addresses = cache_storage.slot_address(page.slot)
                     for pool_idx in range(
                             cache_storage.num_pools_in_group(pg_idx)):
-                        tasks_by_pool[pool_idx].append(
+                        tasks_per_pool[pool_idx].append(
                             CopyTask(dst_addresses[pool_idx],
                                      src_addresses[pool_idx]))
                 with TemporaryCudaStream(prior_events) as stream:
                     slot_sizes = cache_storage.slot_size(pg_idx)
-                    for pool_idx, tasks in enumerate(tasks_by_pool):
+                    for pool_idx, tasks in enumerate(tasks_per_pool):
                         batched_copy(dst_cache_level, src_lv,
                                      slot_sizes[pool_idx], tasks, stream.get())
                     finish_event = stream.finish()

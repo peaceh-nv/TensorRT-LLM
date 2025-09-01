@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 
-from .. import DataRole, KVCacheManagerConfig, LayerId
-from .._common import SlidingWinSize
+from .._common import LayerId, SlidingWinSize
+from .._config import DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LifeCycle, LifeCycleId, LifeCycleRegistry
 
 

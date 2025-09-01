@@ -99,7 +99,7 @@ class _BlockRadixTree:
             block: _Block = self.root_blocks[key]
             while True:
                 if len(block.next) > 0:
-                    key = next(iter(block.next.keys()))
+                    key = next(iter(block.next))
                     block = block.next[key]
                 else:
                     block.drop_storage()

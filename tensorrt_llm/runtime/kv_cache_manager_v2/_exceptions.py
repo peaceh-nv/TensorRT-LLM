@@ -1,33 +1,15 @@
 import cuda.bindings.driver as drv
 
 
-class OutOfMemory(MemoryError):
+class OutOfMemoryError(MemoryError):
     pass
 
 
-class OutOfGpuMemory(OutOfMemory):
-    __slots__ = ('previous', 'goal', 'actual')
-    previous: int | None
-    goal: int | None
-    actual: int | None
-
-    def __init__(self,
-                 previous: int | None = None,
-                 goal: int | None = None,
-                 actual: int | None = None):
-        self.previous = previous
-        self.goal = goal
-        self.actual = actual if actual is not None else goal
-        super().__init__(
-            f"Out of GPU memory: previous={previous}, goal={goal}, actual={actual}"
-        )
-
-
-class OutOfHostMemory(OutOfMemory):
+class HostOOMError(OutOfMemoryError):
     pass
 
 
-class OutOfDiskSpace(OutOfMemory):
+class DiskOOMError(OutOfMemoryError):
     pass
 
 
@@ -40,7 +22,7 @@ class LogicError(Exception):
         super().__init__(message)
 
 
-class CudaDriverError(RuntimeError):
+class CuError(RuntimeError):
     error_code: drv.CUresult
 
     def __init__(self, error_code: drv.CUresult):
@@ -48,5 +30,11 @@ class CudaDriverError(RuntimeError):
         super().__init__(f"CUDA driver error: {error_code}")
 
 
-class ResourceBusy(RuntimeError):
+class CuOOMError(CuError, OutOfMemoryError):
+
+    def __init__(self):
+        super().__init__(drv.CUresult.CUDA_ERROR_OUT_OF_MEMORY)
+
+
+class ResourceBusyError(RuntimeError):
     pass
