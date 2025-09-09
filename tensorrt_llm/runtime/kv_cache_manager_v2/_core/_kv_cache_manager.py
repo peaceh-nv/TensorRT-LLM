@@ -1,15 +1,42 @@
+import threading
 from collections.abc import Callable, Sequence
 
-from .._common import CacheLevel, CudaStream, LayerId, Priority, TokenIdExt
+from .._block_radix_tree import BlockRadixTree
+from .._common import BlockOrdinal, CacheTier, CudaStream, Priority, TokenIdExt
 from .._config import KVCacheManagerConfig
-from .._life_cycle_registry import LifeCycle
+from .._eviction_controller import EvictionController
+from .._life_cycle_registry import LifeCycle, LifeCycleRegistry
+from .._storage._core import CacheStorage
+from .._utils import HomoTuple
 from ._kv_cache import _KVCache
 
 
 class KVCacheManager:
+    __slots__ = ('_lock', '_life_cycles', '_radix_tree', '_storage',
+                 '_eviction_controller')
+    _lock: threading.RLock
+    _life_cycles: LifeCycleRegistry
+    _radix_tree: BlockRadixTree
+    _storage: CacheStorage
+    _eviction_controller: EvictionController
+
+    @property
+    def lock(self) -> threading.RLock:
+        return self._lock
+
+    @property
+    def life_cycles(self) -> LifeCycleRegistry:
+        return self._life_cycles
+
+    @property
+    def storage(self) -> CacheStorage:
+        return self._storage
 
     def __init__(self, config: KVCacheManagerConfig):
-        ...
+        self._lock = threading.RLock()
+        self._radix_tree = BlockRadixTree(config.tokens_per_block,
+                                          LifeCycleRegistry(config))
+        raise NotImplementedError("Not implemented")
 
     # lora_task_id: match lora_task_id before matching any tokens.
     # stream: blocks are allocated and made ready in this stream. Later grow() also makes blocks ready in this stream, and later commit() calls also assume data are written in this stream.
@@ -23,20 +50,29 @@ class KVCacheManager:
     def create_kv_cache(self,
                         stream: CudaStream,
                         lora_task_id: int | None = None,
-                        past_tokens: Sequence[TokenIdExt] | None = None,
+                        input_tokens: Sequence[TokenIdExt] | None = None,
                         custom_priority_callback: Callable[
-                            [LayerId, LifeCycle],
+                            [BlockOrdinal, LifeCycle],
                             Priority] = lambda _, __: Priority.DEFAULT,
                         suspended: bool = False) -> '_KVCache | None':
-        ...
+        raise NotImplementedError("Not implemented")
 
     # If best_efforts is True, we will try to resize the quota to the largest possible value that is still <= quota, and returns False only when we cannot resize the quota at all.
     # If best_efforts is False, we will resize the quota to the exact value of quota, and give up if not possible.
     def resize(self,
-               cache_level: CacheLevel,
+               cache_level: CacheTier,
                quota: int,
                best_efforts: bool = False) -> bool:
-        ...
+        raise NotImplementedError("Not implemented")
 
-    def get_quota(self, cache_level: CacheLevel) -> int:
-        ...
+    def get_quota(self, cache_level: CacheTier) -> int:
+        raise NotImplementedError("Not implemented")
+
+    # sorted by CacheLevel from warm to cold
+    @property
+    def cache_level_list(self) -> HomoTuple[CacheTier]:
+        raise NotImplementedError("Not implemented")
+
+    @property
+    def tokens_per_block(self) -> int:
+        raise NotImplementedError("Not implemented")

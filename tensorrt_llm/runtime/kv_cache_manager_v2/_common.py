@@ -1,16 +1,18 @@
 import enum
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, BinaryIO
+from typing import TYPE_CHECKING, BinaryIO, NewType
 
 import cuda.bindings.driver as drv
 
 
-# Can extend to more levels in the future, e.g. object storage like AWS S3.
-class CacheLevel(enum.IntEnum):
-    GPU_MEM = 0
-    HOST_MEM = 1
-    DISK = 2
+# Can extend to more tiers in the future, e.g. object storage like AWS S3.
+class CacheTier(enum.Enum):
+    GPU_MEM = "GPU_MEM"
+    HOST_MEM = "HOST_MEM"
+    DISK = "DISK"
 
+
+CacheLevel = NewType("CacheLevel", int)
 
 # Normal token id that falls in the tokenizer vocabulary.
 TokenId = int
@@ -21,11 +23,11 @@ TokenId = int
 #   3. Hash the multi-modal token embedding data and use the digest as TokenIdExt for every multi-modal token. If we do this, we can't skip the encoder.
 TokenIdExt = TokenId | bytes
 
+BlockOrdinal = int
+
 LayerId = int
 if TYPE_CHECKING:
-
-    class CudaStream(int):
-        ...
+    CudaStream = NewType("CudaStream", int)
 else:
     CudaStream = drv.CUstream
 
@@ -42,7 +44,7 @@ class DiskAddress:
 
 Address = MemAddress | DiskAddress
 
-SlidingWinSize = int | None
+SlidingWindowSize = int | None
 
 
 class Priority(int):

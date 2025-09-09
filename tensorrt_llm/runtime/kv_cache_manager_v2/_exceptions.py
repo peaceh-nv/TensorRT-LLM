@@ -38,3 +38,7 @@ class CuOOMError(CuError, OutOfMemoryError):
 
 class ResourceBusyError(RuntimeError):
     pass
+
+
+class OutOfPagesError(RuntimeError):
+    pass

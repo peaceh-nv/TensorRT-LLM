@@ -1,9 +1,12 @@
 import hashlib
 import weakref
-from typing import Iterator, Sequence
+from typing import Iterable, Iterator, Sequence
 
-from ._common import TokenIdExt
-from ._storage import Page
+from ._common import BlockOrdinal, TokenIdExt
+from ._core._kv_cache_manager import KVCacheManager
+from ._life_cycle_registry import LifeCycleRegistry
+from ._page import CommittedPage
+from ._utils import unwrap_weakref
 
 BlockKey = bytes
 
@@ -20,41 +23,125 @@ def gen_multi_modal_tokens(id_offset: int, multi_modal_data_digest: bytes,
     ]
 
 
-class _Block:
+class Hasher:
+    __slots__ = ('_hasher')
+    _hasher: hashlib._Hash
+
+    def __init__(self, data: int | bytes | None | Iterable = None):
+        self._hasher = hashlib.sha256()
+        self.update(data)
+
+    def update(self, data: int | bytes | None | Iterable) -> 'Hasher':
+        if isinstance(data, int):
+            assert data >= 0 and data < (1 << 64)
+            self._hasher.update(data.to_bytes(8, 'little'))
+        elif isinstance(data, bytes):
+            self._hasher.update(data)
+        elif data is None:
+            pass
+        elif isinstance(data, Iterable):
+            for item in data:
+                self.update(item)
+        else:
+            raise ValueError(f"Unsupported type: {type(data)}")
+        return self
+
+    @property
+    def digest(self) -> bytes:
+        return self._hasher.digest()
+
+
+TokenBlock = Sequence[TokenIdExt]
+
+
+def sequence_to_blockchain_keys(
+        tokens_per_block: int, lora_task_id: int | None,
+        tokens: Sequence[TokenIdExt]) -> Iterator[tuple[TokenBlock, BlockKey]]:
+    digest = Hasher(lora_task_id).digest
+    for i in range(0, len(tokens), tokens_per_block):
+        token_block = tokens[i:i + tokens_per_block]
+        yield token_block, Hasher((digest, token_block)).digest
+
+
+class ChildrenDict(dict[BlockKey, 'Block']):
+    __slots__ = ()
+
+    def remove_child_tree(self, child_key: BlockKey):
+        # taking O(1) space
+        # remove leaf blocks one by one, in post-order
+        block: Block = self[child_key]
+        while True:
+            if block.next:
+                block = next(iter(block.next.values()))
+            else:
+                assert all(
+                    page is None or page() is None
+                    for page in block.storage), "Storage is not cleared, yet"
+                prev_block: Block | None = block.prev(
+                ) if block.prev is not None else None
+                if prev_block is None:
+                    break
+                prev_block.next.pop(block.key)
+                block = prev_block
+
+    def _find_best_partial_match_in_next_nodes(
+            self, tokens: TokenBlock) -> tuple['Block | None', int]:
+        """
+        Among all child nodes (self.next), finds the one whose tokens have the longest leading match with the given tokens.
+        Returns a tuple of (best_block, num_matched_tokens).
+        If no child matches any tokens, returns (None, 0).
+        """
+        # @todo: when we have many children, we need to build a database to accelerate partial matching.
+        best_block = None
+        best_match_len = 0
+        for block in self.values():
+            match_len = block._partial_match_this_node(tokens)
+            if match_len > best_match_len:
+                best_match_len = match_len
+                best_block = block
+        return best_block, best_match_len
+
+
+class RootPrevInfo:
+    __slots__ = ('_manager', 'key')
+    _manager: weakref.ref[KVCacheManager]
+    key: BlockKey  # hash of lora_task_id
+    ordinal: BlockOrdinal = -1
+
+
+class Block:
     """
     A block of tokens. Manages data for all layers.
     """
-    _partial_match_index_build_threshold: int = 100  # if we have more child nodes (self.next) than this, we will build a index to accelerate partial matching.
-    _partial_match_index_removal_threshold: int = 50  # if we have less child nodes (self.next) than this, we will remove the index.
-    __slots__ = ('key', 'tokens', 'prev', 'next', 'storage')
+    __slots__ = ('_manager', 'key', 'tokens', 'ordinal', 'prev', 'next',
+                 'storage')
+    _manager: weakref.ref[KVCacheManager]
     key: BlockKey
     tokens: Sequence[TokenIdExt]
-    prev: weakref.ref['_Block'] | None
-    next: dict[BlockKey, '_Block']
+    ordinal: BlockOrdinal
+    prev: weakref.ref['Block'] | None
+    next: ChildrenDict
 
     # indexed with LifeCycleId
-    storage: list[Page | None]
+    storage: list[weakref.ref[CommittedPage] | None]
 
-    def __init__(self, key: BlockKey, tokens: Sequence[TokenIdExt],
-                 prev: '_Block | None'):
-        self.key = key
+    def __init__(self, tokens: Sequence[TokenIdExt],
+                 prev: 'Block | RootPrevInfo'):
+        self._manager = prev._manager
+        self.key = Hasher((prev.key, tokens)).digest
         self.tokens = tokens
-        if prev is not None:
+        self.ordinal = prev.ordinal + 1
+        if isinstance(prev, Block):
             self.prev = weakref.ref(prev)
             # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
-            prev.next[key] = self
+            prev.next[self.key] = self
         else:
+            assert isinstance(prev, RootPrevInfo)
             self.prev = None
-        self.next = {}
+        self.next = ChildrenDict()
         self.storage = []
 
-    def drop_storage(self):
-        for page in self.storage:
-            if page is not None:
-                page.drop()
-        self.storage.clear()
-
-    def _partial_match_this_node(self, tokens: Sequence[TokenIdExt]) -> int:
+    def _partial_match_this_node(self, tokens: TokenBlock) -> int:
         """
         Returns the number of leading tokens that match between the given tokens and this block's tokens.
         """
@@ -64,89 +151,68 @@ class _Block:
                 return i
         return len(tokens)
 
-    def _find_best_partial_match_in_next_nodes(
-            self, tokens: Sequence[TokenIdExt]) -> tuple['_Block | None', int]:
-        """
-        Among all child nodes (self.next), finds the one whose tokens have the longest leading match with the given tokens.
-        Returns a tuple of (best_block, num_matched_tokens).
-        If no child matches any tokens, returns (None, 0).
-        """
-        if len(self.next) > type(self)._partial_match_index_build_threshold:
-            print(
-                "Warning: should build index to accelerate partial matching, but this is not yet implemented."
-            )
-        best_block = None
-        best_match_len = 0
-        for block in self.next.values():
-            match_len = block._partial_match_this_node(tokens)
-            if match_len > best_match_len:
-                best_match_len = match_len
-                best_block = block
-        return best_block, best_match_len
+    @property
+    def manager(self) -> KVCacheManager:
+        return unwrap_weakref(self._manager)
 
 
-class _BlockRadixTree:
-    tokens_per_block: int
-    root_blocks: dict[BlockKey, _Block]
+class BlockRadixTree:
+    __slots__ = ('_tokens_per_block', '_root_blocks', '_life_cycles')
+    _tokens_per_block: int
+    _life_cycles: LifeCycleRegistry
+    _root_blocks: ChildrenDict
 
-    def __init__(self, tokens_per_block: int):
-        self.tokens_per_block = tokens_per_block
-        self.root_blocks = dict[BlockKey, _Block]()
+    def __init__(self, tokens_per_block: int, life_cycles: LifeCycleRegistry):
+        self._tokens_per_block = tokens_per_block
+        self._life_cycles = life_cycles
+        self._root_blocks = ChildrenDict()
+
+    @property
+    def life_cycles(self) -> LifeCycleRegistry:
+        return self._life_cycles
 
     def clear(self):
-        for root_key in self.root_blocks:
-            key = root_key
-            block: _Block = self.root_blocks[key]
-            while True:
-                if len(block.next) > 0:
-                    key = next(iter(block.next))
-                    block = block.next[key]
-                else:
-                    block.drop_storage()
-                    prev_block: _Block | None = block.prev(
-                    ) if block.prev is not None else None
-                    if prev_block is None:
-                        break
-                    block = prev_block
-                    key = block.key
-        self.root_blocks.clear()
+        # taking O(1) space
+        # remove leaf blocks one by one, in post-order
+        for root_key in self._root_blocks:
+            self._root_blocks.remove_child_tree(root_key)
+        self._root_blocks.clear()
+
+    @staticmethod
+    def traverse_subtree(root: Block) -> Iterator[Block]:
+        stack: list[Iterator[Block]] = []
+        brother_iter: Iterator[Block] = iter((root, ))
+        while True:
+            block: Block | None = next(brother_iter, None)
+            if block is None:
+                if not stack:
+                    break
+                brother_iter = stack.pop()
+            else:
+                yield block
+                if block.next:
+                    stack.append(brother_iter)
+                    brother_iter = iter(block.next.values())
 
     # yields tuples of (block, num_matched_tokens). num_matched_tokens should be equal to tokens_per_block except the last one.
     def match(
             self,
             lora_task_id: int | None,
             tokens: Sequence[TokenIdExt],
-            enable_partial_match: bool = False) -> Iterator[tuple[_Block, int]]:
-        child_blocks: dict[BlockKey, _Block] = self.root_blocks
-        block = None
-        for key in self._sequence_to_blockchain_keys(self.tokens_per_block,
-                                                     lora_task_id, tokens):
-            if key in child_blocks:
-                block = child_blocks[key]
-                yield block, self.tokens_per_block
+            enable_partial_match: bool = False) -> Iterator[tuple[Block, int]]:
+        candidates: ChildrenDict = self._root_blocks
+        mismatched_token_block = None
+        for token_block, key in sequence_to_blockchain_keys(
+                self._tokens_per_block, lora_task_id, tokens):
+            if key in candidates:
+                block = candidates[key]
+                yield block, self._tokens_per_block
+                candidates = block.next
             else:
+                mismatched_token_block = token_block
                 break
-        if block is not None and enable_partial_match:
-            block, match_len = block._find_best_partial_match_in_next_nodes(
-                tokens)
+        if mismatched_token_block is not None and enable_partial_match:
+            block, match_len = candidates._find_best_partial_match_in_next_nodes(
+                mismatched_token_block)
             if block is not None:
                 yield block, match_len
-
-    @staticmethod
-    def _sequence_to_blockchain_keys(
-            tokens_per_block: int, lora_task_id: int | None,
-            tokens: Sequence[TokenIdExt]) -> Iterator[BlockKey]:
-        hasher = hashlib.sha256()
-        if lora_task_id is not None:
-            assert isinstance(lora_task_id, int)
-            hasher.update(lora_task_id.to_bytes(8, 'little'))
-        digest = hasher.digest()
-        for i in range(0, len(tokens), tokens_per_block):
-            hasher = hashlib.sha256(digest)
-            block = tokens[i:i + tokens_per_block]
-            for token in block:
-                hasher.update(
-                    token.to_bytes(8, 'little') if isinstance(token, int
-                                                              ) else token)
-            digest = hasher.digest()
-            yield digest

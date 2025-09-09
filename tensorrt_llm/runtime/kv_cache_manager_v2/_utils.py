@@ -2,16 +2,18 @@ import array
 import atexit
 import ctypes
 import functools
+import operator
 import os
 import traceback
+import weakref
 from abc import ABC, abstractmethod
 from collections import deque
 from ctypes.util import find_library
+from itertools import pairwise
 from typing import (Any, BinaryIO, Callable, ClassVar, Generic, Iterable,
-                    MutableSequence, Sequence, TypeVar)
+                    MutableSequence, Sequence, Type, TypeVar, cast)
 
 import cuda.bindings.driver as drv
-from typing_extensions import Type
 
 from ._exceptions import (CuError, CuOOMError, DiskOOMError, HostOOMError,
                           LogicError)
@@ -47,6 +49,16 @@ def in_range(x: int, lower: int, upper: int) -> bool:
 
 T = TypeVar('T')
 U = TypeVar('U')
+
+
+def unwrap_optional(value: T | None) -> T:
+    if value is None:
+        raise ValueError("Expected non-None value")
+    return cast(T, value)
+
+
+def unwrap_weakref(value: weakref.ref[T]) -> T:
+    return unwrap_optional(value())
 
 
 def coalesce(value: T | None, fallback: T) -> T:
@@ -85,6 +97,22 @@ def noexcept(func: Callable[..., Any]) -> Callable[..., Any]:
 
     return wrapper
 
+
+def expect_type(value: Any, ExpectedType: Type[T]) -> T:
+    if not isinstance(value, ExpectedType):
+        raise ValueError(
+            f"Expected {ExpectedType.__name__}, got {type(value).__name__}")
+    return value
+
+
+def is_sorted(iterable: Iterable[T],
+              key: Callable[[T], Any] = lambda x: x,
+              reverse: bool = False) -> bool:
+    comp = operator.ge if reverse else operator.le
+    return all(comp(key(a), key(b)) for a, b in pairwise(iterable))
+
+
+HomoTuple = tuple[T, ...]
 
 mem_alignment = 2 << 20  # 2MB
 
