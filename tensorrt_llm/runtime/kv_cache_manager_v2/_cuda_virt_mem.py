@@ -96,15 +96,13 @@ class VirtMem:
 
     def extend(self, num_phys_mem: int):
         old_num_phys_mem = self.num_phys_mem
-        success: bool = False
         try:
             for _ in range(num_phys_mem):
                 self._push(self._allocator.create())
-            success = True
-        finally:  # to make realloc behave like normal realloc, we need to rollback if out of memory
-            if not success:
-                while self.num_phys_mem > old_num_phys_mem:
-                    self._pop().close()
+        except Exception:  # to make realloc behave like normal realloc, we need to rollback if out of memory
+            while self.num_phys_mem > old_num_phys_mem:
+                self._pop().close()
+            raise
 
     def shrink(self, num_phys_mem: int):
         for _ in range(num_phys_mem):

@@ -7,11 +7,12 @@ import os
 import traceback
 import weakref
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import defaultdict, deque
 from ctypes.util import find_library
 from itertools import pairwise
 from typing import (Any, BinaryIO, Callable, ClassVar, Generic, Iterable,
-                    MutableSequence, Sequence, Type, TypeVar, cast)
+                    Iterator, MutableSequence, Protocol, Sequence, Type,
+                    TypeVar, cast)
 
 import cuda.bindings.driver as drv
 
@@ -49,12 +50,15 @@ def in_range(x: int, lower: int, upper: int) -> bool:
 
 T = TypeVar('T')
 U = TypeVar('U')
+Index = TypeVar('Index', bound=int, contravariant=True)
+Row = TypeVar('Row', bound=int, contravariant=True)
+Col = TypeVar('Col', bound=int, contravariant=True)
 
 
 def unwrap_optional(value: T | None) -> T:
     if value is None:
         raise ValueError("Expected non-None value")
-    return cast(T, value)
+    return value
 
 
 def unwrap_weakref(value: weakref.ref[T]) -> T:
@@ -76,6 +80,14 @@ def remove_if(original: MutableSequence[T],
             original[idx - len(removed)] = item
     del original[len(original) - len(removed):]
     return removed
+
+
+def partition(original: Iterable[T],
+              classifier: Callable[[T], U]) -> defaultdict[U, list[T]]:
+    ret = defaultdict(list)
+    for item in original:
+        ret[classifier(item)].append(item)
+    return ret
 
 
 def get_uniform_attribute(iterable: Iterable[T],
@@ -114,23 +126,98 @@ def is_sorted(iterable: Iterable[T],
 
 HomoTuple = tuple[T, ...]
 
+
+class TypedIndexList(Protocol[Index, T]):
+
+    def __getitem__(self, index: Index) -> T:
+        ...
+
+    def __setitem__(self, index: Index, value: T) -> None:
+        ...
+
+    def __iter__(self) -> Iterator[T]:
+        ...
+
+    def __len__(self) -> int:
+        ...
+
+    def __reversed__(self) -> Iterator[T]:
+        ...
+
+
+class Array2D(Generic[Row, Col, T]):
+    __slots__ = ('_data', '_cols')
+    _data: list[T]
+    _cols: int
+
+    def __init__(self, rows: int, cols: int, init_val: Iterable[T]):
+        self._data = list(init_val)
+        self._cols = cols
+
+    def __getitem__(self, index: tuple[Row, Col]) -> T:
+        return self._data[index[0] * self._cols + index[1]]
+
+    def __setitem__(self, index: tuple[Row, Col], value: T) -> None:
+        self._data[index[0] * self._cols + index[1]] = value
+
+    @property
+    def rows(self) -> int:
+        assert len(self._data) % self._cols == 0
+        return len(self._data) // self._cols
+
+    def row(self, row: Row) -> TypedIndexList[Col, T]:
+        return cast(TypedIndexList[Col, T],
+                    self._data[row * self._cols:(row + 1) * self._cols])
+
+    def col(self, col: Col) -> TypedIndexList[Row, T]:
+        return cast(TypedIndexList[Row, T], self._data[col::self._cols])
+
+    @property
+    def cols(self) -> int:
+        return self._cols
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __iter__(self) -> Iterator[T]:
+        return iter(self._data)
+
+    def __reversed__(self) -> Iterator[T]:
+        return reversed(self._data)
+
+
+def typed_range(count: Index) -> Iterator[Index]:
+    return (cast(Index, i) for i in range(int(count)))
+
+
 mem_alignment = 2 << 20  # 2MB
 
 _libc = ctypes.CDLL(find_library('c'))
 
 
-def _posix_memalign(alignment: int, size: int) -> int:
+def _aligned_alloc(alignment: int, size: int) -> int:
     """
     Allocates size bytes of uninitialized storage whose alignment is specified by alignment.
     Returns the address as an integer.
-    Raises OSError on failure.
+    Raises HostOOMError on failure.
     """
-    memptr = ctypes.c_void_p()
-    ret = _libc.posix_memalign(ctypes.byref(memptr), alignment, size)
-    if ret != 0:
-        raise HostOOMError("posix_memalign failed")
+    assert size % alignment == 0
+    memptr = _libc.aligned_alloc(alignment, size)
+    if memptr == ctypes.c_void_p(0):
+        raise HostOOMError("aligned_alloc failed")
     assert memptr.value is not None and memptr.value != 0
     return memptr.value
+
+
+def _memadvise(ptr: int, size: int, advice: int):
+    if os.name == "nt":
+        return
+    ret = _libc.madvise(ptr, size, advice)
+    if ret != 0:
+        raise HostOOMError("memadvise failed")
+
+
+MADV_HUGEPAGE = 14
 
 
 def _realloc(ptr: int, size: int) -> int:
@@ -149,8 +236,6 @@ class HostMem:
     """
     Host memory aligned to 2MB, reallocable for low-cost resizing and registered to CUDA as page-locked memory.
     Resizing will keep the original memory content, like `realloc` in C.
-    Note that we did not enable CU_MEMHOSTREGISTER_DEVICEMAP so the memory may not be accessible from kernels.
-    We do not intend to use this memory in CUDA kernels.
     """
     __slots__ = ('_address', '_size')
     _address: int
@@ -169,14 +254,16 @@ class HostMem:
             self._address = 0
             self._size = 0
             return
-        self._address = _posix_memalign(mem_alignment, size)
+        self._address = _aligned_alloc(mem_alignment, size)
         self._size = size
+        _memadvise(self._address, size, MADV_HUGEPAGE)
 
     def resize(self, new_size: int):
         self._unregister_from_cuda()
         try:
             self._address = _realloc(self._address, new_size)
             self._size = new_size
+            _memadvise(self._address, new_size, MADV_HUGEPAGE)
         finally:
             self._register_to_cuda()
 
@@ -192,8 +279,9 @@ class HostMem:
 
     def _register_to_cuda(self):
         _unwrap(
-            drv.cuMemHostRegister(self._address, self._size,
-                                  drv.CU_MEMHOSTREGISTER_PORTABLE))
+            drv.cuMemHostRegister(
+                self._address, self._size, drv.CU_MEMHOSTREGISTER_PORTABLE
+                | drv.CU_MEMHOSTREGISTER_DEVICEMAP))
 
     def _unregister_from_cuda(self):
         _unwrap(drv.cuMemHostUnregister(self._address))

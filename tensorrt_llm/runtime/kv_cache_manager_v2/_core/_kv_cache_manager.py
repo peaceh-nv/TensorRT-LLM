@@ -1,39 +1,29 @@
-import threading
 from collections.abc import Callable, Sequence
 
 from .._block_radix_tree import BlockRadixTree
 from .._common import BlockOrdinal, CacheTier, CudaStream, Priority, TokenIdExt
 from .._config import KVCacheManagerConfig
-from .._eviction_controller import EvictionController
 from .._life_cycle_registry import LifeCycle, LifeCycleRegistry
-from .._storage._core import CacheStorage
+from .._storage_manager import StorageManager
 from .._utils import HomoTuple
 from ._kv_cache import _KVCache
 
 
 class KVCacheManager:
-    __slots__ = ('_lock', '_life_cycles', '_radix_tree', '_storage',
-                 '_eviction_controller')
-    _lock: threading.RLock
+    __slots__ = ('_life_cycles', '_radix_tree', '_storage')
     _life_cycles: LifeCycleRegistry
     _radix_tree: BlockRadixTree
-    _storage: CacheStorage
-    _eviction_controller: EvictionController
-
-    @property
-    def lock(self) -> threading.RLock:
-        return self._lock
+    _storage: StorageManager
 
     @property
     def life_cycles(self) -> LifeCycleRegistry:
         return self._life_cycles
 
     @property
-    def storage(self) -> CacheStorage:
+    def storage(self) -> StorageManager:
         return self._storage
 
     def __init__(self, config: KVCacheManagerConfig):
-        self._lock = threading.RLock()
         self._radix_tree = BlockRadixTree(config.tokens_per_block,
                                           LifeCycleRegistry(config))
         raise NotImplementedError("Not implemented")
@@ -70,9 +60,9 @@ class KVCacheManager:
 
     # sorted by CacheLevel from warm to cold
     @property
-    def cache_level_list(self) -> HomoTuple[CacheTier]:
-        raise NotImplementedError("Not implemented")
+    def cache_tier_list(self) -> HomoTuple[CacheTier]:
+        return self._storage.cache_tiers
 
     @property
     def tokens_per_block(self) -> int:
-        raise NotImplementedError("Not implemented")
+        return self._radix_tree.tokens_per_block

@@ -7,6 +7,7 @@ class PageStatus(enum.IntEnum):
     DROPPABLE = 2  # Allow eviction and dropping
 
 
-from ._eviction_controller import Candidate, EvictionController, EvictionPolicy
+from ._eviction_controller import (EvictablePage, EvictionPolicy,
+                                   PerLevelEvictionController)
 
-__all__ = ['EvictionController', 'Candidate', 'EvictionPolicy']
+__all__ = ['EvictionPolicy', 'PerLevelEvictionController', 'EvictablePage']

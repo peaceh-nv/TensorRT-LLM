@@ -1,16 +1,13 @@
-import weakref
-from typing import Callable, Iterable, Protocol, runtime_checkable
+from typing import Callable, Protocol, cast, runtime_checkable
 
 from llist import sllist, sllistnode
 
-from .._block_radix_tree import BlockRadixTree
 from .._common import CacheLevel, Priority
-from .._core._kv_cache_manager import KVCacheManager
 from .._eviction_controller import PageStatus
 from .._exceptions import OutOfPagesError
-from .._life_cycle_registry import LifeCycle, LifeCycleId
-from .._storage._core import CacheStorage, PoolGroupIndex
-from .._utils import HomoTuple, unwrap_weakref
+from .._life_cycle_registry import LifeCycleId
+from .._storage._core import PoolGroupIndex
+from .._utils import TypedIndexList, noexcept, unwrap_optional
 
 
 @runtime_checkable
@@ -49,10 +46,10 @@ class EvictionPolicy(Protocol):
         def value(self) -> EvictablePage:
             ...
 
-    def push(self, page: EvictablePage) -> NodeRef:
+    def push(self, page: EvictablePage, evict_first: bool = False) -> NodeRef:
         ...
 
-    def front(self) -> NodeRef:
+    def pop(self) -> EvictablePage:
         ...
 
     # Remove a node so we no longer consider it for eviction. Like pop() but allow removing a node that is not the first.
@@ -72,11 +69,19 @@ class LRUEvictionPolicy:
     def __init__(self):
         self._queue = sllist()
 
-    def push(self, page: EvictablePage) -> sllistnode:
-        return self._queue.append(page)
+    def push(self,
+             page: EvictablePage,
+             evict_first: bool = False) -> EvictionPolicy.NodeRef:
+        assert page.node_ref is None
+        return self._queue.appendleft(
+            page) if evict_first else self._queue.append(page)
 
-    def front(self) -> sllistnode:
-        return self._queue.first
+    def pop(self) -> EvictablePage:
+        victim = self._queue.first
+        assert victim is not None
+        page = victim.value
+        self.remove(victim)
+        return page
 
     def remove(self, node: EvictionPolicy.NodeRef) -> EvictablePage:
         assert isinstance(node, self.NodeRef)
@@ -114,15 +119,16 @@ class PrioritizedEvictionPolicy:
     def _front_policy(self) -> EvictionPolicy:
         return next(iter(self._policies.values()))
 
-    def push(self, page: EvictablePage) -> EvictionPolicy.NodeRef:
-        return self.get_policy(page.priority).push(page)
+    def push(self,
+             page: EvictablePage,
+             evict_first: bool = False) -> EvictionPolicy.NodeRef:
+        return self.get_policy(page.priority).push(page, evict_first)
 
-    def front(self) -> EvictionPolicy.NodeRef:
-        return self._front_policy().front()
+    def pop(self) -> EvictablePage:
+        return self._front_policy().pop()
 
     def remove(self, node: EvictionPolicy.NodeRef) -> EvictablePage:
         page = node.value
-        assert page.node_ref == node
         policy = self._policies[page.priority]
         policy.remove(node)
         if not policy:
@@ -139,159 +145,75 @@ class PrioritizedLRUEvictionPolicy(PrioritizedEvictionPolicy):
 
 
 class PerLevelEvictionController:  # for one cache level
-    __slots__ = ('_controller', '_level', '_radix_tree', '_policies')
-    _controller: weakref.ref['EvictionController']
-    _level: CacheLevel
-    _policies: dict[PoolGroupIndex, EvictionPolicy]
+    __slots__ = ('_life_cycle_grouping', '_policies')
+    _life_cycle_grouping: dict[LifeCycleId, PoolGroupIndex]
+    _policies: TypedIndexList[PoolGroupIndex, EvictionPolicy]
 
-    def __init__(self, controller: 'EvictionController', level: CacheLevel):
-        self._controller = weakref.ref(controller)
-        self._level = level
-        manager = controller.manager
-        self._policies = {
-            PoolGroupIndex(pg_idx): PrioritizedLRUEvictionPolicy()
-            for pg_idx in range(manager.storage.num_pool_groups)
-        }
+    def __init__(self, life_cycle_grouping: dict[LifeCycleId, PoolGroupIndex]):
+        self._life_cycle_grouping = life_cycle_grouping
+        num_pool_groups = max(life_cycle_grouping.values()) + 1
+        assert num_pool_groups == len(set(life_cycle_grouping.values()))
+        self._policies = cast(
+            TypedIndexList,
+            [PrioritizedLRUEvictionPolicy() for _ in range(num_pool_groups)])
 
     def _get_policy(self, life_cycle: LifeCycleId) -> EvictionPolicy:
-        pg_idx = self.storage.get_pool_group_index(life_cycle)
+        pg_idx = self._life_cycle_grouping[life_cycle]
         return self._policies[pg_idx]
 
-    def schedule_for_eviction(self, page: EvictablePage):
+    def schedule_for_eviction(self,
+                              page: EvictablePage,
+                              evict_first: bool = False):
         assert page.node_ref is None
-        page.node_ref = self._get_policy(page.life_cycle).push(page)
+        page.node_ref = self._get_policy(page.life_cycle).push(
+            page, evict_first)
+        assert unwrap_optional(page.node_ref).value is page
 
-    # Usually only evict at most num_pages pages, but if evicting a node makes some other nodes useless, those nodes will be returned as well.
+    # If evicting a node makes some other nodes useless, those nodes will be returned as well.
     # One example: for SWA, if the number of blocks just makes up one window size, then evicting any of them makes the remaining blocks useless.
-    # Raise if no enough pages to evict.
-    def get_eviction_candidates(
-            self, pg_idx: PoolGroupIndex,
-            min_num_pages: int) -> list[EvictionPolicy.NodeRef]:
-        policy = self._policies[pg_idx]
-        if len(policy) < min_num_pages:
-            raise OutOfPagesError(
-                f"Not enough pages to evict. {len(policy)} < {min_num_pages}")
-        pages: list[EvictionPolicy.NodeRef] = []
-        while len(pages) < min_num_pages:
-            nodes = self._next_to_evict(pg_idx)
-            assert len(nodes) > 0
-            pages.extend(nodes)
-        return pages
+    # Raise if no enough pages to evict. In this case, pages are returned to the eviction queue.
+    def evict(
+        self, min_num_pages: TypedIndexList[PoolGroupIndex, int]
+    ) -> TypedIndexList[PoolGroupIndex, list[EvictablePage]]:
+        assert len(min_num_pages) == self.num_pool_groups
+        ret: TypedIndexList[PoolGroupIndex, list[EvictablePage]] = cast(
+            TypedIndexList, [[]] * self.num_pool_groups)
+        try:
+            for pg_idx, count in enumerate(min_num_pages):
+                pg_idx = PoolGroupIndex(pg_idx)
+                count = min_num_pages[pg_idx]
+                policy = self._policies[pg_idx]
+                if (len(policy) + len(ret[pg_idx])) < count:
+                    raise OutOfPagesError(
+                        f"Not enough pages to evict in group {pg_idx}")
+                while len(ret[pg_idx]) < count:
+                    page = policy.pop()
+                    page.node_ref = None
+                    ret[pg_idx].append(page)
+                    for a, b in zip(ret, self._evict_dependencies(page)):
+                        a.extend(b)
+            return ret
+        except Exception:
+            for p in reversed(sum(ret, [])):
+                self.schedule_for_eviction(p, evict_first=True)
+            raise
 
-    def remove(
-            self, nodes: Iterable[EvictionPolicy.NodeRef]
-    ) -> HomoTuple[EvictablePage]:
-        ret = tuple(
-            self._get_policy(n.value.life_cycle).remove(n) for n in nodes)
-        for page in ret:
-            page.node_ref = None
-        return ret
+    def remove(self, node: EvictionPolicy.NodeRef) -> None:
+        page = node.value
+        assert page.node_ref == node
+        self._get_policy(page.life_cycle).remove(node)
+        page.node_ref = None
 
-    @property
-    def radix_tree(self) -> BlockRadixTree:
-        return self.manager._radix_tree
+    # @TODO: implement this
+    @noexcept
+    def _evict_dependencies(
+        self, page: EvictablePage
+    ) -> TypedIndexList[PoolGroupIndex, list[EvictablePage]]:
+        return cast(TypedIndexList, [[]] * self.num_pool_groups)
 
-    def _next_to_evict(self,
-                       pg_idx: PoolGroupIndex) -> list[EvictionPolicy.NodeRef]:
-        policy = self._policies[pg_idx]
-        if len(policy) == 0:
-            return []
-        seed = policy.front()
-        ret = [seed]
-        # For now, we ignore dependency check. This should be good enough for LRU policy.
-        return ret
-        # @todo: Check if evicting this page makes any other pages useless.
-        front_page = seed.value
-        front_page.cache_level
-        tree = self.radix_tree
-
-        seed_block = unwrap_weakref(front_page.block)
-        life_cycle: LifeCycle = tree.life_cycles.get_life_cycle(
-            front_page.life_cycle_id)
-        if seed_block.depth < life_cycle.num_sink_blocks or life_cycle.sliding_win_size is None:
-            for block in tree.traverse_subtree(seed_block):
-                raise NotImplementedError("Not implemented")
-        else:
-            raise NotImplementedError("Not implemented")
+    def num_evictable_pages(self, pg_idx: PoolGroupIndex) -> int:
+        return len(self._policies[pg_idx])
 
     @property
-    def controller(self) -> 'EvictionController':
-        return unwrap_weakref(self._controller)
-
-    @property
-    def manager(self) -> KVCacheManager:
-        return self.controller.manager
-
-    @property
-    def storage(self) -> CacheStorage:
-        return self.manager.storage
-
-
-class HeldNodeRef:
-    __slots__ = ('_page', )
-    _page: EvictablePage
-
-    def __init__(self, page: EvictablePage):
-        self._page = page
-
-    @property
-    def value(self) -> EvictablePage:
-        return self._page
-
-
-assert issubclass(HeldNodeRef, EvictionPolicy.NodeRef)
-
-
-class EvictionController:
-    __slots__ = ('_storage', '_radix_tree', '_per_level_controllers',
-                 '_held_pages')
-    _manager: weakref.ref[KVCacheManager]
-    _radix_tree: weakref.ref[BlockRadixTree]
-    # sorted by CacheLevel from warm to cold
-    _per_level_controllers: tuple[PerLevelEvictionController]
-
-    def schedule_for_eviction(self, page: EvictablePage) -> bool:
-        'If success, sets page.node_ref.'
-        assert page.node_ref is None
-        if not self.is_evictable(page):
-            return False
-        self._per_level_controllers[page.cache_level].schedule_for_eviction(
-            page)
-        return True
-
-    def is_evictable(self, page: EvictablePage) -> bool:
-        status = page.status
-        # droppable pages that are not committed should be dropped immediately.
-        # held pages in last level cache can't be evicted.
-        return (status == PageStatus.DROPPABLE and page.is_committed()) or (
-            status == PageStatus.HELD
-            and page.cache_level < self.num_cache_levels - 1)
-
-    def get_eviction_candidates(self, cache_level: CacheLevel,
-                                pg_idx: PoolGroupIndex,
-                                num_pages: int) -> list[EvictionPolicy.NodeRef]:
-        return self._per_level_controllers[cache_level].get_eviction_candidates(
-            pg_idx, num_pages)
-
-    def remove(
-            self, nodes: Iterable[EvictionPolicy.NodeRef]
-    ) -> HomoTuple[EvictablePage]:
-        return tuple(
-            self._per_level_controllers[n.value.cache_level].remove((n, ))[0]
-            for n in nodes)
-
-    @property
-    def radix_tree(self) -> BlockRadixTree:
-        return unwrap_weakref(self._radix_tree)
-
-    @property
-    def num_cache_levels(self) -> int:
-        return len(self._per_level_controllers)
-
-    @property
-    def manager(self) -> KVCacheManager:
-        return unwrap_weakref(self._manager)
-
-    @property
-    def storage(self) -> CacheStorage:
-        return self.manager.storage
+    def num_pool_groups(self) -> int:
+        return len(self._policies)

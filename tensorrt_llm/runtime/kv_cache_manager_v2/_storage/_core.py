@@ -7,14 +7,13 @@ from typing import BinaryIO, ClassVar, NewType, final, override
 
 from .._common import Address, CacheLevel, CacheTier, DiskAddress, MemAddress
 from .._config import CacheTierConfig, DiskCacheTierConfig, KVCacheManagerConfig
-from .._copy_engine import CopyTask, batched_copy
 from .._cuda_virt_mem import PhysMem, PooledPhysMemAllocator, VirtMem
 from .._exceptions import LogicError, OutOfPagesError, ResourceBusyError
 from .._life_cycle_registry import LifeCycleId
 from .._utils import (CachedCudaEvent, DynamicBitset, HomoTuple, HostMem,
-                      TemporaryCudaStream, div_up, get_file_size,
-                      get_uniform_attribute, query_total_gpu_memory, remove_if,
-                      resize_file, round_down, unwrap_optional)
+                      div_up, get_file_size, get_uniform_attribute,
+                      query_total_gpu_memory, remove_if, resize_file,
+                      round_down, unwrap_optional)
 from ._config import StorageConfig, create_storage_config
 
 
@@ -181,6 +180,12 @@ class Slot:
     @property
     def has_valid_slot(self) -> bool:
         return self._slot_id is not None
+
+    def set_slot(self, slot: 'Slot'):
+        if self.has_valid_slot:
+            raise LogicError("Slot is already set.")
+        self._slot_id = slot.slot_id
+        self.ready_event = slot.ready_event
 
 
 class SlotAllocator:
@@ -442,6 +447,7 @@ class PoolGroupBase:
     def slot_address(self, slot: Slot) -> HomoTuple[Address]:
         return tuple(pool.slot_address(slot.slot_id) for pool in self._pools)
 
+    @property
     def slot_size(self) -> HomoTuple[int]:
         return tuple(pool.slot_size for pool in self._pools)
 
@@ -498,6 +504,7 @@ class DiskPoolGroup(PoolGroupBase):
 
 
 PoolGroupIndex = NewType("PoolGroupIndex", int)
+PoolIndex = NewType("PoolIndex", int)
 
 
 class CacheLevelStorage:
@@ -543,6 +550,9 @@ class CacheLevelStorage:
     def num_slots(self, pool_group_index: PoolGroupIndex) -> int:
         return self._pool_groups[pool_group_index].num_slots
 
+    def get_num_free_slots(self, pool_group_index: PoolGroupIndex) -> int:
+        return self._pool_groups[pool_group_index].num_free_slots
+
     @property
     def slot_count_list(self) -> HomoTuple[int]:
         """
@@ -554,7 +564,7 @@ class CacheLevelStorage:
         """
         The slot sizes of each pool in the pool group.
         """
-        return self._pool_groups[pool_group_index].slot_size()
+        return self._pool_groups[pool_group_index].slot_size
 
     @property
     def slot_size_lists(self) -> HomoTuple[HomoTuple[int]]:
@@ -580,7 +590,6 @@ class CacheLevelStorage:
             self._ratio_list = tuple(new_ratio_list)
 
     def _resize_impl(self, new_slot_count_list: Sequence[int]):
-        success = False
         old_slot_count_list = self.slot_count_list
         assert old_slot_count_list == self._compute_slot_count_list(
             self.total_quota, self.ratio_list)
@@ -602,10 +611,9 @@ class CacheLevelStorage:
                         new_slot_count
                     )  # expand pools first as it can fail for expanding
                     pg.resize_slot_allocator(new_slot_count)
-            success = True
-        finally:
-            if not success:
-                self._resize_impl(old_slot_count_list)
+        except Exception:
+            self._resize_impl(old_slot_count_list)
+            raise
 
     # Calculate how many slots will there be in each pool group with the given total_quota and ratio_list. Use _ratio_to_slot_count_list for initialization.
     def _compute_slot_count_list(
@@ -744,14 +752,7 @@ class CacheStorage:
             self._create_cache_level_storage(tier_config, slot_size_lists,
                                              init_ratio)
             for tier_config in config.cache_tiers)
-        for pg_index, life_cycle_id_list in enumerate(
-                config.life_cycle_grouping()):
-            for life_cycle_id in life_cycle_id_list:
-                assert LifeCycleId(
-                    life_cycle_id
-                ) not in self._life_cycle_id_to_pool_group_index, f"Life cycle {life_cycle_id} is already mapped to pool group {self._life_cycle_id_to_pool_group_index[LifeCycleId(life_cycle_id)]}"
-                self._life_cycle_id_to_pool_group_index[LifeCycleId(
-                    life_cycle_id)] = PoolGroupIndex(pg_index)
+        self._life_cycle_id_to_pool_group_index = config.life_cycle_grouping()
 
     @staticmethod
     def _create_cache_level_storage(
@@ -874,41 +875,3 @@ class CacheStorage:
                     pool_group_index: PoolGroupIndex) -> PoolGroupBase:
         assert 0 <= cache_level < self.num_cache_levels, f"Cache level {cache_level} is invalid"
         return self._cache_levels[cache_level]._pool_groups[pool_group_index]
-
-    def batched_migrate(self, pool_group_index: PoolGroupIndex,
-                        dst_level: CacheLevel, src_level: CacheLevel,
-                        src_slots: Sequence[Slot],
-                        release_src: bool) -> Sequence[Slot]:
-        assert dst_level != src_level, "dst_level and src_level must be different"
-        num_slots = len(src_slots)
-        num_pools = self.num_pools_in_group(pool_group_index)
-        src_pool_group = self._pool_group(src_level, pool_group_index)
-        dst_pool_group = self._pool_group(dst_level, pool_group_index)
-        if dst_pool_group.num_free_slots < num_slots:
-            raise OutOfPagesError("Not enough free slots")
-        dst_slots = dst_pool_group.allocate_multiple(num_slots)
-        assert len(dst_slots) == num_slots
-        prior_events: set[CachedCudaEvent] = set()
-        tasks_per_pool: list[list[CopyTask]] = [[]] * num_pools
-        for src, dst in zip(src_slots, dst_slots):
-            prior_events.update((dst.ready_event, src.ready_event))
-            dst_addresses = dst_pool_group.slot_address(dst)
-            src_addresses = src_pool_group.slot_address(src)
-            for pool_idx in range(num_pools):
-                tasks_per_pool[pool_idx].append(
-                    CopyTask(dst_addresses[pool_idx], src_addresses[pool_idx]))
-        dst_tier = self._cache_levels[dst_level].cache_tier
-        src_tier = self._cache_levels[src_level].cache_tier
-        with TemporaryCudaStream(prior_events) as stream:
-            slot_sizes = self.slot_size(pool_group_index)
-            for pool_idx, tasks in enumerate(tasks_per_pool):
-                batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks,
-                             stream.get())
-            finish_event = stream.finish()
-        for src, dst in zip(src_slots, dst_slots):
-            dst.ready_event = finish_event
-            src.ready_event = finish_event  # compulsory for the next owner getting this slot from the pool.
-        if release_src:
-            for src in src_slots:
-                src_pool_group.free(src)
-        return dst_slots

@@ -4,12 +4,12 @@ from dataclasses import dataclass, field
 
 from ._block_radix_tree import Block
 from ._common import BlockOrdinal, CacheLevel, Priority, TokenIdExt
-from ._core._kv_cache import _KVCache
-from ._core._kv_cache_manager import KVCacheManager
+from ._core._kv_cache import BeamIndex, _KVCache
 from ._eviction_controller import EvictionPolicy, PageStatus
 from ._exceptions import LogicError
 from ._life_cycle_registry import LifeCycleId
 from ._storage._core import Slot
+from ._storage_manager import StorageManager
 from ._utils import CachedCudaEvent, merge_events, unwrap_weakref
 
 
@@ -17,7 +17,7 @@ from ._utils import CachedCudaEvent, merge_events, unwrap_weakref
 # So we prefer inheritance over composition to save some memory.
 @dataclass(slots=True)
 class Page(Slot):
-    _manager: weakref.ref[KVCacheManager]
+    _manager: weakref.ref[StorageManager]
     life_cycle: LifeCycleId
     cache_level: CacheLevel
     _priority: Priority
@@ -29,11 +29,11 @@ class Page(Slot):
         assert self.status == PageStatus.DROPPABLE
         assert not self.scheduled_for_eviction
         if self.has_valid_slot:
-            self.manager.storage.free(self.life_cycle, self.cache_level, self)
+            self.manager.free_slot(self.life_cycle, self.cache_level, self)
             assert not self.has_valid_slot
 
     @property
-    def manager(self) -> KVCacheManager:
+    def manager(self) -> StorageManager:
         return unwrap_weakref(self._manager)
 
     @property
@@ -44,16 +44,16 @@ class Page(Slot):
     def hold(self) -> '_PageHolder':
         if self._holder is not None:
             return unwrap_weakref(self._holder)
-        controller = self.manager._eviction_controller
+        controller = self.manager
         holder = object.__new__(_PageHolder)
         holder._setup(self)
         self._holder = weakref.ref(holder)
         if self.scheduled_for_eviction and not controller.is_evictable(self):
-            controller.remove((self.node_ref, ))  # type: ignore[arg-type]
+            controller.exclude_from_eviction(self)
             assert not self.scheduled_for_eviction
         return holder
 
-    # lock to GPU memory and prevent eviction
+    # prevent eviction
     def lock(self, kv_cache: _KVCache) -> '_SharedPageLock':
         return self.hold().lock(kv_cache)
 
@@ -82,7 +82,7 @@ class UncommittedPageKey:
     kv_cache: weakref.ref[_KVCache]
     ordinal: BlockOrdinal
     life_cycle: LifeCycleId
-    beam_index: int
+    beam_index: BeamIndex
 
     @staticmethod
     def is_committed() -> bool:
@@ -109,14 +109,15 @@ class UncommittedPage(UncommittedPageKey, Page):
                  life_cycle: LifeCycleId,
                  cache_level: CacheLevel,
                  slot: Slot,
-                 beam_index: int = 0):
+                 beam_index: BeamIndex = BeamIndex(0)):
         UncommittedPageKey.__init__(self, weakref.ref(kv_cache), ordinal,
                                     life_cycle, beam_index)
         manager = kv_cache.manager
         priority = kv_cache.get_priority(
             ordinal, manager.life_cycles.get_life_cycle(life_cycle))
-        Page.__init__(self, slot.slot_id, slot.ready_event, kv_cache._manager,
-                      life_cycle, cache_level, priority)
+        Page.__init__(self, slot.slot_id, slot.ready_event,
+                      weakref.ref(manager.storage), life_cycle, cache_level,
+                      priority)
 
     def convert_to_committed(self, block: Block) -> 'CommittedPage':
         'Moves the slot to the committed page. The uncommitted page becomes invalid.'
@@ -128,6 +129,11 @@ class UncommittedPage(UncommittedPageKey, Page):
         assert committed_page.has_valid_slot
         return committed_page
 
+    def __del__(self):
+        assert unwrap_weakref(self.kv_cache)._pages[self.ordinal][
+            self.beam_index][self.life_cycle] is None
+        Page.__del__(self)
+
 
 @dataclass(slots=True)
 class CommittedPage(CommittedPageKey, Page):
@@ -135,8 +141,9 @@ class CommittedPage(CommittedPageKey, Page):
     def __init__(self, block: Block, life_cycle: LifeCycleId,
                  cache_level: CacheLevel, slot: Slot, priority: Priority):
         CommittedPageKey.__init__(self, weakref.ref(block), life_cycle)
-        Page.__init__(self, slot.slot_id, slot.ready_event, block._manager,
-                      life_cycle, cache_level, priority)
+        Page.__init__(self, slot.slot_id, slot.ready_event,
+                      weakref.ref(block.manager), life_cycle, cache_level,
+                      priority)
 
     def __del__(self):
         block = unwrap_weakref(self.block)
@@ -167,7 +174,7 @@ class _PageHolder:
         # If a held page was in last level cache, it was not scheduled for eviction.
         if self.page.is_committed() and not self.page.scheduled_for_eviction:
             page = self.page
-            page.manager._eviction_controller.schedule_for_eviction(page)
+            page.manager.schedule_for_eviction(page)
 
     # lock to GPU memory and prevent eviction
     def lock(self, kv_cache: _KVCache) -> '_SharedPageLock':
@@ -178,17 +185,18 @@ class _PageHolder:
         else:
             lock = unwrap_weakref(self._lock)
         if self.page.scheduled_for_eviction:
-            controller = self.page.manager._eviction_controller
-            controller.remove((self.page.node_ref, ))  # type: ignore[arg-type]
+            manager = self.page.manager
+            manager.exclude_from_eviction(self.page)
             assert not self.page.scheduled_for_eviction
         return lock.share(kv_cache)
 
 
 @dataclass(slots=True, init=False)
 class _UniqPageLock:
-    'Locks pages in GPU memory and prevents eviction.'
+    'Locks pages to prevent eviction.'
     holder: _PageHolder
     finish_events: list[CachedCudaEvent]
+    users: weakref.WeakSet['_SharedPageLock']
 
     def __init__(self):
         raise LogicError("Use page.lock() or holder.lock() instead")
@@ -199,7 +207,9 @@ class _UniqPageLock:
         self.holder = holder
 
     def share(self, kv_cache: _KVCache) -> '_SharedPageLock':
-        return _SharedPageLock(self, kv_cache)
+        ret = _SharedPageLock(self, kv_cache)
+        self.users.add(ret)
+        return ret
 
     @property
     def page(self) -> Page:
@@ -213,7 +223,7 @@ class _UniqPageLock:
         self.holder._lock = None
         # delete holder first, so if no _KVCache holds the page, it becomes droppable immediately, before we hand it over to eviction controller.
         del self.holder
-        page.manager._eviction_controller.schedule_for_eviction(page)
+        page.manager.schedule_for_eviction(page)
 
 
 @dataclass(slots=True, init=False)

@@ -1,12 +1,14 @@
 import hashlib
 import weakref
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Sequence, cast
+
+from tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager import \
+    StorageManager
 
 from ._common import BlockOrdinal, TokenIdExt
-from ._core._kv_cache_manager import KVCacheManager
-from ._life_cycle_registry import LifeCycleRegistry
+from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry
 from ._page import CommittedPage
-from ._utils import unwrap_weakref
+from ._utils import TypedIndexList, unwrap_weakref
 
 BlockKey = bytes
 
@@ -74,9 +76,7 @@ class ChildrenDict(dict[BlockKey, 'Block']):
             if block.next:
                 block = next(iter(block.next.values()))
             else:
-                assert all(
-                    page is None or page() is None
-                    for page in block.storage), "Storage is not cleared, yet"
+                assert not block.storage, "Storage is not cleared, yet"
                 prev_block: Block | None = block.prev(
                 ) if block.prev is not None else None
                 if prev_block is None:
@@ -104,7 +104,7 @@ class ChildrenDict(dict[BlockKey, 'Block']):
 
 class RootPrevInfo:
     __slots__ = ('_manager', 'key')
-    _manager: weakref.ref[KVCacheManager]
+    _manager: weakref.ref[StorageManager]
     key: BlockKey  # hash of lora_task_id
     ordinal: BlockOrdinal = -1
 
@@ -115,7 +115,7 @@ class Block:
     """
     __slots__ = ('_manager', 'key', 'tokens', 'ordinal', 'prev', 'next',
                  'storage')
-    _manager: weakref.ref[KVCacheManager]
+    _manager: weakref.ref[StorageManager]
     key: BlockKey
     tokens: Sequence[TokenIdExt]
     ordinal: BlockOrdinal
@@ -123,7 +123,7 @@ class Block:
     next: ChildrenDict
 
     # indexed with LifeCycleId
-    storage: list[weakref.ref[CommittedPage] | None]
+    storage: TypedIndexList[LifeCycleId, weakref.ref[CommittedPage] | None]
 
     def __init__(self, tokens: Sequence[TokenIdExt],
                  prev: 'Block | RootPrevInfo'):
@@ -139,7 +139,8 @@ class Block:
             assert isinstance(prev, RootPrevInfo)
             self.prev = None
         self.next = ChildrenDict()
-        self.storage = []
+        self.storage = cast(TypedIndexList,
+                            [None] * self.manager.num_life_cycles)
 
     def _partial_match_this_node(self, tokens: TokenBlock) -> int:
         """
@@ -152,7 +153,7 @@ class Block:
         return len(tokens)
 
     @property
-    def manager(self) -> KVCacheManager:
+    def manager(self) -> StorageManager:
         return unwrap_weakref(self._manager)
 
 
@@ -166,6 +167,10 @@ class BlockRadixTree:
         self._tokens_per_block = tokens_per_block
         self._life_cycles = life_cycles
         self._root_blocks = ChildrenDict()
+
+    @property
+    def tokens_per_block(self) -> int:
+        return self._tokens_per_block
 
     @property
     def life_cycles(self) -> LifeCycleRegistry:

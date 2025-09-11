@@ -1,4 +1,4 @@
-from typing import NamedTuple, NewType
+from typing import Iterator, NamedTuple, NewType
 
 from ._common import SlidingWindowSize
 from ._config import KVCacheManagerConfig
@@ -47,3 +47,6 @@ class LifeCycleRegistry:
         assert len(self._life_cycle_list) == len(
             self._life_cycle_id_dict), "corrupted life cycle registry"
         return len(self._life_cycle_list)
+
+    def __iter__(self) -> Iterator[LifeCycle]:
+        return iter(self._life_cycle_list)

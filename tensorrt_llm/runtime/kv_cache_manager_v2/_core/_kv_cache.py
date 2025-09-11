@@ -1,17 +1,19 @@
 import enum
+import warnings
 import weakref
 from collections.abc import Sequence
-from typing import Callable
+from typing import Callable, NewType
 
 from .._common import BlockOrdinal, CudaStream, LayerId, Priority, TokenIdExt
 from .._config import DataRole
 from .._life_cycle_registry import LifeCycle, LifeCycleId
 from .._page import _PageHolder, _SharedPageLock
-from .._utils import CachedCudaEvent, unwrap_optional, unwrap_weakref
+from .._utils import (CachedCudaEvent, TypedIndexList, unwrap_optional,
+                      unwrap_weakref)
 from ._kv_cache_manager import KVCacheManager
 
-# indexed with (num_life_cycles * beam_index + life_cycle)
-BlockPages = list[_SharedPageLock | _PageHolder | None]
+BlockPage = _SharedPageLock | _PageHolder | None
+BeamIndex = NewType("BeamIndex", int)
 
 
 # The _KVCache holds unique/shared ownership of memory blocks. On deletion, the ownership if destroys and KVCacheManager takes control of them. A KV cache maintains three lengths:
@@ -25,7 +27,8 @@ BlockPages = list[_SharedPageLock | _PageHolder | None]
 # @TODO: in __del__, we should check if committed pages are usable for SWA cases. e.g. all pages are dropped except the last one. The last one is not usable.
 class _KVCache:
     __slots__ = ('_manager', 'get_priority', 'status', '_beam_width',
-                 'capacity', 'history_length', 'num_committed_tokens', 'pages')
+                 'capacity', 'history_length', 'num_committed_tokens', '_pages',
+                 '_finish_event')
 
     class Status(enum.IntEnum):
         ACTIVE = 0
@@ -40,7 +43,8 @@ class _KVCache:
     history_length: int
     num_committed_tokens: int
 
-    _pages: list[BlockPages]  # indexed with block_ordinal
+    _pages: list[TypedIndexList[BeamIndex, TypedIndexList[
+        LifeCycleId, BlockPage]]]  # indexed with block_ordinal
     _finish_event: CachedCudaEvent | None
 
     @property
@@ -56,13 +60,17 @@ class _KVCache:
         'Event recorded when switching from active to suspended/closed state.'
         return unwrap_optional(self._finish_event)
 
-    def page(self,
-             block_ordinal: BlockOrdinal,
-             life_cycle: LifeCycleId,
-             beam_index: int = 0) -> _SharedPageLock | _PageHolder | None:
-        num_life_cycles = self.manager.life_cycles.num_life_cycles
-        return self._pages[block_ordinal][num_life_cycles * beam_index +
-                                          life_cycle]
+    def page(
+        self,
+        block_ordinal: BlockOrdinal,
+        life_cycle: LifeCycleId,
+        beam_index: BeamIndex = BeamIndex(0)) -> BlockPage:
+        return self.block(block_ordinal, beam_index)[life_cycle]
+
+    def block(
+        self, block_ordinal: BlockOrdinal, beam_index: BeamIndex = BeamIndex(0)
+    ) -> TypedIndexList[LifeCycleId, BlockPage]:
+        return self._pages[block_ordinal][beam_index]
 
     # destroy ownership of memory blocks, so KV cache manager can decide to evict or drop them.
     def close(self):
@@ -72,6 +80,9 @@ class _KVCache:
 
     def __del__(self):
         self.close()
+        warnings.warn(
+            "Check if the last committed pages are usable, in case some prior pages are already dropped. For SWA, this can be done only when _KVCache terminates."
+        )
 
     @property
     def beam_width(self) -> int:

@@ -1,5 +1,9 @@
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import NamedTuple
+
+from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import \
+    PoolGroupIndex
 
 from .._common import LayerId
 from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
@@ -69,45 +73,70 @@ class PoolGroupConfig:
         return get_uniform_attribute(self.slots, lambda s: s.slot_size_list)
 
 
+class BufferAttr(NamedTuple):
+    life_cycle: LifeCycleId
+    offset: int
+    size: int
+
+
 @dataclass(slots=True, frozen=True)
 class StorageConfig:
     cache_tiers: HomoTuple[CacheTierConfig]
     pool_groups: HomoTuple[PoolGroupConfig]
 
-    def life_cycle_grouping(self) -> HomoTuple[HomoTuple[LifeCycleId]]:
-        return tuple(
-            tuple(sg.life_cycle_id for sg in pg.slots)
-            for pg in self.pool_groups)
+    def life_cycle_grouping(self) -> dict[LifeCycleId, PoolGroupIndex]:
+        ret = dict[LifeCycleId, PoolGroupIndex]()
+        for pg_idx, pg in enumerate(self.pool_groups):
+            pg_idx = PoolGroupIndex(pg_idx)
+            for s in pg.slots:
+                ret[s.life_cycle_id] = pg_idx
+        return ret
+
+    def buffer_attributes(self) -> dict[BufferId, BufferAttr]:
+        ret = dict[BufferId, BufferAttr]()
+        for pg in self.pool_groups:
+            for slot in pg.slots:
+                for page in slot.pages:
+                    for cb in page.coalesced_buffers:
+                        offset = 0
+                        for b in cb.buffer_ids:
+                            ret[b] = BufferAttr(cb.life_cycle_id, offset,
+                                                cb.single_buffer_size)
+                            offset += cb.single_buffer_size
+        return ret
 
     def __post_init__(self) -> None:
-        all_life_cycle_ids = sum((g for g in self.life_cycle_grouping()), ())
+        groups = [
+            tuple(s.life_cycle_id for s in pg.slots) for pg in self.pool_groups
+        ]
+        all_life_cycle_ids = sum((g for g in groups), ())
         assert len(all_life_cycle_ids) == len(set(all_life_cycle_ids))
 
 
 def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
     # group buffers first by life cycle, then by single buffer size.
-    buffer_groups = dict[LifeCycleId, dict[int, list[BufferId]]]()
+    buffer_groups = defaultdict[LifeCycleId, defaultdict[int, list[BufferId]]](
+        lambda: defaultdict[int, list[BufferId]](list[BufferId]))
     life_cycle_registry = LifeCycleRegistry(config)
     for layer in config.layers:
         life_cycle = LifeCycle.make(layer.sliding_window_size,
                                     layer.num_sink_tokens,
                                     config.tokens_per_block)
         life_cycle_id = life_cycle_registry.get_id(life_cycle)
-        size_to_buffers = buffer_groups.setdefault(life_cycle_id,
-                                                   dict[int, list[BufferId]]())
+        size_to_buffers = buffer_groups[life_cycle_id]
         for buffer in layer.buffers:
-            size_to_buffers.setdefault(buffer.size, []).append(
+            size_to_buffers[buffer.size].append(
                 BufferId(layer.layer_id, buffer.role))
     # Create one slot group for each life cycle.
     # It's possible that buffers with different sizes form coalesced buffers with the same coalesced size.
     # @TODO: add test for this case.
     slot_groups: list[SlotConfig] = []
     for life_cycle_id, size_to_buffers in buffer_groups.items():
-        size_to_coalesced_buffers = dict[int, list[CoalescedBuffer]]()
+        size_to_coalesced_buffers = defaultdict[int, list[CoalescedBuffer]](
+            list[CoalescedBuffer])
         for size, buffer_ids in size_to_buffers.items():
             coalesced_size = size * len(buffer_ids)
-            coalesced_buffers = size_to_coalesced_buffers.setdefault(
-                coalesced_size, [])
+            coalesced_buffers = size_to_coalesced_buffers[coalesced_size]
             coalesced_buffers.append(
                 CoalescedBuffer(life_cycle_id=life_cycle_id,
                                 single_buffer_size=size,
@@ -119,10 +148,12 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
         slots.sort(key=lambda p: p.slot_size, reverse=True)
         slot_groups.append(SlotConfig(tuple(slots)))
     # Merge slot groups with the same slot_size_list
-    pool_groups_by_slot_size_list = dict[HomoTuple[int], list[SlotConfig]]()
+    pool_groups_by_slot_size_list = defaultdict[HomoTuple[int],
+                                                list[SlotConfig]](
+                                                    list[SlotConfig])
     for slot_group in slot_groups:
-        pool_groups_by_slot_size_list.setdefault(slot_group.slot_size_list,
-                                                 []).append(slot_group)
+        pool_groups_by_slot_size_list[slot_group.slot_size_list].append(
+            slot_group)
     pool_groups = [
         PoolGroupConfig(tuple(slot_groups))
         for slot_groups in pool_groups_by_slot_size_list.values()
