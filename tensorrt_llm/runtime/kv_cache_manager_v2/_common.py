@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, BinaryIO, NewType
 
 import cuda.bindings.driver as drv
 
+NDEBUG = False
+
 
 # Can extend to more tiers in the future, e.g. object storage like AWS S3.
 class CacheTier(enum.Enum):

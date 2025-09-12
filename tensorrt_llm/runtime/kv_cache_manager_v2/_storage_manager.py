@@ -1,25 +1,24 @@
 import os
 import weakref
-from typing import Sequence, cast
+from typing import Iterable, Iterator, Sequence, cast
 
-from tensorrt_llm.runtime.kv_cache_manager_v2._config import (
-    CacheTierConfig, DiskCacheTierConfig)
-
-from ._common import CacheLevel, CacheTier
+from ._common import NDEBUG, CacheLevel, CacheTier, LayerId
+from ._config import CacheTierConfig, DataRole, DiskCacheTierConfig
 from ._copy_engine import CopyTask, batched_copy
+from ._core._kv_cache_manager import KVCacheManager
 from ._eviction_controller import (EvictablePage, PageStatus,
                                    PerLevelEvictionController)
 from ._exceptions import OutOfPagesError
 from ._life_cycle_registry import LifeCycleId
-from ._page import Page
+from ._page import Page, _SharedPageLock
 from ._storage import CacheLevelStorage
 from ._storage._config import BufferAttr, BufferId, StorageConfig
 from ._storage._core import (DiskCacheLevelStorage, GpuCacheLevelStorage,
                              HostCacheLevelStorage, PoolGroupBase,
-                             PoolGroupIndex, Slot)
+                             PoolGroupIndex, Slot, SlotId)
 from ._utils import (Array2D, CachedCudaEvent, HomoTuple, TemporaryCudaStream,
-                     TypedIndexList, get_uniform_attribute, partition,
-                     remove_if, typed_range)
+                     TypedIndexList, exact_div, get_uniform_attribute,
+                     partition, remove_if, typed_range, unwrap_weakref)
 
 
 class CacheLevelManager:
@@ -68,12 +67,19 @@ class CacheLevelManager:
             raise ValueError(f"Invalid cache tier: {config.tier}")
 
 
+GPU_LEVEL = CacheLevel(0)
+
+
 class StorageManager:
+    __slots__ = ('_parent', '_buffer_attr', '_life_cycle_grouping', '_levels')
+    _parent: weakref.ref[KVCacheManager]
     _buffer_attr: dict[BufferId, BufferAttr]
     _life_cycle_grouping: dict[LifeCycleId, PoolGroupIndex]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
 
-    def __init__(self, config: StorageConfig):
+    def __init__(self, parent: KVCacheManager, config: StorageConfig):
+        assert config.cache_tiers[GPU_LEVEL].tier == CacheTier.GPU_MEM
+        self._parent = weakref.ref(parent)
         self._buffer_attr = config.buffer_attributes()
         self._life_cycle_grouping = config.life_cycle_grouping()
         slot_size_lists = [pg.slot_size_list for pg in config.pool_groups]
@@ -92,18 +98,41 @@ class StorageManager:
     def get_pool_group_index(self, life_cycle: LifeCycleId) -> PoolGroupIndex:
         return self._life_cycle_grouping[life_cycle]
 
-    def new_gpu_slots(self, life_cycle: LifeCycleId,
-                      count: int) -> HomoTuple[Slot]:
-        'Allocate new slots for a life cycle.'
-        raise NotImplementedError("Not implemented")
+    def new_gpu_slots(
+        self, num_slots: TypedIndexList[LifeCycleId, int]
+    ) -> TypedIndexList[LifeCycleId, HomoTuple[Slot]]:
+        goals = Array2D[CacheLevel, PoolGroupIndex,
+                        int].filled(self.num_cache_levels, self.num_pool_groups,
+                                    0)
+        for lc in typed_range(LifeCycleId(self.num_life_cycles)):
+            goals[GPU_LEVEL, self.get_pool_group_index(lc)] += num_slots[lc]
+        fallen_pages = cast(TypedIndexList[PoolGroupIndex, list[Page]],
+                            [list[Page]()] * self.num_pool_groups)
+        self._prepare_free_slots(goals, GPU_LEVEL, fallen_pages)
+        ret = []
+        storage = self._levels[GPU_LEVEL].storage
+        for life_cycle in typed_range(LifeCycleId(self.num_life_cycles)):
+            pg_idx = self.get_pool_group_index(life_cycle)
+            ret.append(storage.allocate_multiple(pg_idx, num_slots[life_cycle]))
+        return cast(TypedIndexList[LifeCycleId, HomoTuple[Slot]], ret)
 
-    def new_gpu_slots_for_blocks(
-            self, count: int) -> HomoTuple[TypedIndexList[LifeCycleId, Slot]]:
-        'Allocate new slots for each life cycle, as new blocks require a slot for each life cycle.'
-        raise NotImplementedError("Not implemented")
+    def batched_migrate_to_gpu(self,
+                               page_locks: Iterable[_SharedPageLock]) -> None:
+        gpu_lvl = GPU_LEVEL
+        partitioned = partition(
+            page_locks, lambda l:
+            (l.page.cache_level, self.get_pool_group_index(l.page.life_cycle)))
+        for (lvl, pg_idx), locks in partitioned.items():
+            if lvl == gpu_lvl:
+                continue
+            self.batched_migrate(pg_idx,
+                                 gpu_lvl,
+                                 lvl, [l.page for l in locks],
+                                 update_src=True)
 
-    def batched_migrate_to_gpu(self, pages: Sequence[Page]) -> None:
-        raise NotImplementedError("Not implemented")
+    @property
+    def kv_cache_manager(self) -> KVCacheManager:
+        return unwrap_weakref(self._parent)
 
     @property
     def num_life_cycles(self) -> int:
@@ -140,8 +169,8 @@ class StorageManager:
             self, goals: Array2D[CacheLevel, PoolGroupIndex,
                                  int], lvl_id: CacheLevel,
             fallen_pages: TypedIndexList[PoolGroupIndex, list[Page]]) -> None:
-        assert goals.rows == self.num_cache_levels and goals.cols == self.num_pool_groups
-        assert all(
+        assert NDEBUG or goals.rows == self.num_cache_levels and goals.cols == self.num_pool_groups
+        assert NDEBUG or all(
             all(p.cache_level < lvl_id for p in pages) for pages in
             fallen_pages), 'Fallen pages must come from upper cache levels'
         storage = self._levels[lvl_id].storage
@@ -153,15 +182,15 @@ class StorageManager:
         for pg_idx in typed_range(PoolGroupIndex(self.num_pool_groups)):
             goal = goals[lvl_id, pg_idx]
             fallen = len(fallen_pages[pg_idx])
-            free = storage.get_num_free_slots(pg_idx)
+            old_free_cnt = storage.get_num_free_slots(pg_idx)
             evictable_cnt = ctrl.num_evictable_pages(pg_idx)
-            num_to_evict[pg_idx] = max(0,
-                                       min(goal + fallen - free, evictable_cnt))
+            num_to_evict[pg_idx] = max(
+                0, min(goal + fallen - old_free_cnt, evictable_cnt))
             if self.is_last_level(lvl_id):
                 held_pages[pg_idx] = remove_if(
                     fallen_pages[pg_idx], lambda p: p.status == PageStatus.HELD)
                 held_cnt = len(held_pages[pg_idx])
-                if held_cnt > free + evictable_cnt:
+                if held_cnt > old_free_cnt + evictable_cnt:
                     # need to revert the eviction we did before.
                     raise OutOfPagesError(
                         "Too many pages are held in the last-level cache for group {pg_idx}"
@@ -172,28 +201,34 @@ class StorageManager:
                               [[]] * self.num_pool_groups)
         if self.is_last_level(lvl_id):
             for pg_idx in typed_range(PoolGroupIndex(self.num_pool_groups)):
-                prev_free_cnt = storage.get_num_free_slots(pg_idx)
+                old_free_cnt = storage.get_num_free_slots(pg_idx)
                 num_evicted = len(evicted[pg_idx])
-                assert all(p.status == PageStatus.DROPPABLE
-                           for p in evicted[pg_idx])
+                assert NDEBUG or all(p.status == PageStatus.DROPPABLE
+                                     for p in evicted[pg_idx])
                 evicted[pg_idx].clear()
-                free = storage.get_num_free_slots(pg_idx)
-                assert num_evicted + prev_free_cnt == free
-                assert len(held_pages[pg_idx]) <= free
+                new_free_cnt = storage.get_num_free_slots(pg_idx)
+                assert num_evicted + old_free_cnt == new_free_cnt
+                assert len(held_pages[pg_idx]) <= new_free_cnt
                 fallen_pages[pg_idx].extend(held_pages[pg_idx])
                 held_pages[pg_idx].clear()
-                accepted_pages[pg_idx] = fallen_pages[pg_idx][-free:]
+                goal = goals[lvl_id, pg_idx]
+                num_accepted = min(new_free_cnt - goal,
+                                   len(fallen_pages[pg_idx]))
+                assert num_accepted >= 0
+                accepted_pages[pg_idx] = fallen_pages[pg_idx][-num_accepted:]
                 fallen_pages[pg_idx].clear()
         else:
             assert all(len(g) == 0 for g in held_pages)
             for pg_idx in typed_range(PoolGroupIndex(self.num_pool_groups)):
-                free = storage.get_num_free_slots(pg_idx)
+                old_free_cnt = storage.get_num_free_slots(pg_idx)
                 e = evicted[pg_idx]
                 num_evicted = len(e)
                 fallen_pages[pg_idx][:0] = e
                 e.clear()
-                num_accepted = min(free + num_evicted,
-                                   len(fallen_pages[pg_idx]))
+                num_accepted = min(
+                    old_free_cnt + num_evicted - goals[lvl_id, pg_idx],
+                    len(fallen_pages[pg_idx]))
+                assert num_accepted >= 0
                 accepted_pages[pg_idx] = fallen_pages[pg_idx][-num_accepted:]
                 del fallen_pages[pg_idx][-num_accepted:]
             self._prepare_free_slots(goals, CacheLevel(lvl_id + 1),
@@ -233,8 +268,8 @@ class StorageManager:
             tasks_per_pool: list[list[CopyTask]] = [[]] * num_pools
             for src, dst in zip(src_pages, dst_slots):
                 prior_events.update((dst.ready_event, src.ready_event))
-                dst_addresses = dst_pool_group.slot_address(dst)
-                src_addresses = src_pool_group.slot_address(src)
+                dst_addresses = dst_pool_group.slot_address(dst.slot_id)
+                src_addresses = src_pool_group.slot_address(src.slot_id)
                 for pool_idx in range(num_pools):
                     tasks_per_pool[pool_idx].append(
                         CopyTask(dst_addresses[pool_idx],
@@ -284,3 +319,29 @@ class StorageManager:
     def exclude_from_eviction(self, page: EvictablePage) -> None:
         assert page.node_ref is not None
         self._levels[page.cache_level].controller.remove(page.node_ref)
+
+    def get_mem_pool_base_address(self, layer_id: LayerId,
+                                  data_role: DataRole) -> int:
+        storage = self._levels[GPU_LEVEL].storage
+        attr = self.get_buffer_attr(layer_id, data_role)
+        pool_group_index = self.get_pool_group_index(attr.life_cycle_id)
+        return cast(
+            int,
+            storage.slot_address(pool_group_index, attr.pool_index,
+                                 SlotId(0))) + attr.offset
+
+    def get_page_indices(self, layer_id: LayerId, data_role: DataRole,
+                         pages: Iterator[Page]) -> Iterator[int]:
+        attr = self.get_buffer_attr(layer_id, data_role)
+        pg_idx = self.get_pool_group_index(attr.life_cycle_id)
+        pool_idx = attr.pool_index
+        pool = self._levels[GPU_LEVEL].storage._pool(pg_idx, pool_idx)
+        indice_offset = exact_div(attr.offset, attr.size)
+        base = cast(int, pool.slot_address(SlotId(0)))
+        for page in pages:
+            offset = cast(int, pool.slot_address(page.slot_id)) - base
+            yield exact_div(offset, attr.size) + indice_offset
+
+    def get_buffer_attr(self, layer_id: LayerId,
+                        data_role: DataRole) -> BufferAttr:
+        return self._buffer_attr[BufferId(layer_id, data_role)]

@@ -53,7 +53,7 @@ class Page(Slot):
             assert not self.scheduled_for_eviction
         return holder
 
-    # prevent eviction
+    # Prevent eviction. You need to migrate the page to GPU later.
     def lock(self, kv_cache: _KVCache) -> '_SharedPageLock':
         return self.hold().lock(kv_cache)
 
@@ -114,9 +114,9 @@ class UncommittedPage(UncommittedPageKey, Page):
                                     life_cycle, beam_index)
         manager = kv_cache.manager
         priority = kv_cache.get_priority(
-            ordinal, manager.life_cycles.get_life_cycle(life_cycle))
+            ordinal, manager._life_cycles.get_life_cycle(life_cycle))
         Page.__init__(self, slot.slot_id, slot.ready_event,
-                      weakref.ref(manager.storage), life_cycle, cache_level,
+                      weakref.ref(manager._storage), life_cycle, cache_level,
                       priority)
 
     def convert_to_committed(self, block: Block) -> 'CommittedPage':
@@ -150,7 +150,10 @@ class CommittedPage(CommittedPageKey, Page):
         block.storage[self.life_cycle] = None
         # if this makes the block unusable, remove it from the radix tree.
         warnings.warn(
-            "########### Not Implemented: CommittedPage.__del__() ###########")
+            "[KVCacheManager] ########### Not Implemented: CommittedPage.__del__() ###########"
+        )
+        # For now, we use a very simple approach to avoid accumulation of radix tree nodes.
+        block.remove_if_unusable()
         Page.__del__(self)
         raise NotImplementedError("Not implemented")
 
@@ -176,7 +179,7 @@ class _PageHolder:
             page = self.page
             page.manager.schedule_for_eviction(page)
 
-    # lock to GPU memory and prevent eviction
+    # Prevent eviction. You need to migrate the page to GPU later.
     def lock(self, kv_cache: _KVCache) -> '_SharedPageLock':
         if self._lock is None:
             lock = object.__new__(_UniqPageLock)
@@ -221,7 +224,7 @@ class _UniqPageLock:
             0) and not page.scheduled_for_eviction
         page.ready_event = merge_events(self.finish_events)
         self.holder._lock = None
-        # delete holder first, so if no _KVCache holds the page, it becomes droppable immediately, before we hand it over to eviction controller.
+        # delete holder first, so if nobody holds the page elsewhere, it becomes droppable immediately, before we hand it over to eviction controller.
         del self.holder
         page.manager.schedule_for_eviction(page)
 

@@ -10,6 +10,7 @@ from ._common import CacheTier, LayerId
 
 
 class DataRole(enum.IntEnum):
+    'The data role of a buffer inside one layer. The name does not really matter. You are free to convert arbitrary int into DataRole and use it.'
     KEY_DATA = 0
     VALUE_DATA = 1
     KEY_BLOCK_SCALE = 2

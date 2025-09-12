@@ -16,6 +16,7 @@ from typing import (Any, BinaryIO, Callable, ClassVar, Generic, Iterable,
 
 import cuda.bindings.driver as drv
 
+from ._common import NDEBUG
 from ._exceptions import (CuError, CuOOMError, DiskOOMError, HostOOMError,
                           LogicError)
 
@@ -46,6 +47,11 @@ def round_down(x: int, y: int) -> int:
 
 def in_range(x: int, lower: int, upper: int) -> bool:
     return lower <= x < upper
+
+
+def exact_div(x: int, y: int) -> int:
+    assert x % y == 0
+    return x // y
 
 
 T = TypeVar('T')
@@ -93,7 +99,7 @@ def partition(original: Iterable[T],
 def get_uniform_attribute(iterable: Iterable[T],
                           attribute_func: Callable[[T], U]) -> U:
     ret = attribute_func(next(iter(iterable)))
-    assert all(attribute_func(item) == ret for item in iterable)
+    assert NDEBUG or all(attribute_func(item) == ret for item in iterable)
     return ret
 
 
@@ -110,10 +116,10 @@ def noexcept(func: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
-def expect_type(value: Any, ExpectedType: Type[T]) -> T:
-    if not isinstance(value, ExpectedType):
-        raise ValueError(
-            f"Expected {ExpectedType.__name__}, got {type(value).__name__}")
+def expect_type(ExpectedType: Type[T], value: Any) -> T:
+    'Similar to typing.cast, but does runtime checking with assert.'
+    assert isinstance(
+        value, ExpectedType), f"Expected {ExpectedType}, got {type(value)}"
     return value
 
 
@@ -144,6 +150,15 @@ class TypedIndexList(Protocol[Index, T]):
     def __reversed__(self) -> Iterator[T]:
         ...
 
+    def clear(self) -> None:
+        ...
+
+    def pop(self) -> T:
+        ...
+
+    def push(self, value: T) -> None:
+        ...
+
 
 class Array2D(Generic[Row, Col, T]):
     __slots__ = ('_data', '_cols')
@@ -153,6 +168,10 @@ class Array2D(Generic[Row, Col, T]):
     def __init__(self, rows: int, cols: int, init_val: Iterable[T]):
         self._data = list(init_val)
         self._cols = cols
+
+    @staticmethod
+    def filled(rows: int, cols: int, val: T) -> 'Array2D[Row, Col, T]':
+        return Array2D(rows, cols, [val] * rows * cols)
 
     def __getitem__(self, index: tuple[Row, Col]) -> T:
         return self._data[index[0] * self._cols + index[1]]

@@ -1,4 +1,4 @@
-from ._core import CacheLevelStorage, CacheStorage
+from ._core import CacheLevelStorage
 
 # These are re-exported for external use
-__all__ = ["CacheStorage", "CacheLevelStorage"]
+__all__ = ["CacheLevelStorage"]

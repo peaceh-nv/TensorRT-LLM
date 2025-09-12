@@ -1,9 +1,11 @@
 from collections.abc import Callable, Sequence
 
 from .._block_radix_tree import BlockRadixTree
-from .._common import BlockOrdinal, CacheTier, CudaStream, Priority, TokenIdExt
-from .._config import KVCacheManagerConfig
+from .._common import (BlockOrdinal, CacheTier, CudaStream, LayerId, Priority,
+                       TokenIdExt)
+from .._config import DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LifeCycle, LifeCycleRegistry
+from .._storage._config import create_storage_config
 from .._storage_manager import StorageManager
 from .._utils import HomoTuple
 from ._kv_cache import _KVCache
@@ -15,18 +17,16 @@ class KVCacheManager:
     _radix_tree: BlockRadixTree
     _storage: StorageManager
 
-    @property
-    def life_cycles(self) -> LifeCycleRegistry:
-        return self._life_cycles
-
-    @property
-    def storage(self) -> StorageManager:
-        return self._storage
-
     def __init__(self, config: KVCacheManagerConfig):
-        self._radix_tree = BlockRadixTree(config.tokens_per_block,
-                                          LifeCycleRegistry(config))
-        raise NotImplementedError("Not implemented")
+        self._life_cycles = LifeCycleRegistry(config)
+        self._radix_tree = BlockRadixTree(self, config.tokens_per_block)
+        storage_config = create_storage_config(config)
+        self._storage = StorageManager(self, storage_config)
+
+    # Get the base address of the memory pool holding pages for the given layer and data role.
+    def get_mem_pool_base_address(self, layer_id: LayerId,
+                                  data_role: DataRole) -> int:
+        return self._storage.get_mem_pool_base_address(layer_id, data_role)
 
     # lora_task_id: match lora_task_id before matching any tokens.
     # stream: blocks are allocated and made ready in this stream. Later grow() also makes blocks ready in this stream, and later commit() calls also assume data are written in this stream.
@@ -44,8 +44,9 @@ class KVCacheManager:
                         custom_priority_callback: Callable[
                             [BlockOrdinal, LifeCycle],
                             Priority] = lambda _, __: Priority.DEFAULT,
-                        suspended: bool = False) -> '_KVCache | None':
-        raise NotImplementedError("Not implemented")
+                        suspended: bool = False) -> _KVCache | None:
+        return _KVCache(self, stream, lora_task_id, input_tokens,
+                        custom_priority_callback, suspended)
 
     # If best_efforts is True, we will try to resize the quota to the largest possible value that is still <= quota, and returns False only when we cannot resize the quota at all.
     # If best_efforts is False, we will resize the quota to the exact value of quota, and give up if not possible.

@@ -1,20 +1,17 @@
 import abc
 import os
+import warnings
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import BinaryIO, ClassVar, NewType, final, override
 
-from .._common import Address, CacheLevel, CacheTier, DiskAddress, MemAddress
-from .._config import CacheTierConfig, DiskCacheTierConfig, KVCacheManagerConfig
+from .._common import Address, CacheTier, DiskAddress, MemAddress
 from .._cuda_virt_mem import PhysMem, PooledPhysMemAllocator, VirtMem
 from .._exceptions import LogicError, OutOfPagesError, ResourceBusyError
-from .._life_cycle_registry import LifeCycleId
 from .._utils import (CachedCudaEvent, DynamicBitset, HomoTuple, HostMem,
-                      div_up, get_file_size, get_uniform_attribute,
-                      query_total_gpu_memory, remove_if, resize_file,
-                      round_down, unwrap_optional)
-from ._config import StorageConfig, create_storage_config
+                      div_up, get_file_size, query_total_gpu_memory, remove_if,
+                      resize_file, round_down, unwrap_optional)
 
 
 class SlotPoolBase(abc.ABC):
@@ -186,6 +183,12 @@ class Slot:
             raise LogicError("Slot is already set.")
         self._slot_id = slot.slot_id
         self.ready_event = slot.ready_event
+        slot._slot_id = None
+        slot.ready_event = CachedCudaEvent.NULL
+
+    def __del__(self):
+        if self.has_valid_slot:
+            warnings.warn("[KVCacheManager] slot is not freed before deletion")
 
 
 class SlotAllocator:
@@ -249,10 +252,10 @@ class SlotAllocator:
         return slot
 
     # The reason why we don't use allocate() multiple times is that if what user need is all or none, and when we don't have enough free slots, we will free these newly allocated slots by appending them to the back of the recycled slot queue, which may impact perf.
-    def allocate_multiple(self, num_slots: int) -> list[Slot]:
+    def allocate_multiple(self, num_slots: int) -> HomoTuple[Slot]:
         if self.num_free_slots < num_slots:
             raise OutOfPagesError("Not enough free slots")
-        return [self.allocate() for _ in range(num_slots)]
+        return tuple(self.allocate() for _ in range(num_slots))
 
     def free(self, slot: Slot):
         if slot.slot_id >= self._capacity or not self._occupied_mask.get(
@@ -438,14 +441,14 @@ class PoolGroupBase:
     def allocate(self) -> Slot:
         return self._slot_allocator.allocate()
 
-    def allocate_multiple(self, num_slots: int) -> list[Slot]:
+    def allocate_multiple(self, num_slots: int) -> HomoTuple[Slot]:
         return self._slot_allocator.allocate_multiple(num_slots)
 
     def free(self, slot: Slot):
         self._slot_allocator.free(slot)
 
-    def slot_address(self, slot: Slot) -> HomoTuple[Address]:
-        return tuple(pool.slot_address(slot.slot_id) for pool in self._pools)
+    def slot_address(self, slot_id: SlotId) -> HomoTuple[Address]:
+        return tuple(pool.slot_address(slot_id) for pool in self._pools)
 
     @property
     def slot_size(self) -> HomoTuple[int]:
@@ -509,19 +512,23 @@ PoolIndex = NewType("PoolIndex", int)
 
 class CacheLevelStorage:
     POOL_SIZE_GRANULARITY: ClassVar[int] = 1  # derived class can override this
+    TIER: ClassVar[CacheTier]
     __slots__ = ('_total_quota', '_ratio_list', '_pool_groups')
     _total_quota: int  # fixme: remove _total_quota and _ratio_list and compute from _pool_groups
     _ratio_list: HomoTuple[float]
     _pool_groups: HomoTuple[PoolGroupBase]
 
     def __init__(self, total_quota: int, ratio_list: Sequence[float]):
+        if not hasattr(self.__class__, 'TIER'):
+            raise ValueError(
+                f"{self.__class__.__name__} must define 'TIER' as a class variable"
+            )
         self._total_quota = total_quota
         self._ratio_list = tuple(ratio_list)
 
     @property
-    @abc.abstractmethod
     def cache_tier(self) -> CacheTier:
-        ...
+        return self.TIER
 
     def destroy(self):
         for pg in self._pool_groups:
@@ -533,7 +540,7 @@ class CacheLevelStorage:
         return self._pool_groups[pool_group_index].allocate()
 
     def allocate_multiple(self, pool_group_index: PoolGroupIndex,
-                          num_slots: int) -> list[Slot]:
+                          num_slots: int) -> HomoTuple[Slot]:
         return self._pool_groups[pool_group_index].allocate_multiple(num_slots)
 
     def free(self, pool_group_index: PoolGroupIndex, slot: Slot):
@@ -578,6 +585,10 @@ class CacheLevelStorage:
     def num_pool_groups(self) -> int:
         return len(self._pool_groups)
 
+    def slot_address(self, pool_group_index: PoolGroupIndex,
+                     pool_index: PoolIndex, slot_id: SlotId) -> Address:
+        return self._pool(pool_group_index, pool_index).slot_address(slot_id)
+
     def resize(self,
                new_total_quota: int | None = None,
                new_ratio_list: Sequence[float] | None = None) -> None:
@@ -614,6 +625,10 @@ class CacheLevelStorage:
         except Exception:
             self._resize_impl(old_slot_count_list)
             raise
+
+    def _pool(self, pool_group_index: PoolGroupIndex,
+              pool_index: PoolIndex) -> SlotPoolBase:
+        return self._pool_groups[pool_group_index]._pools[pool_index]
 
     # Calculate how many slots will there be in each pool group with the given total_quota and ratio_list. Use _ratio_to_slot_count_list for initialization.
     def _compute_slot_count_list(
@@ -655,6 +670,7 @@ class CacheLevelStorage:
 
 class GpuCacheLevelStorage(CacheLevelStorage):
     POOL_SIZE_GRANULARITY: ClassVar[int] = PhysMem.SIZE
+    TIER: ClassVar[CacheTier] = CacheTier.GPU_MEM
     __slots__ = ('shared_phys_mem_pool', )
     shared_phys_mem_pool: PooledPhysMemAllocator
 
@@ -674,11 +690,6 @@ class GpuCacheLevelStorage(CacheLevelStorage):
             for slot_size_list, num_slots in zip(slot_size_lists,
                                                  slot_count_list))
 
-    @property
-    @override
-    def cache_tier(self) -> CacheTier:
-        return CacheTier.GPU_MEM
-
     @override
     def resize(self,
                new_total_quota: int | None = None,
@@ -689,6 +700,7 @@ class GpuCacheLevelStorage(CacheLevelStorage):
 
 class HostCacheLevelStorage(CacheLevelStorage):
     __slots__ = ()
+    TIER: ClassVar[CacheTier] = CacheTier.HOST_MEM
 
     def __init__(self, total_quota: int,
                  slot_size_lists: Sequence[Sequence[int]],
@@ -701,14 +713,10 @@ class HostCacheLevelStorage(CacheLevelStorage):
             HostPoolGroup(num_slots, slot_size_list) for slot_size_list,
             num_slots in zip(slot_size_lists, slot_count_list))
 
-    @property
-    @override
-    def cache_tier(self) -> CacheTier:
-        return CacheTier.HOST_MEM
-
 
 class DiskCacheLevelStorage(CacheLevelStorage):
     __slots__ = ()
+    TIER: ClassVar[CacheTier] = CacheTier.DISK
 
     def __init__(self, total_quota: int,
                  slot_size_lists: Sequence[Sequence[int]],
@@ -723,155 +731,3 @@ class DiskCacheLevelStorage(CacheLevelStorage):
             for pg_idx, (
                 slot_size_list,
                 num_slots) in enumerate(zip(slot_size_lists, slot_count_list)))
-
-    @property
-    @override
-    def cache_tier(self) -> CacheTier:
-        return CacheTier.DISK
-
-
-class CacheStorage:
-    __slots__ = ('_life_cycle_id_to_pool_group_index', '_cache_levels')
-
-    # different life cycle variants may map to the same pool group
-    _life_cycle_id_to_pool_group_index: dict[LifeCycleId, PoolGroupIndex]
-    # sorted by cache levels, None means no storage for this cache level
-    _cache_levels: HomoTuple[CacheLevelStorage]
-
-    def __init__(self, config: StorageConfig | KVCacheManagerConfig):
-        if isinstance(config, KVCacheManagerConfig):
-            config = create_storage_config(config)
-        slot_size_lists = [pg.slot_size_list for pg in config.pool_groups]
-        # @TODO: accept an optional avg_seq_len param and consider sliding window.
-        init_ratio = [
-            sum(pg.slot_size_list) * len(pg.slots) for pg in config.pool_groups
-        ]
-        total = sum(init_ratio)
-        init_ratio = [x / total for x in init_ratio]
-        self._cache_levels = tuple(
-            self._create_cache_level_storage(tier_config, slot_size_lists,
-                                             init_ratio)
-            for tier_config in config.cache_tiers)
-        self._life_cycle_id_to_pool_group_index = config.life_cycle_grouping()
-
-    @staticmethod
-    def _create_cache_level_storage(
-            config: CacheTierConfig, slot_size_lists: Sequence[Sequence[int]],
-            init_ratio: Sequence[float]) -> CacheLevelStorage:
-        if config.tier == CacheTier.GPU_MEM:
-            return GpuCacheLevelStorage(config.quota, slot_size_lists,
-                                        init_ratio)
-        elif config.tier == CacheTier.HOST_MEM:
-            return HostCacheLevelStorage(config.quota, slot_size_lists,
-                                         init_ratio)
-        elif config.tier == CacheTier.DISK:
-            assert isinstance(config, DiskCacheTierConfig)
-            assert os.path.isdir(
-                config.path
-            ), f"Disk path {config.path} does not exist or is not a directory"
-            filename_template = os.path.join(config.path, 'g{}p{}.bin')
-            return DiskCacheLevelStorage(config.quota, slot_size_lists,
-                                         init_ratio, filename_template)
-        else:
-            raise ValueError(f"Invalid cache tier: {config.tier}")
-
-    @property
-    def num_cache_levels(self) -> int:
-        return len(self._cache_levels)
-
-    @property
-    def cache_tiers(self) -> HomoTuple[CacheTier]:
-        return tuple(cache_level.cache_tier
-                     for cache_level in self._cache_levels)
-
-    def get_pool_group_index(self, life_cycle: LifeCycleId) -> PoolGroupIndex:
-        return PoolGroupIndex(
-            self._life_cycle_id_to_pool_group_index[life_cycle])
-
-    def get_num_free_slots(self, cache_level: CacheLevel,
-                           pg_idx: PoolGroupIndex) -> int:
-        return self._pool_group(cache_level, pg_idx).num_free_slots
-
-    def allocate(self, life_cycle: LifeCycleId,
-                 cache_level: CacheLevel) -> Slot:
-        assert 0 <= cache_level < self.num_cache_levels, f"Cache level {cache_level} is invalid"
-        pool_group_index = self.get_pool_group_index(life_cycle)
-        return self._pool_group(cache_level, pool_group_index).allocate()
-
-    def allocate_multiple(self, life_cycle: LifeCycleId,
-                          cache_level: CacheLevel,
-                          num_slots: int) -> list[Slot]:
-        assert 0 <= cache_level < self.num_cache_levels, f"Cache level {cache_level} is invalid"
-        pool_group_index = self.get_pool_group_index(life_cycle)
-        return self._pool_group(cache_level,
-                                pool_group_index).allocate_multiple(num_slots)
-
-    def allocate_multiple_for_all_life_cycles(
-            self, cache_level: CacheLevel,
-            num_slots_per_life_cycle: list[int]) -> list[list[Slot]]:
-        assert 0 <= cache_level < self.num_cache_levels, f"Cache level {cache_level} is invalid"
-        assert (
-            len(num_slots_per_life_cycle) == self.num_life_cycles
-        ), f"num_slots_per_life_cycle must have {self.num_life_cycles} elements"
-        num_slots_per_pool_group = [0] * self.num_pool_groups
-        for i in range(self.num_life_cycles):
-            num_slots_per_pool_group[self.get_pool_group_index(
-                LifeCycleId(i))] += num_slots_per_life_cycle[i]
-        if any(
-                self.get_num_free_slots(cache_level, PoolGroupIndex(pg_idx)) <
-                num_slots
-                for pg_idx, num_slots in enumerate(num_slots_per_pool_group)):
-            raise OutOfPagesError("Not enough free slots")
-        return [
-            self.allocate_multiple(LifeCycleId(life_cycle_id), cache_level,
-                                   num_slots)
-            for life_cycle_id, num_slots in enumerate(num_slots_per_life_cycle)
-        ]
-
-    def free(self, life_cycle: LifeCycleId, cache_level: CacheLevel,
-             slot: Slot):
-        self._pool_group(cache_level,
-                         self.get_pool_group_index(life_cycle)).free(slot)
-
-    def slot_address(self, life_cycle: LifeCycleId, cache_level: CacheLevel,
-                     slot: Slot) -> HomoTuple[Address]:
-        return self._pool_group(
-            cache_level,
-            self.get_pool_group_index(life_cycle)).slot_address(slot)
-
-    def num_slots(self, cache_level: CacheLevel,
-                  pool_group_index: PoolGroupIndex) -> int:
-        return self._pool_group(cache_level, pool_group_index).num_slots
-
-    def slot_size(self, pool_group_index: PoolGroupIndex) -> HomoTuple[int]:
-        assert self._cache_levels
-        return get_uniform_attribute(self._cache_levels,
-                                     lambda s: s.slot_size(pool_group_index))
-
-    def resize(self, cache_level: CacheLevel, new_quota: int) -> bool:
-        self._cache_levels[cache_level].resize(new_quota, None)
-        raise NotImplementedError("Not implemented")
-
-    def update_ratio(self, cache_level: CacheLevel,
-                     ratio_list: Sequence[float]) -> bool:
-        self._cache_levels[cache_level].resize(None, ratio_list)
-        raise NotImplementedError("Not implemented")
-
-    @property
-    def num_life_cycles(self) -> int:
-        return len(self._life_cycle_id_to_pool_group_index)
-
-    @property
-    def num_pool_groups(self) -> int:
-        return get_uniform_attribute(self._cache_levels,
-                                     lambda s: len(s._pool_groups))
-
-    def num_pools_in_group(self, pool_group_index: PoolGroupIndex) -> int:
-        return get_uniform_attribute(
-            self._cache_levels,
-            lambda s: s._pool_groups[pool_group_index].num_pools)
-
-    def _pool_group(self, cache_level: CacheLevel,
-                    pool_group_index: PoolGroupIndex) -> PoolGroupBase:
-        assert 0 <= cache_level < self.num_cache_levels, f"Cache level {cache_level} is invalid"
-        return self._cache_levels[cache_level]._pool_groups[pool_group_index]

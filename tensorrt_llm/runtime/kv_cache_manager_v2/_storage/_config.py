@@ -2,12 +2,10 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import \
-    PoolGroupIndex
-
 from .._common import LayerId
 from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LifeCycle, LifeCycleId, LifeCycleRegistry
+from .._storage._core import PoolGroupIndex, PoolIndex
 from .._utils import HomoTuple, get_uniform_attribute, is_sorted
 
 
@@ -74,7 +72,8 @@ class PoolGroupConfig:
 
 
 class BufferAttr(NamedTuple):
-    life_cycle: LifeCycleId
+    life_cycle_id: LifeCycleId
+    pool_index: PoolIndex
     offset: int
     size: int
 
@@ -96,12 +95,13 @@ class StorageConfig:
         ret = dict[BufferId, BufferAttr]()
         for pg in self.pool_groups:
             for slot in pg.slots:
-                for page in slot.pages:
+                life_cycle_id = slot.life_cycle_id
+                for pool, page in enumerate(slot.pages):
+                    offset = 0
                     for cb in page.coalesced_buffers:
-                        offset = 0
                         for b in cb.buffer_ids:
-                            ret[b] = BufferAttr(cb.life_cycle_id, offset,
-                                                cb.single_buffer_size)
+                            ret[b] = BufferAttr(life_cycle_id, PoolIndex(pool),
+                                                offset, cb.single_buffer_size)
                             offset += cb.single_buffer_size
         return ret
 

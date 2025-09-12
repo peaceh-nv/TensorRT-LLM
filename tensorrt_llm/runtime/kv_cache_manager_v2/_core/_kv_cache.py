@@ -2,7 +2,7 @@ import enum
 import warnings
 import weakref
 from collections.abc import Sequence
-from typing import Callable, NewType
+from typing import Callable, Iterator, NewType
 
 from .._common import BlockOrdinal, CudaStream, LayerId, Priority, TokenIdExt
 from .._config import DataRole
@@ -27,8 +27,8 @@ BeamIndex = NewType("BeamIndex", int)
 # @TODO: in __del__, we should check if committed pages are usable for SWA cases. e.g. all pages are dropped except the last one. The last one is not usable.
 class _KVCache:
     __slots__ = ('_manager', 'get_priority', 'status', '_beam_width',
-                 'capacity', 'history_length', 'num_committed_tokens', '_pages',
-                 '_finish_event')
+                 '_cuda_stream', 'capacity', 'history_length',
+                 'num_committed_tokens', '_pages', '_finish_event')
 
     class Status(enum.IntEnum):
         ACTIVE = 0
@@ -37,15 +37,32 @@ class _KVCache:
 
     _manager: weakref.ref[KVCacheManager]
     get_priority: Callable[[BlockOrdinal, LifeCycle], Priority]
-    status: Status
+    _cuda_stream: CudaStream
+    _status: Status
     _beam_width: int
     capacity: int
     history_length: int
     num_committed_tokens: int
 
-    _pages: list[TypedIndexList[BeamIndex, TypedIndexList[
-        LifeCycleId, BlockPage]]]  # indexed with block_ordinal
+    _pages: TypedIndexList[BlockOrdinal,
+                           TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId,
+                                                                    BlockPage]]]
+    # set when switch away from ACTIVE, cleared when switching to ACTIVE.
     _finish_event: CachedCudaEvent | None
+
+    def __init__(self, manager: KVCacheManager, stream: CudaStream,
+                 lora_task_id: int | None,
+                 input_tokens: Sequence[TokenIdExt] | None,
+                 custom_priority_callback: Callable[[BlockOrdinal, LifeCycle],
+                                                    Priority], suspended: bool):
+        self._manager = weakref.ref(manager)
+        self._cuda_stream = stream
+        self._status = self.Status.SUSPENDED
+        self._beam_width = 1
+        self.capacity = 0
+        self.history_length = 0
+        self.num_committed_tokens = 0
+        raise NotImplementedError("Not implemented")
 
     @property
     def manager(self) -> KVCacheManager:
@@ -53,36 +70,30 @@ class _KVCache:
 
     @property
     def cuda_stream(self) -> CudaStream:
-        raise NotImplementedError("Not implemented")
+        return self._cuda_stream
 
     @property
     def finish_event(self) -> CachedCudaEvent:
         'Event recorded when switching from active to suspended/closed state.'
         return unwrap_optional(self._finish_event)
 
-    def page(
-        self,
-        block_ordinal: BlockOrdinal,
-        life_cycle: LifeCycleId,
-        beam_index: BeamIndex = BeamIndex(0)) -> BlockPage:
-        return self.block(block_ordinal, beam_index)[life_cycle]
-
-    def block(
-        self, block_ordinal: BlockOrdinal, beam_index: BeamIndex = BeamIndex(0)
-    ) -> TypedIndexList[LifeCycleId, BlockPage]:
-        return self._pages[block_ordinal][beam_index]
-
     # destroy ownership of memory blocks, so KV cache manager can decide to evict or drop them.
     def close(self):
-        if self.status != self.Status.CLOSED:
-            ...
-            self.status = self.Status.CLOSED
+        if self.status == self.Status.CLOSED:
+            return
+        if self.num_committed_tokens % self.tokens_per_block != 0:
+            ordinal = self.num_committed_tokens // self.tokens_per_block
+            self._commit_block(ordinal, is_last=True)
+        if self.status == self.Status.ACTIVE:
+            # suspend first, just to record finish_event.
+            self.suspend()
+        # make last block first droppable first.
+        while self._pages:
+            self._pages.pop()
+        self._status = self.Status.CLOSED
 
     def __del__(self):
         self.close()
-        warnings.warn(
-            "Check if the last committed pages are usable, in case some prior pages are already dropped. For SWA, this can be done only when _KVCache terminates."
-        )
 
     @property
     def beam_width(self) -> int:
@@ -94,19 +105,25 @@ class _KVCache:
         self._beam_width = beam_width
         raise NotImplementedError("Not implemented")
 
-    # Get the base address of the memory pool holding pages for the given layer and data role.
-    def get_mem_pool_base_address(self, layer_id: LayerId,
-                                  data_role: DataRole) -> int:
-        ...
-
     # Get the indices of memory blocks for each beam.
     # Due to constraints of the current kernels, K/V data blocks and the correspondding quant scale blocks
     # share the same indices, so the output for DataRole.KEY_DATA and DataRole.KEY_BLOCK_SCALE are the same.
-    def get_page_indices(self,
-                         layer_id: LayerId,
-                         data_role: DataRole,
-                         beam_id: int = 0) -> list[int]:
-        ...
+    def get_page_indices(
+        self,
+        layer_id: LayerId,
+        data_role: DataRole,
+        beam_id: BeamIndex = BeamIndex(0)) -> Iterator[int]:
+        storage = self.manager._storage
+        lc = storage.get_buffer_attr(layer_id, data_role).life_cycle_id
+        pages = (unwrap_optional(p[beam_id][lc]).page for p in self._pages)
+        return self.manager._storage.get_page_indices(layer_id, data_role,
+                                                      pages)
+
+    # Currently always equals to page size. In the future, that will change when kernels support page stride.
+    def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int:
+        storage = self.manager._storage
+        attr = storage.get_buffer_attr(layer_id, data_role)
+        return attr.size
 
     # reserve space for next inference. Request new blocks from KVCacheManager if necessary.
     # if delta_capacity > 0 and beam_width > 1, blocks containing new tokens should be allocated for each beam.
@@ -159,15 +176,44 @@ class _KVCache:
     def resume(self) -> bool:
         ...
 
-    def get_status(self) -> Status:
-        ...
+    @property
+    def status(self) -> Status:
+        return self._status
 
     # Wait until the whole helix group arrives at the same phase.
     # When calling this, all ranks must have the same KV cache lengths (capacity, history_length, num_committed_tokens), committed tokens, beam_width, and status. Otherwise the behavior is undefined.
     # This is for helix parallelism. Returns immediately if not using helix parallelism.
     def helix_sync(self):
-        ...
+        raise NotImplementedError("Not implemented")
 
     # From which rank the sequence starts. This API is required only if we support helix sequence starting from arbitrary rank.
     def helix_seq_start_rank(self) -> int:
-        ...
+        raise NotImplementedError("Not implemented")
+
+    def _page(
+        self,
+        block_ordinal: BlockOrdinal,
+        life_cycle: LifeCycleId,
+        beam_index: BeamIndex = BeamIndex(0)) -> BlockPage:
+        return self._block(block_ordinal, beam_index)[life_cycle]
+
+    def _block(
+        self, block_ordinal: BlockOrdinal, beam_index: BeamIndex = BeamIndex(0)
+    ) -> TypedIndexList[LifeCycleId, BlockPage]:
+        return self._pages[block_ordinal][beam_index]
+
+    def _commit_block(self, ordinal: BlockOrdinal, is_last: bool = False):
+        'Commit the block for reuse. Block must be full of tokens except for the last block.'
+        if not is_last:
+            assert self.num_committed_tokens >= self.manager.tokens_per_block * ordinal
+        # convert uncommit pages to committed pages and create a new block in the radix tree.
+
+        raise NotImplementedError("Not implemented")
+        if is_last:
+            warnings.warn(
+                "[KVCacheManager] Not Implemented: check if the last committed pages are usable, in case some prior pages are already dropped. For SWA, this can be done only when _KVCache terminates."
+            )
+
+    @property
+    def tokens_per_block(self) -> int:
+        return self.manager.tokens_per_block
