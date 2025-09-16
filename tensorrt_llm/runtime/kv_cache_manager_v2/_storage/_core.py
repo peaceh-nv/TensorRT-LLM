@@ -13,6 +13,9 @@ from .._utils import (CachedCudaEvent, DynamicBitset, HomoTuple, HostMem,
                       div_up, get_file_size, query_total_gpu_memory, remove_if,
                       resize_file, round_down, unwrap_optional)
 
+PoolGroupIndex = NewType("PoolGroupIndex", int)
+PoolIndex = NewType("PoolIndex", int)
+
 
 class SlotPoolBase(abc.ABC):
     _slot_size: int
@@ -74,7 +77,7 @@ class GpuSlotPool(SlotPoolBase):
 
     @override
     def slot_address(self, slot: int) -> MemAddress:
-        return int(self._vm.address) + self.slot_size * slot
+        return MemAddress(int(self._vm.address) + self.slot_size * slot)
 
     @property
     @override
@@ -109,7 +112,7 @@ class HostSlotPool(SlotPoolBase):
 
     @override
     def slot_address(self, slot: int) -> MemAddress:
-        return self._host_mem._address + self.slot_size * slot
+        return MemAddress(self._host_mem._address + self.slot_size * slot)
 
     @property
     @override
@@ -160,7 +163,7 @@ class Slot:
     # ready_event indicates whether the slot is ready for use.
     #  For newly allocated BlockData, it indicates finish of the last usage by the previous owners of the slot (who returned the slot to the pool).
     #  After data migration, it indicates finish of data migration.
-    #  When passed to free(), it indicates finish of usage by the current owners of the slot.
+    #  When passed to release(), it indicates finish of usage by the current owners of the slot.
     _slot_id: SlotId | None
     ready_event: CachedCudaEvent
 
@@ -257,7 +260,7 @@ class SlotAllocator:
             raise OutOfPagesError("Not enough free slots")
         return tuple(self.allocate() for _ in range(num_slots))
 
-    def free(self, slot: Slot):
+    def release(self, slot: Slot):
         if slot.slot_id >= self._capacity or not self._occupied_mask.get(
                 slot.slot_id):
             raise LogicError(f"Slot {slot.slot_id} is not occupied")
@@ -401,8 +404,8 @@ class PoolGroupBase:
         self._slot_allocator.resize(0)
 
     @property
-    def num_pools(self) -> int:
-        return len(self._pools)
+    def num_pools(self) -> PoolIndex:
+        return PoolIndex(len(self._pools))
 
     @property
     def num_slots(self) -> int:
@@ -444,8 +447,8 @@ class PoolGroupBase:
     def allocate_multiple(self, num_slots: int) -> HomoTuple[Slot]:
         return self._slot_allocator.allocate_multiple(num_slots)
 
-    def free(self, slot: Slot):
-        self._slot_allocator.free(slot)
+    def release(self, slot: Slot):
+        self._slot_allocator.release(slot)
 
     def slot_address(self, slot_id: SlotId) -> HomoTuple[Address]:
         return tuple(pool.slot_address(slot_id) for pool in self._pools)
@@ -506,10 +509,6 @@ class DiskPoolGroup(PoolGroupBase):
             for i, slot_size in enumerate(slot_size_list))
 
 
-PoolGroupIndex = NewType("PoolGroupIndex", int)
-PoolIndex = NewType("PoolIndex", int)
-
-
 class CacheLevelStorage:
     POOL_SIZE_GRANULARITY: ClassVar[int] = 1  # derived class can override this
     TIER: ClassVar[CacheTier]
@@ -543,8 +542,8 @@ class CacheLevelStorage:
                           num_slots: int) -> HomoTuple[Slot]:
         return self._pool_groups[pool_group_index].allocate_multiple(num_slots)
 
-    def free(self, pool_group_index: PoolGroupIndex, slot: Slot):
-        self._pool_groups[pool_group_index].free(slot)
+    def release(self, pool_group_index: PoolGroupIndex, slot: Slot):
+        self._pool_groups[pool_group_index].release(slot)
 
     @property
     def total_quota(self) -> int:
@@ -582,8 +581,8 @@ class CacheLevelStorage:
             tuple(p.slot_size for p in pg._pools) for pg in self._pool_groups)
 
     @property
-    def num_pool_groups(self) -> int:
-        return len(self._pool_groups)
+    def num_pool_groups(self) -> PoolGroupIndex:
+        return PoolGroupIndex(len(self._pool_groups))
 
     def slot_address(self, pool_group_index: PoolGroupIndex,
                      pool_index: PoolIndex, slot_id: SlotId) -> Address:

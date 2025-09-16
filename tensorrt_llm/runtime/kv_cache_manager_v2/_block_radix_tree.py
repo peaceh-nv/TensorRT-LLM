@@ -3,11 +3,11 @@ import warnings
 import weakref
 from typing import Iterable, Iterator, Sequence, TypeVar, cast
 
-from ._common import BlockOrdinal, TokenIdExt
+from ._common import NDEBUG, BlockOrdinal, TokenIdExt
 from ._eviction_controller import PageStatus
 from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry
 from ._page import CommittedPage
-from ._utils import HomoTuple, TypedIndexList, unwrap_weakref
+from ._utils import HomoTuple, TypedIndexList, filled_list, unwrap_weakref
 
 BlockKey = bytes
 
@@ -119,39 +119,75 @@ def find_best_partial_match_in_next_nodes(
         )
     best_block = None
     best_match_len = 0
-    for block in block.next.values():
-        match_len = block._partial_match_this_node(tokens)
+    for b in block.next.values():
+        match_len = b._partial_match_this_node(tokens)
         if match_len > best_match_len:
             best_match_len = match_len
-            best_block = block
+            best_block = b
     return best_block, best_match_len
 
 
+class DuplicateKeyError(RuntimeError):
+    key: BlockKey
+
+    def __init__(self, key: BlockKey):
+        super().__init__(f"Block with key {key} already exists")
+        self.key = key
+
+
+class UselessBlockError(RuntimeError):
+    block: 'Block'
+
+    def __init__(self, block: 'Block'):
+        super().__init__(
+            "Block is useless because all its tokens are covered by another block with key = {block.key}"
+        )
+        self.block = block
+
+
+def _add_or_get_existing(parent: 'RootBlock | Block',
+                         tokens: Sequence[TokenIdExt]) -> 'Block | None':
+    try:
+        return Block(tokens, parent)
+    except DuplicateKeyError as e:
+        return parent.next[e.key]
+    except UselessBlockError:
+        return None
+
+
 class RootBlock:
-    __slots__ = ('_prev', 'key', 'next', '_num_life_cycles')
+    __slots__ = ('_prev', 'key', 'next')
     key: BlockKey
     lora_task_id: int | None
     _prev: weakref.ref['BlockRadixTree']
     next: Children['Block']
-    _num_life_cycles: int
 
     def __init__(self, lora_task_id: int | None, prev: 'BlockRadixTree'):
         self.key = Hasher(lora_task_id).digest
+        assert self.key not in prev.next, "Root block already exists"
         self._prev = weakref.ref(prev)
         self.next = {}
-        self._num_life_cycles = prev.num_life_cycles
+        prev.next[self.key] = self
+
+    def add_or_get_existing(self,
+                            tokens: Sequence[TokenIdExt]) -> 'Block | None':
+        return _add_or_get_existing(self, tokens)
 
     @property
     def ordinal(self) -> BlockOrdinal:
-        return -1
+        return BlockOrdinal(-1)
 
     @property
     def prev(self) -> 'BlockRadixTree':
         return unwrap_weakref(self._prev)
 
     @property
-    def num_life_cycles(self) -> int:
-        return self._num_life_cycles
+    def num_life_cycles(self) -> LifeCycleId:
+        return self.prev.num_life_cycles
+
+    @property
+    def tokens_per_block(self) -> int:
+        return self.prev.tokens_per_block
 
 
 class Block:
@@ -168,25 +204,52 @@ class Block:
     # indexed with LifeCycleId
     storage: TypedIndexList[LifeCycleId, weakref.ref[CommittedPage] | None]
 
+    @staticmethod
+    def make_key(prev_key: BlockKey, tokens: Sequence[TokenIdExt]) -> BlockKey:
+        return Hasher((prev_key, tokens)).digest
+
     def __init__(self, tokens: Sequence[TokenIdExt], prev: 'Block | RootBlock'):
-        self.key = Hasher((prev.key, tokens)).digest
+        assert prev.tokens_per_block == prev.prev.tokens_per_block, 'prev must be a full block'
+        self.key = self.make_key(prev.key, tokens)
+        # a Block is useless if all its tokens are covered by a sibling block. Raise UselessBlockError if so.
+        if self.key in prev.next:
+            raise UselessBlockError(prev.next[self.key])
+        # @TODO: when we have the database for find_best_partial_match_in_next_nodes, we may use that for faster check.
+        for b in prev.next.values():
+            if b.tokens[:len(tokens)] == tokens:
+                raise UselessBlockError(b)
         self.tokens = tokens
-        self.ordinal = prev.ordinal + 1
+        self.ordinal = BlockOrdinal(prev.ordinal + 1)
         self._prev = weakref.ref(prev)
         # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
         prev.next[self.key] = self
         self.next = {}
-        self.storage = cast(TypedIndexList, [None] * prev.num_life_cycles)
+        self.storage = filled_list(None, prev.num_life_cycles)
+        # If there are sibling blocks fully covered by this block, remove them.
+        for k, b in prev.next.items():
+            if len(b.tokens) < len(
+                    tokens) and tokens[:len(b.tokens)] == b.tokens:
+                assert NDEBUG or (not b.is_full and b is not self and b.key == k
+                                  and not b.next)
+                prev.next.pop(k)
+                assert b.is_orphan  # _KVCache may still hold it.
+
+    def add_or_get_existing(self,
+                            tokens: Sequence[TokenIdExt]) -> 'Block | None':
+        return _add_or_get_existing(self, tokens)
 
     def __del__(self):
         for ref in self.storage:
             if ref is not None and ref() is not None:
                 page = unwrap_weakref(ref)
-                if page.status != PageStatus.DROPPABLE:
+                if page.status == PageStatus.DROPPABLE:
+                    if page.scheduled_for_eviction:
+                        page.manager.exclude_from_eviction(page)
+                    assert not page.scheduled_for_eviction
+                else:
                     warnings.warn(
                         "[KVCacheManager] Block is being deleted, but its pages are still in use!"
                     )
-                    break
 
     def _partial_match_this_node(self, tokens: TokenBlock) -> int:
         """
@@ -199,8 +262,8 @@ class Block:
         return len(tokens)
 
     @property
-    def num_life_cycles(self) -> int:
-        return len(self.storage)
+    def num_life_cycles(self) -> LifeCycleId:
+        return LifeCycleId(len(self.storage))
 
     @property
     def prev(self) -> 'Block | RootBlock':
@@ -210,20 +273,42 @@ class Block:
         warnings.warn(
             "[KVCacheManager] Not Implemented: Block.remove_if_unusable() is currently just a naive implementation."
         )
-        if all(page is None for page in self.storage):
+        has_empty_storage = lambda b: all(page is None for page in b.storage)
+        if all(has_empty_storage(b) for b in traverse_subtree(self)):
             remove_subtree(self)
+
+    @property
+    def tokens_per_block(self) -> int:
+        # we assume non-leaf blocks are always full.
+        prev = self.prev
+        return prev.tokens_per_block if isinstance(prev, RootBlock) else len(
+            prev.tokens)
+
+    @property
+    def is_full(self) -> bool:
+        return len(self.tokens) == self.tokens_per_block
+
+    @property
+    def is_orphan(self) -> bool:
+        return self not in self.prev.next
 
 
 class BlockRadixTree:
     __slots__ = ('_life_cycles', '_tokens_per_block', 'next')
     _life_cycles: weakref.ref[LifeCycleRegistry]
     _tokens_per_block: int
-    next: Children['RootBlock']
+    next: Children[RootBlock]
 
     def __init__(self, life_cycles: LifeCycleRegistry, tokens_per_block: int):
         self._life_cycles = weakref.ref(life_cycles)
         self._tokens_per_block = tokens_per_block
         self.next = {}
+
+    def add_or_get_existing(self, lora_task_id: int | None) -> RootBlock:
+        try:
+            return RootBlock(lora_task_id, self)
+        except DuplicateKeyError as e:
+            return self.next[e.key]
 
     @property
     def tokens_per_block(self) -> int:
@@ -234,8 +319,8 @@ class BlockRadixTree:
         return unwrap_weakref(self._life_cycles)
 
     @property
-    def num_life_cycles(self) -> int:
-        return self.life_cycles.num_life_cycles
+    def num_life_cycles(self) -> LifeCycleId:
+        return self.life_cycles.size
 
     def clear(self):
         # taking O(1) space
@@ -257,7 +342,8 @@ class BlockRadixTree:
             if key in block.next:
                 block = block.next[key]
                 if token_block:
-                    yield cast(Block, block), self._tokens_per_block
+                    assert isinstance(block, Block)
+                    yield block, len(token_block)
             else:
                 mismatched_token_block = token_block
                 break
@@ -266,3 +352,8 @@ class BlockRadixTree:
                 cast(Block | RootBlock, block), mismatched_token_block)
             if block is not None:
                 yield block, match_len
+
+    def _check_sanity(self) -> bool:
+        raise NotImplementedError(
+            "[KVCacheManager] Check if there are any unusable blocks that should have been removed."
+        )

@@ -2,18 +2,18 @@ from typing import Iterator, NamedTuple, NewType
 
 from ._common import SlidingWindowSize
 from ._config import KVCacheManagerConfig
-from ._utils import div_up
+from ._utils import TypedIndexList, div_up, typed_enumerate
 
 
 class LifeCycle(NamedTuple):
-    sliding_win_size: SlidingWindowSize
+    window_size: SlidingWindowSize
     num_sink_blocks: int  # div_up(num_sink_tokens, tokens_per_block)
 
     @staticmethod
-    def make(sliding_win_size: SlidingWindowSize, num_sink_tokens: int,
+    def make(window_size: SlidingWindowSize, num_sink_tokens: int | None,
              tokens_per_block: int) -> 'LifeCycle':
-        return LifeCycle(sliding_win_size,
-                         div_up(num_sink_tokens, tokens_per_block))
+        num_sink_blocks = div_up(num_sink_tokens or 0, tokens_per_block)
+        return LifeCycle(window_size, num_sink_blocks)
 
 
 LifeCycleId = NewType("LifeCycleId", int)
@@ -21,14 +21,13 @@ LifeCycleId = NewType("LifeCycleId", int)
 
 class LifeCycleRegistry:
     __slots__ = ('_life_cycle_list', '_life_cycle_id_dict')
-    _life_cycle_list: list[LifeCycle]
+    _life_cycle_list: TypedIndexList[LifeCycleId, LifeCycle]
     _life_cycle_id_dict: dict[LifeCycle, LifeCycleId]
 
     def __init__(self, config: KVCacheManagerConfig):
         for layer in config.layers:
-            num_sink_blocks = div_up(layer.num_sink_tokens,
+            details = LifeCycle.make(layer.window_size, layer.num_sink_tokens,
                                      config.tokens_per_block)
-            details = LifeCycle(layer.sliding_window_size, num_sink_blocks)
             if details not in self._life_cycle_id_dict:
                 assert len(self._life_cycle_id_dict) == len(
                     self._life_cycle_list), "corrupted life cycle registry"
@@ -43,10 +42,19 @@ class LifeCycleRegistry:
         return self._life_cycle_id_dict[life_cycle_details]
 
     @property
-    def num_life_cycles(self) -> int:
+    def size(self) -> LifeCycleId:
         assert len(self._life_cycle_list) == len(
             self._life_cycle_id_dict), "corrupted life cycle registry"
-        return len(self._life_cycle_list)
+        return LifeCycleId(len(self._life_cycle_list))
 
     def __iter__(self) -> Iterator[LifeCycle]:
         return iter(self._life_cycle_list)
+
+    def __getitem__(self, idx: LifeCycleId) -> LifeCycle:
+        return self._life_cycle_list[idx]
+
+    def items(self) -> Iterator[tuple[LifeCycleId, LifeCycle]]:
+        return typed_enumerate(self.get())
+
+    def get(self) -> TypedIndexList[LifeCycleId, LifeCycle]:
+        return self._life_cycle_list

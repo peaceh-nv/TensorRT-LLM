@@ -25,17 +25,18 @@ TokenId = int
 #   3. Hash the multi-modal token embedding data and use the digest as TokenIdExt for every multi-modal token. If we do this, we can't skip the encoder.
 TokenIdExt = TokenId | bytes
 
-BlockOrdinal = int
+BlockOrdinal = NewType("BlockOrdinal", int)
+BlockOrdinalT = type(BlockOrdinal(0))
 
-LayerId = int
+LayerId = NewType("LayerId", int)
 if TYPE_CHECKING:
     CudaStream = NewType("CudaStream", int)
 else:
     CudaStream = drv.CUstream
 
-UserId = int
+UserId = NewType("UserId", int)
 
-MemAddress = int
+MemAddress = NewType("MemAddress", int)
 
 
 @dataclass(slots=True)

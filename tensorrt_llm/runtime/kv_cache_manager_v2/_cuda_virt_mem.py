@@ -24,7 +24,7 @@ class NativePhysMemAllocator:
     def allocate(self) -> drv.CUmemGenericAllocationHandle:
         return _unwrap(drv.cuMemCreate(self._size, self._prop, 0))
 
-    def free(self, handle: drv.CUmemGenericAllocationHandle):
+    def release(self, handle: drv.CUmemGenericAllocationHandle):
         if handle == drv.CUmemGenericAllocationHandle(0):
             return
         _unwrap(drv.cuMemFree(handle))
@@ -53,7 +53,7 @@ class PooledPhysMemAllocator(PooledFactoryBase[drv.CUmemGenericAllocationHandle,
         raw_alloc = NativePhysMemAllocator(PhysMem.SIZE)
         self.device_id = raw_alloc.device_id
         super().__init__(lambda: raw_alloc.allocate(),
-                         lambda handle: raw_alloc.free(handle))
+                         lambda handle: raw_alloc.release(handle))
 
 
 # Virtual memory

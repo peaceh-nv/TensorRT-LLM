@@ -8,6 +8,7 @@ import traceback
 import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
+from collections.abc import Set
 from ctypes.util import find_library
 from itertools import pairwise
 from typing import (Any, BinaryIO, Callable, ClassVar, Generic, Iterable,
@@ -61,6 +62,10 @@ Row = TypeVar('Row', bound=int, contravariant=True)
 Col = TypeVar('Col', bound=int, contravariant=True)
 
 
+def value_or(opt: T | None, default: T) -> T:
+    return default if opt is None else opt
+
+
 def unwrap_optional(value: T | None) -> T:
     if value is None:
         raise ValueError("Expected non-None value")
@@ -73,6 +78,10 @@ def unwrap_weakref(value: weakref.ref[T]) -> T:
 
 def coalesce(value: T | None, fallback: T) -> T:
     return value if value is not None else fallback
+
+
+def map_optional(value: T | None, func: Callable[[T], U]) -> U | None:
+    return func(value) if value is not None else None
 
 
 def remove_if(original: MutableSequence[T],
@@ -116,6 +125,16 @@ def noexcept(func: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def not_implemented(func):
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        raise NotImplementedError(
+            f"The function '{func.__name__}' is not implemented yet.")
+
+    return wrapper
+
+
 def expect_type(ExpectedType: Type[T], value: Any) -> T:
     'Similar to typing.cast, but does runtime checking with assert.'
     assert isinstance(
@@ -132,8 +151,14 @@ def is_sorted(iterable: Iterable[T],
 
 HomoTuple = tuple[T, ...]
 
+Index = TypeVar('Index', bound=int, contravariant=True)
+
 
 class TypedIndexList(Protocol[Index, T]):
+    """
+    A protocol representing a list-like container with a strongly typed integer index.
+    Useful for enforcing index types like NewType wrappers around int.
+    """
 
     def __getitem__(self, index: Index) -> T:
         ...
@@ -156,8 +181,41 @@ class TypedIndexList(Protocol[Index, T]):
     def pop(self) -> T:
         ...
 
-    def push(self, value: T) -> None:
+    def append(self, value: T) -> None:
         ...
+
+
+# @TODO: use this where applicable.
+def to_typed(index_type: Type[Index], lst: list[T]) -> TypedIndexList[Index, T]:
+    """
+    Casts a standard list to a TypedIndexList with a strongly typed integer index.
+
+    Parameters:
+        index_type: A type alias for the NewType index, e.g. type(BlockOrdinal(0)) or a concrete class derived from int.
+        lst: The list to cast
+
+    Returns:
+        A TypedIndexList[Index, T] with the specified index type
+    """
+    return cast(TypedIndexList[Index, T], lst)
+
+
+def filled_list(value: T, count: Index) -> TypedIndexList[Index, T]:
+    return cast(TypedIndexList[Index, T], [value] * int(count))
+
+
+def typed_len(iterable: TypedIndexList[Index, T]) -> Index:
+    return cast(Index, len(iterable))
+
+
+def typed_enumerate(
+        iterable: TypedIndexList[Index, T]) -> Iterator[tuple[Index, T]]:
+    return cast(Iterator[tuple[Index, T]], enumerate(iterable))
+
+
+def typed_map(iterable: TypedIndexList[Index, T],
+              func: Callable[[T], U]) -> TypedIndexList[Index, U]:
+    return cast(TypedIndexList[Index, U], [func(item) for item in iterable])
 
 
 class Array2D(Generic[Row, Col, T]):
@@ -165,13 +223,9 @@ class Array2D(Generic[Row, Col, T]):
     _data: list[T]
     _cols: int
 
-    def __init__(self, rows: int, cols: int, init_val: Iterable[T]):
+    def __init__(self, rows: Row, cols: Col, init_val: Iterable[T]):
         self._data = list(init_val)
         self._cols = cols
-
-    @staticmethod
-    def filled(rows: int, cols: int, val: T) -> 'Array2D[Row, Col, T]':
-        return Array2D(rows, cols, [val] * rows * cols)
 
     def __getitem__(self, index: tuple[Row, Col]) -> T:
         return self._data[index[0] * self._cols + index[1]]
@@ -205,8 +259,27 @@ class Array2D(Generic[Row, Col, T]):
         return reversed(self._data)
 
 
-def typed_range(count: Index) -> Iterator[Index]:
-    return (cast(Index, i) for i in range(int(count)))
+def filled_array2d(rows: Row, cols: Col, val: T) -> Array2D[Row, Col, T]:
+    return Array2D(rows, cols, [val] * rows * cols)
+
+
+Index = TypeVar('Index', bound=int, contravariant=True)
+
+
+def typed_range(*args: Index) -> Iterator[Index]:
+    return (cast(Index, i) for i in range(*args))
+
+
+def find(seq: Sequence[T], predicate: Callable[[T], bool], default: U) -> T | U:
+    return next((item for item in seq if predicate(item)), default)
+
+
+def find_index(seq: Iterable[T], predicate: Callable[[T], bool]) -> int:
+    i = 0
+    for i, item in enumerate(seq):
+        if predicate(item):
+            return i
+    return i + 1
 
 
 mem_alignment = 2 << 20  # 2MB
@@ -559,6 +632,15 @@ class _NullCudaEvent(CachedCudaEvent):
 CachedCudaEvent.NULL = _NullCudaEvent()
 
 
+# @TODO: consider do this in a single batch call to C++.
+def stream_wait_events(stream: drv.CUstream, events: Iterable[CachedCudaEvent]):
+    'Batched wait for multiple events with deduplication first.'
+    if not isinstance(events, Set):
+        events = set(events)
+    for ev in events:
+        ev.wait_in_stream(stream)
+
+
 class CachedCudaStream(ItemHolderWithGlobalPool[drv.CUstream]):
     """
     A cached non-blocking CUDA stream.
@@ -576,8 +658,7 @@ class CachedCudaStream(ItemHolderWithGlobalPool[drv.CUstream]):
         '''
         Wait for events with deduplication first.
         '''
-        for ev in (set(events) if isinstance(events, Sequence) else events):
-            ev.wait_in_stream(self.get())
+        stream_wait_events(self.get(), events)
 
     def record_event(self) -> CachedCudaEvent:
         return CachedCudaEvent(self.get())

@@ -7,7 +7,7 @@ from .._eviction_controller import PageStatus
 from .._exceptions import OutOfPagesError
 from .._life_cycle_registry import LifeCycleId
 from .._storage._core import PoolGroupIndex
-from .._utils import TypedIndexList, noexcept, unwrap_optional
+from .._utils import TypedIndexList, filled_list, noexcept, unwrap_optional
 
 
 @runtime_checkable
@@ -145,11 +145,14 @@ class PrioritizedLRUEvictionPolicy(PrioritizedEvictionPolicy):
 
 
 class PerLevelEvictionController:  # for one cache level
-    __slots__ = ('_life_cycle_grouping', '_policies')
+    __slots__ = ('_life_cycle_grouping', '_policies', '_cache_level')
     _life_cycle_grouping: dict[LifeCycleId, PoolGroupIndex]
     _policies: TypedIndexList[PoolGroupIndex, EvictionPolicy]
+    _cache_level: CacheLevel
 
-    def __init__(self, life_cycle_grouping: dict[LifeCycleId, PoolGroupIndex]):
+    def __init__(self, life_cycle_grouping: dict[LifeCycleId, PoolGroupIndex],
+                 cache_level: CacheLevel):
+        self._cache_level = cache_level
         self._life_cycle_grouping = life_cycle_grouping
         num_pool_groups = max(life_cycle_grouping.values()) + 1
         assert num_pool_groups == len(set(life_cycle_grouping.values()))
@@ -176,8 +179,7 @@ class PerLevelEvictionController:  # for one cache level
         self, min_num_pages: TypedIndexList[PoolGroupIndex, int]
     ) -> TypedIndexList[PoolGroupIndex, list[EvictablePage]]:
         assert len(min_num_pages) == self.num_pool_groups
-        ret: TypedIndexList[PoolGroupIndex, list[EvictablePage]] = cast(
-            TypedIndexList, [[]] * self.num_pool_groups)
+        ret = filled_list(list[EvictablePage](), self.num_pool_groups)
         try:
             for pg_idx, count in enumerate(min_num_pages):
                 pg_idx = PoolGroupIndex(pg_idx)
@@ -192,11 +194,13 @@ class PerLevelEvictionController:  # for one cache level
                     ret[pg_idx].append(page)
                     for a, b in zip(ret, self._evict_dependencies(page)):
                         a.extend(b)
-            return ret
         except Exception:
             for p in reversed(sum(ret, [])):
                 self.schedule_for_eviction(p, evict_first=True)
             raise
+        assert all(p.cache_level == self._cache_level
+                   for p in sum(ret, [])), "Corrupted eviction controller"
+        return ret
 
     def remove(self, node: EvictionPolicy.NodeRef) -> None:
         page = node.value
@@ -209,11 +213,11 @@ class PerLevelEvictionController:  # for one cache level
     def _evict_dependencies(
         self, page: EvictablePage
     ) -> TypedIndexList[PoolGroupIndex, list[EvictablePage]]:
-        return cast(TypedIndexList, [[]] * self.num_pool_groups)
+        return filled_list(list[EvictablePage](), self.num_pool_groups)
 
     def num_evictable_pages(self, pg_idx: PoolGroupIndex) -> int:
         return len(self._policies[pg_idx])
 
     @property
-    def num_pool_groups(self) -> int:
-        return len(self._policies)
+    def num_pool_groups(self) -> PoolGroupIndex:
+        return PoolGroupIndex(len(self._policies))

@@ -1,20 +1,18 @@
 # Currently, our nvfp4 kernels require that KV data and its corresponding KV block scale use the same block index, but different base address.
 # As the ratio between KV data size and KV block scale size is fixed, we can simply use a pool with smaller block size and the same number of blocks for block scale.
 import abc
-import enum
 import os
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import NamedTuple, NewType
 
 from ._common import CacheTier, LayerId
 
-
-class DataRole(enum.IntEnum):
-    'The data role of a buffer inside one layer. The name does not really matter. You are free to convert arbitrary int into DataRole and use it.'
-    KEY_DATA = 0
-    VALUE_DATA = 1
-    KEY_BLOCK_SCALE = 2
-    VALUE_BLOCK_SCALE = 3
+DataRole = NewType("DataRole", str)
+DataRole.__doc__ = '''
+The data role of a buffer inside one layer.
+Must be unique for each buffer inside a layer.
+Examples: "key", "value", "key_block_quant", "value_block_quant".
+'''
 
 
 class CacheTierConfig(NamedTuple):
@@ -82,7 +80,11 @@ class KVCacheManagerConfig:
         buffers: list[BufferConfig]
         # Note that we use None to represent "no sliding window". Sink tokens are excluded.
         sliding_window_size: int | None = None
-        num_sink_tokens: int = 0
+        num_sink_tokens: int | None = None
+
+        @property
+        def window_size(self) -> int | None:
+            return self.sliding_window_size
 
         def __post_init__(self):
             assert len(set(buffer.role for buffer in self.buffers)) == len(

@@ -119,8 +119,7 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
         lambda: defaultdict[int, list[BufferId]](list[BufferId]))
     life_cycle_registry = LifeCycleRegistry(config)
     for layer in config.layers:
-        life_cycle = LifeCycle.make(layer.sliding_window_size,
-                                    layer.num_sink_tokens,
+        life_cycle = LifeCycle.make(layer.window_size, layer.num_sink_tokens,
                                     config.tokens_per_block)
         life_cycle_id = life_cycle_registry.get_id(life_cycle)
         size_to_buffers = buffer_groups[life_cycle_id]

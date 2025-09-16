@@ -1,8 +1,8 @@
 from collections.abc import Callable, Sequence
 
 from .._block_radix_tree import BlockRadixTree
-from .._common import (BlockOrdinal, CacheTier, CudaStream, LayerId, Priority,
-                       TokenIdExt)
+from .._common import (BlockOrdinal, CacheLevel, CacheTier, CudaStream, LayerId,
+                       Priority, TokenIdExt)
 from .._config import DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LifeCycle, LifeCycleRegistry
 from .._storage._config import create_storage_config
@@ -19,7 +19,8 @@ class KVCacheManager:
 
     def __init__(self, config: KVCacheManagerConfig):
         self._life_cycles = LifeCycleRegistry(config)
-        self._radix_tree = BlockRadixTree(self, config.tokens_per_block)
+        self._radix_tree = BlockRadixTree(self._life_cycles,
+                                          config.tokens_per_block)
         storage_config = create_storage_config(config)
         self._storage = StorageManager(self, storage_config)
 
@@ -51,12 +52,12 @@ class KVCacheManager:
     # If best_efforts is True, we will try to resize the quota to the largest possible value that is still <= quota, and returns False only when we cannot resize the quota at all.
     # If best_efforts is False, we will resize the quota to the exact value of quota, and give up if not possible.
     def resize(self,
-               cache_level: CacheTier,
+               cache_level: CacheLevel,
                quota: int,
                best_efforts: bool = False) -> bool:
         raise NotImplementedError("Not implemented")
 
-    def get_quota(self, cache_level: CacheTier) -> int:
+    def get_quota(self, cache_level: CacheLevel) -> int:
         raise NotImplementedError("Not implemented")
 
     # sorted by CacheLevel from warm to cold
@@ -67,3 +68,12 @@ class KVCacheManager:
     @property
     def tokens_per_block(self) -> int:
         return self._radix_tree.tokens_per_block
+
+    @property
+    def allow_seq_rebasing(self) -> bool:
+        'If True, when we commit a full block, we will try to find a existing reusable block with the same tokens and reuse that block instead to save some memory. Intra-batch reuse will be enabled if this is True.'
+        return True
+
+    @property
+    def enable_partial_match(self) -> bool:
+        return True
