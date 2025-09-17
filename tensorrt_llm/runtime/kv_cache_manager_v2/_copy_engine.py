@@ -125,10 +125,9 @@ class StagingBufferManager:
     def num_grains(self) -> int:
         return len(self.grains)
 
-    def suggest_next_max_size(self) -> int:
-        'Requesting more than this may degrade performance.'
-        with self.mutex:
-            return self.GRANULARITY * (self.num_grains - self.next)
+    def _suggest_next_max_size_unsafe(self) -> int:
+        'Requesting more than this may degrade performance. Must be called with self.mutex held.'
+        return self.GRANULARITY * (self.num_grains - self.next)
 
     # max_size is just a hint, the actual size may be smaller.
     def new(self, min_size: int, max_size: int,
@@ -176,8 +175,9 @@ class StagingBufferManager:
                 raise ValueError(
                     f"Requested min_size {self.min_size} is too large for the manager"
                 )
-            self._size = min(self.max_size, manager.suggest_next_max_size())
             with manager.mutex:
+                self._size = min(self.max_size,
+                                 manager._suggest_next_max_size_unsafe())
                 self.start_grain = manager.next
                 manager.next += self.num_grains
                 assert manager.next <= manager.num_grains
@@ -188,6 +188,7 @@ class StagingBufferManager:
                     for grain in self.grains:
                         grain.mutex.acquire()
                         yield grain.ready_event
+                        grain.ready_event = CachedCudaEvent.NULL
 
                 stream_wait_events(self.stream, lock_and_consume_events())
                 return self
@@ -215,7 +216,7 @@ class CopyEngine:
         if not isinstance(copier, tuple):
             return copier(tasks, num_bytes, stream)
         assert len(
-            copier) == 2  # for now, we only support 2 copiers via host memory
+            copier) == 2, "for now, we only support 2 copiers via host memory"
         manager = self.staging_buffer_manager
         remaining = tasks
         while remaining:

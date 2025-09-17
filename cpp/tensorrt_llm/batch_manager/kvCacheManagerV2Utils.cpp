@@ -4,11 +4,8 @@
 #include <cstdio>
 #include <cuda.h>
 #include <fcntl.h>
-#include <filesystem>
 #include <unistd.h>
 #include <vector>
-
-namespace fs = std::filesystem;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -83,7 +80,7 @@ CUDA_CB void hostFnDiskToDiskCopy(void* userData) noexcept
     delete data;
     if (!success)
     {
-        TLLM_LOG_ERROR("hostFnDiskToDiskCopy failed.\n");
+        TLLM_LOG_ERROR("[kvCacheManagerV2Utils] hostFnDiskToDiskCopy failed.\n");
     }
 }
 
@@ -99,7 +96,7 @@ CUDA_CB void hostFnDiskToHostCopy(void* userData) noexcept
     delete data;
     if (!success)
     {
-        TLLM_LOG_ERROR("hostFnDiskToHostCopy failed.\n");
+        TLLM_LOG_ERROR("[kvCacheManagerV2Utils] hostFnDiskToHostCopy failed.\n");
     }
 }
 
@@ -115,7 +112,7 @@ CUDA_CB void hostFnHostToDiskCopy(void* userData) noexcept
     delete data;
     if (!success)
     {
-        TLLM_LOG_ERROR("hostFnDiskToHostCopy failed.\n");
+        TLLM_LOG_ERROR("[kvCacheManagerV2Utils] hostFnDiskToHostCopy failed.\n");
     }
 }
 

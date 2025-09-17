@@ -18,10 +18,7 @@
 #pragma once
 
 #include <cuda.h>
-#include <filesystem>
 #include <vector>
-
-namespace fs = std::filesystem;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
