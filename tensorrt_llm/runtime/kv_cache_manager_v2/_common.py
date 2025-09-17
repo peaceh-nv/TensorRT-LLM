@@ -1,6 +1,6 @@
 import enum
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, BinaryIO, NewType
+from typing import TYPE_CHECKING, NewType
 
 import cuda.bindings.driver as drv
 
@@ -8,10 +8,10 @@ NDEBUG = False
 
 
 # Can extend to more tiers in the future, e.g. object storage like AWS S3.
-class CacheTier(enum.Enum):
-    GPU_MEM = "GPU_MEM"
-    HOST_MEM = "HOST_MEM"
-    DISK = "DISK"
+class CacheTier(enum.IntEnum):
+    GPU_MEM = 0
+    HOST_MEM = 1
+    DISK = 2
 
 
 CacheLevel = NewType("CacheLevel", int)
@@ -38,10 +38,14 @@ UserId = NewType("UserId", int)
 
 MemAddress = NewType("MemAddress", int)
 
+FileDescriptor = NewType("FileDescriptor", int)
+
+BAD_FILE_DESCRIPTOR = FileDescriptor(-1)
+
 
 @dataclass(slots=True)
 class DiskAddress:
-    file: BinaryIO
+    fd: FileDescriptor
     offset: int
 
 

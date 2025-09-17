@@ -36,6 +36,7 @@ set(SRCS
     kvCacheManager.cpp
     kvCacheEventManager.cpp
     kvCacheTransferManager.cpp
+    kvCacheManagerV2Utils.cpp
     llmRequest.cpp
     logitsPostProcessor.cpp
     loraBuffers.cpp

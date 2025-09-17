@@ -4,14 +4,15 @@ import warnings
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import BinaryIO, ClassVar, NewType, final, override
+from typing import ClassVar, NewType, final, override
 
-from .._common import Address, CacheTier, DiskAddress, MemAddress
+from .._common import (BAD_FILE_DESCRIPTOR, Address, CacheTier, DiskAddress,
+                       FileDescriptor, MemAddress)
 from .._cuda_virt_mem import PhysMem, PooledPhysMemAllocator, VirtMem
 from .._exceptions import LogicError, OutOfPagesError, ResourceBusyError
 from .._utils import (CachedCudaEvent, DynamicBitset, HomoTuple, HostMem,
-                      div_up, get_file_size, query_total_gpu_memory, remove_if,
-                      resize_file, round_down, unwrap_optional)
+                      div_up, query_total_gpu_memory, remove_if, resize_file,
+                      round_down, unwrap_optional)
 
 PoolGroupIndex = NewType("PoolGroupIndex", int)
 PoolIndex = NewType("PoolIndex", int)
@@ -47,6 +48,9 @@ class SlotPoolBase(abc.ABC):
     @abc.abstractmethod
     def slot_address(self, slot: int) -> Address:
         pass
+
+    def __del__(self):
+        self.destroy()
 
 
 @final
@@ -121,33 +125,45 @@ class HostSlotPool(SlotPoolBase):
 
 
 class DiskSlotPool(SlotPoolBase):
-    __slots__ = ('_filename', '_file')
+    __slots__ = ('_filename', '_fd')
+    # Currently only used to get the parent folder where we create temporary files.
+    # You won't find file with this name.
     filename: str
-    file: BinaryIO
+    _fd: FileDescriptor
 
     def __init__(self, filename: str, slot_size: int, num_slots: int):
         super().__init__(slot_size)
         self.filename = filename
-        self.file = open(filename, "wb+")
+        folder = os.path.dirname(filename)
+        assert os.path.isdir(folder), f"Folder {folder} does not exist"
+        self._fd = FileDescriptor(
+            os.open(folder, os.O_TMPFILE | os.O_RDWR | os.O_EXCL, 0o664))
         self.resize(num_slots)
 
     @override
     def destroy(self):
-        self.file.close()
-        os.remove(self.filename)
+        if self.fd == BAD_FILE_DESCRIPTOR:
+            return
+        os.close(self.fd)
+        self._fd = BAD_FILE_DESCRIPTOR
+
+    @property
+    def fd(self) -> FileDescriptor:
+        return self._fd
 
     @property
     def file_size(self) -> int:
-        return get_file_size(self.file)
+        return os.lseek(self.fd, 0, os.SEEK_END)
 
     @override
     def resize(self, new_num_slots: int) -> None:
-        resize_file(self.file, new_num_slots * self.slot_size)
+        file_size = new_num_slots * self.slot_size
+        resize_file(self.fd, file_size)
 
     @override
     def slot_address(self, slot: int) -> DiskAddress:
         assert slot < self.num_slots
-        return DiskAddress(self.file, slot * self.slot_size)
+        return DiskAddress(self.fd, slot * self.slot_size)
 
     @property
     @override
@@ -398,7 +414,12 @@ class PoolGroupBase:
     def __init__(self, num_slots: int):
         self._slot_allocator = SlotAllocator(num_slots)
 
+    def __del__(self):
+        self.destroy()
+
     def destroy(self):
+        if self._slot_allocator._capacity == 0:
+            return
         for pool in self._pools:
             pool.destroy()
         self._slot_allocator.resize(0)
@@ -525,11 +546,16 @@ class CacheLevelStorage:
         self._total_quota = total_quota
         self._ratio_list = tuple(ratio_list)
 
+    def __del__(self):
+        self.destroy()
+
     @property
     def cache_tier(self) -> CacheTier:
         return self.TIER
 
     def destroy(self):
+        if self._total_quota == 0:
+            return
         for pg in self._pool_groups:
             pg.destroy()
         self._total_quota = 0

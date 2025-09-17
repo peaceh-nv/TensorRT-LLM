@@ -4,16 +4,17 @@ import ctypes
 import functools
 import operator
 import os
+import platform
 import traceback
+import warnings
 import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Set
 from ctypes.util import find_library
 from itertools import pairwise
-from typing import (Any, BinaryIO, Callable, ClassVar, Generic, Iterable,
-                    Iterator, MutableSequence, Protocol, Sequence, Type,
-                    TypeVar, cast)
+from typing import (Any, Callable, ClassVar, Generic, Iterable, Iterator,
+                    MutableSequence, Protocol, Sequence, Type, TypeVar, cast)
 
 import cuda.bindings.driver as drv
 
@@ -360,6 +361,8 @@ class HostMem:
             self._register_to_cuda()
 
     def destroy(self):
+        if self._size == 0:
+            return
         self._unregister_from_cuda()
         _libc.free(self._address)
         self._address = 0
@@ -370,10 +373,21 @@ class HostMem:
             self.destroy()
 
     def _register_to_cuda(self):
-        _unwrap(
-            drv.cuMemHostRegister(
-                self._address, self._size, drv.CU_MEMHOSTREGISTER_PORTABLE
-                | drv.CU_MEMHOSTREGISTER_DEVICEMAP))
+        try:
+            _unwrap(
+                drv.cuMemHostRegister(
+                    self._address, self._size, drv.CU_MEMHOSTREGISTER_PORTABLE
+                    | drv.CU_MEMHOSTREGISTER_DEVICEMAP))
+        except CuError as e:
+            if e.error_code == drv.CUresult.CUDA_ERROR_INVALID_VALUE and self._size > (
+                    2 << 30
+            ) and platform.system() == "Linux" and platform.release()[:4] in [
+                    "6.11", "6.12", '6.13'
+            ]:
+                warnings.warn(
+                    "There is a known bug in Linux kernel 6.11/6.12/6.13 preventing pinning more than 2GB of host memory. You can fix it by upgrading (>=6.14) or downgrading your kernel (<=6.10). See https://lore.kernel.org/all/20241030030116.670307-1-jhubbard@nvidia.com/"
+                )
+            raise
 
     def _unregister_from_cuda(self):
         _unwrap(drv.cuMemHostUnregister(self._address))
@@ -385,20 +399,12 @@ def _posix_fallocate(fd: int, offset: int, length: int):
         raise DiskOOMError(ret, "posix_fallocate failed")
 
 
-def get_file_size(file: BinaryIO) -> int:
-    pos = file.tell()
-    file.seek(0, os.SEEK_END)
-    size = file.tell()
-    file.seek(pos)
-    return size
-
-
-def resize_file(file: BinaryIO, new_size: int):
-    old_size = get_file_size(file)
+def resize_file(fd: int, new_size: int):
+    old_size = os.lseek(fd, 0, os.SEEK_END)
     if new_size > old_size:
-        _posix_fallocate(file.fileno(), old_size, new_size - old_size)
+        _posix_fallocate(fd, old_size, new_size - old_size)
     elif new_size < old_size:
-        file.truncate(new_size)
+        os.truncate(fd, new_size)
 
 
 class DynamicBitset:
@@ -538,7 +544,7 @@ class ItemHolderBase(Generic[T], ABC):
 
     def close(self):
         if not self.is_closed():
-            self.pool().put(self._item)  # type: ignore
+            self.pool().put(cast(T, self._item))
             self._item = None
 
     def __del__(self):
@@ -548,8 +554,7 @@ class ItemHolderBase(Generic[T], ABC):
         return self._item is None
 
     def get(self) -> T:
-        assert not self.is_closed()
-        return self._item  # type: ignore
+        return unwrap_optional(self._item)
 
     @property
     def handle(self) -> T:
