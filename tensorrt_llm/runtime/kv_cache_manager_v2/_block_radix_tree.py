@@ -1,13 +1,16 @@
 import hashlib
 import warnings
 import weakref
-from typing import Iterable, Iterator, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Iterable, Iterator, Sequence, TypeVar, cast
 
-from ._common import NDEBUG, BlockOrdinal, TokenIdExt
+from ._common import NDEBUG, BlockOrdinal, TokenId, TokenIdExt
 from ._eviction_controller import PageStatus
 from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry
-from ._page import CommittedPage
-from ._utils import HomoTuple, TypedIndexList, filled_list, unwrap_weakref
+from ._utils import (HomoTuple, TypedIndexList, chunked, filled_list,
+                     unwrap_weakref)
+
+if TYPE_CHECKING:
+    from ._page import CommittedPage
 
 BlockKey = bytes
 
@@ -19,14 +22,14 @@ def gen_multi_modal_tokens(id_offset: int, multi_modal_data_digest: bytes,
     # Alternatively, we could also use (multi_modal_data_digest + i.to_bytes(8, 'little')) or its hash digest as token id.
     # The implementation below is faster and also works because KV cache reuse of a token is with a precondition that all previous tokens also match. So only the first multi-modal token id needs to be unique.
     return [
-        multi_modal_data_digest if i == 0 else id_offset + i
+        multi_modal_data_digest if i == 0 else TokenId(id_offset + i)
         for i in range(num_tokens)
     ]
 
 
 class Hasher:
     __slots__ = ('_hasher')
-    _hasher: hashlib._Hash
+    _hasher: 'hashlib._Hash'
 
     def __init__(self, data: int | bytes | None | Iterable = None):
         self._hasher = hashlib.sha256()
@@ -60,9 +63,8 @@ def sequence_to_blockchain_keys(
         tokens: Sequence[TokenIdExt]) -> Iterator[tuple[TokenBlock, BlockKey]]:
     digest = Hasher(lora_task_id).digest
     yield (), digest
-    for i in range(0, len(tokens), tokens_per_block):
-        token_block = tuple(tokens[i:i + tokens_per_block])
-        yield token_block, Hasher((digest, token_block)).digest
+    for token_block in chunked(tokens, tokens_per_block):
+        yield tuple(token_block), Hasher((digest, token_block)).digest
 
 
 Child = TypeVar('Child', bound='Block | RootBlock')
@@ -156,7 +158,7 @@ def _add_or_get_existing(parent: 'RootBlock | Block',
 
 
 class RootBlock:
-    __slots__ = ('_prev', 'key', 'next')
+    __slots__ = ('_prev', 'key', 'next', '__weakref__')
     key: BlockKey
     lora_task_id: int | None
     _prev: weakref.ref['BlockRadixTree']
@@ -168,10 +170,6 @@ class RootBlock:
         self._prev = weakref.ref(prev)
         self.next = {}
         prev.next[self.key] = self
-
-    def add_or_get_existing(self,
-                            tokens: Sequence[TokenIdExt]) -> 'Block | None':
-        return _add_or_get_existing(self, tokens)
 
     @property
     def ordinal(self) -> BlockOrdinal:
@@ -194,7 +192,8 @@ class Block:
     """
     A block of tokens. Manages data for all layers.
     """
-    __slots__ = ('key', 'tokens', 'ordinal', '_prev', 'next', 'storage')
+    __slots__ = ('key', 'tokens', 'ordinal', '_prev', 'next', 'storage',
+                 '__weakref__')
     key: BlockKey
     tokens: Sequence[TokenIdExt]
     ordinal: BlockOrdinal
@@ -202,7 +201,7 @@ class Block:
     next: Children['Block']
 
     # indexed with LifeCycleId
-    storage: TypedIndexList[LifeCycleId, weakref.ref[CommittedPage] | None]
+    storage: TypedIndexList[LifeCycleId, weakref.ref['CommittedPage'] | None]
 
     @staticmethod
     def make_key(prev_key: BlockKey, tokens: Sequence[TokenIdExt]) -> BlockKey:
@@ -233,10 +232,6 @@ class Block:
                                   and not b.next)
                 prev.next.pop(k)
                 assert b.is_orphan  # _KVCache may still hold it.
-
-    def add_or_get_existing(self,
-                            tokens: Sequence[TokenIdExt]) -> 'Block | None':
-        return _add_or_get_existing(self, tokens)
 
     def __del__(self):
         for ref in self.storage:
@@ -294,7 +289,7 @@ class Block:
 
 
 class BlockRadixTree:
-    __slots__ = ('_life_cycles', '_tokens_per_block', 'next')
+    __slots__ = ('_life_cycles', '_tokens_per_block', 'next', '__weakref__')
     _life_cycles: weakref.ref[LifeCycleRegistry]
     _tokens_per_block: int
     next: Children[RootBlock]

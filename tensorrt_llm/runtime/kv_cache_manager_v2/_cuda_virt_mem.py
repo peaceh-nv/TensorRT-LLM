@@ -1,5 +1,6 @@
 import cuda.bindings.driver as drv
 
+from ._common import MemAddress
 from ._utils import ItemHolderWithSharedPool, PooledFactoryBase, _unwrap, div_up
 
 
@@ -39,7 +40,7 @@ class NativePhysMemAllocator:
 
 
 class PhysMem(ItemHolderWithSharedPool[drv.CUmemGenericAllocationHandle]):
-    SIZE: int = 32 << 20
+    SIZE: int = 2 << 20
     __slots__ = ()
 
 
@@ -79,14 +80,14 @@ class VirtMem:
         self._access_desc = drv.CUmemAccessDesc()
         self._access_desc.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         self._access_desc.location.id = device_id
-        self._access_desc.flags = drv.CUmemAccessFlags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+        self._access_desc.flags = drv.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
         self.extend(init_num_phys_mem)
 
     def destroy(self):
         if self._vm_size == 0:
             return
         while self._pm_stack:
-            self._pm_stack.pop().close()
+            self._pop().close()
         _unwrap(drv.cuMemAddressFree(self._address, self._vm_size))
         self._address = drv.CUdeviceptr(0)
         self._vm_size = 0
@@ -118,17 +119,17 @@ class VirtMem:
 
     def _push(self, phy_mem: PhysMem):
         assert PhysMem.SIZE * (len(self._pm_stack) + 1) <= self._vm_size
-        vm_ptr = drv.CUdeviceptr(
-            int(self._address.value()) + PhysMem.SIZE * len(self._pm_stack))
+        vm_ptr = drv.CUdeviceptr(self.address +
+                                 PhysMem.SIZE * len(self._pm_stack))
         _unwrap(drv.cuMemMap(vm_ptr, PhysMem.SIZE, 0, phy_mem.handle, 0))
-        _unwrap(drv.cuMemSetAccess(vm_ptr, PhysMem.SIZE, self._access_desc))
+        _unwrap(
+            drv.cuMemSetAccess(vm_ptr, PhysMem.SIZE, (self._access_desc, ), 1))
         self._pm_stack.append(phy_mem)
 
     def _pop(self) -> PhysMem:
         assert self._pm_stack
-        vm_ptr = drv.CUdeviceptr(
-            int(self._address.value()) + PhysMem.SIZE *
-            (len(self._pm_stack) - 1))
+        vm_ptr = drv.CUdeviceptr(self.address + PhysMem.SIZE *
+                                 (len(self._pm_stack) - 1))
         _unwrap(drv.cuMemUnmap(vm_ptr, PhysMem.SIZE))
         return self._pm_stack.pop()
 
@@ -145,5 +146,5 @@ class VirtMem:
         return len(self._pm_stack)
 
     @property
-    def address(self) -> drv.CUdeviceptr:
-        return self._address
+    def address(self) -> MemAddress:
+        return MemAddress(int(self._address))

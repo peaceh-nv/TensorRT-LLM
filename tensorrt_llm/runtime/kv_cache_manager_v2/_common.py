@@ -16,8 +16,10 @@ class CacheTier(enum.IntEnum):
 
 CacheLevel = NewType("CacheLevel", int)
 
+GPU_LEVEL = CacheLevel(0)
+
 # Normal token id that falls in the tokenizer vocabulary.
-TokenId = int
+TokenId = NewType("TokenId", int)
 
 # For multi-modal tokens, we can handle it in either of the following ways:
 #   1. Hash combine image digest and local_token_id, then use digest for every multi-modal token.
@@ -30,9 +32,13 @@ BlockOrdinalT = type(BlockOrdinal(0))
 
 LayerId = NewType("LayerId", int)
 if TYPE_CHECKING:
-    CudaStream = NewType("CudaStream", int)
+
+    class CudaStream(int):
+        __slots__ = ()
 else:
     CudaStream = drv.CUstream
+
+BeamIndex = NewType("BeamIndex", int)
 
 UserId = NewType("UserId", int)
 

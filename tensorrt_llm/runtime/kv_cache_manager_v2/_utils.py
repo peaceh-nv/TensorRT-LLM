@@ -1,11 +1,12 @@
 import array
 import atexit
 import ctypes
+import errno
 import functools
+import itertools
 import operator
 import os
 import platform
-import traceback
 import warnings
 import weakref
 from abc import ABC, abstractmethod
@@ -18,21 +19,26 @@ from typing import (Any, Callable, ClassVar, Generic, Iterable, Iterator,
 
 import cuda.bindings.driver as drv
 
-from ._common import NDEBUG
+from ._common import NDEBUG, CudaStream
 from ._exceptions import (CuError, CuOOMError, DiskOOMError, HostOOMError,
                           LogicError)
 
 
-def _unwrap(ret: drv.CUresult | tuple[drv.CUresult, Any]
+def _unwrap(ret: drv.CUresult
+            | tuple[
+                drv.CUresult,
+                Any,
+            ]
             | tuple[drv.CUresult, Any, Any]):
     if isinstance(ret, drv.CUresult):
-        if ret != drv.CUDA_SUCCESS:
-            if ret == drv.CUresult.CUDA_ERROR_OUT_OF_MEMORY:
+        if int(ret) != int(drv.CUresult.CUDA_SUCCESS):  # type: ignore[arg-type]
+            if int(ret) == int(drv.CUresult.CUDA_ERROR_OUT_OF_MEMORY
+                               ):  # type: ignore[arg-type]
                 raise CuOOMError()
             raise CuError(ret)
     else:
         _unwrap(ret[0])
-        return ret[1:]
+        return ret[1] if len(ret) == 2 else ret[1:]
 
 
 def div_up(x: int, y: int) -> int:
@@ -54,6 +60,13 @@ def in_range(x: int, lower: int, upper: int) -> bool:
 def exact_div(x: int, y: int) -> int:
     assert x % y == 0
     return x // y
+
+
+def overlap(a: tuple[int, int], b: tuple[int,
+                                         int]) -> tuple[int, int] | tuple[()]:
+    'Returns the overlap of two ranges, or an empty tuple if they do not overlap.'
+    return (max(a[0], b[0]),
+            min(a[1], b[1])) if a[0] < b[1] and b[0] < a[1] else ()
 
 
 T = TypeVar('T')
@@ -96,6 +109,15 @@ def remove_if(original: MutableSequence[T],
             original[idx - len(removed)] = item
     del original[len(original) - len(removed):]
     return removed
+
+
+def chunked(iterable: Iterable[T], size: int) -> Iterator[tuple[T, ...]]:
+    iterator = iter(iterable)
+    while True:
+        chunk = tuple(itertools.islice(iterator, size))
+        if not chunk:
+            break
+        yield chunk
 
 
 def partition(original: Iterable[T],
@@ -286,6 +308,18 @@ def find_index(seq: Iterable[T], predicate: Callable[[T], bool]) -> int:
 mem_alignment = 2 << 20  # 2MB
 
 _libc = ctypes.CDLL(find_library('c'))
+_libc.aligned_alloc.restype = ctypes.c_void_p
+_libc.aligned_alloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+_libc.madvise.restype = ctypes.c_int
+_libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+_libc.realloc.restype = ctypes.c_void_p
+_libc.realloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+_libc.free.restype = None
+_libc.free.argtypes = [ctypes.c_void_p]
+_libc.posix_fallocate.restype = ctypes.c_int
+_libc.posix_fallocate.argtypes = [
+    ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong
+]
 
 
 def _aligned_alloc(alignment: int, size: int) -> int:
@@ -295,19 +329,22 @@ def _aligned_alloc(alignment: int, size: int) -> int:
     Raises HostOOMError on failure.
     """
     assert size % alignment == 0
-    memptr = _libc.aligned_alloc(alignment, size)
+    memptr: ctypes.c_void_p = _libc.aligned_alloc(ctypes.c_size_t(alignment),
+                                                  ctypes.c_size_t(size))
     if memptr == ctypes.c_void_p(0):
         raise HostOOMError("aligned_alloc failed")
-    assert memptr.value is not None and memptr.value != 0
-    return memptr.value
+    return int(memptr)
 
 
-def _memadvise(ptr: int, size: int, advice: int):
+def _madvise(ptr: int, size: int, advice: int):
     if os.name == "nt":
         return
-    ret = _libc.madvise(ptr, size, advice)
+    ret = _libc.madvise(ctypes.c_void_p(ptr), ctypes.c_size_t(size),
+                        ctypes.c_int(advice))
     if ret != 0:
-        raise HostOOMError("memadvise failed")
+        error_code = ctypes.get_errno()
+        error_msg = f"madvise failed with errno {error_code}: {errno.errorcode.get(error_code, 'Unknown error')}"
+        raise HostOOMError(error_msg)
 
 
 MADV_HUGEPAGE = 14
@@ -319,13 +356,25 @@ def _realloc(ptr: int, size: int) -> int:
     Returns the address as an integer.
     Raises OSError on failure.
     """
-    ret = _libc.realloc(ptr, size)
+    ret = _libc.realloc(ctypes.c_void_p(ptr), ctypes.c_size_t(size))
     if ret == ctypes.c_void_p(0):
         raise HostOOMError("realloc failed.")
-    return ret
+    return int(ret)
+
+
+def _free(ptr: int):
+    _libc.free(ctypes.c_void_p(ptr))
+
+
+def _posix_fallocate(fd: int, offset: int, length: int):
+    ret = _libc.posix_fallocate(ctypes.c_int(fd), ctypes.c_longlong(offset),
+                                ctypes.c_longlong(length))
+    if ret != 0:
+        raise DiskOOMError(ret, "posix_fallocate failed")
 
 
 class HostMem:
+    ALIGNMENT: int = 2 << 20
     """
     Host memory aligned to 2MB, reallocable for low-cost resizing and registered to CUDA as page-locked memory.
     Resizing will keep the original memory content, like `realloc` in C.
@@ -349,28 +398,28 @@ class HostMem:
             return
         self._address = _aligned_alloc(mem_alignment, size)
         self._size = size
-        _memadvise(self._address, size, MADV_HUGEPAGE)
+        _madvise(self._address, size, MADV_HUGEPAGE)
+        self._register_to_cuda()
 
     def resize(self, new_size: int):
         self._unregister_from_cuda()
         try:
             self._address = _realloc(self._address, new_size)
             self._size = new_size
-            _memadvise(self._address, new_size, MADV_HUGEPAGE)
+            _madvise(self._address, new_size, MADV_HUGEPAGE)
         finally:
             self._register_to_cuda()
 
     def destroy(self):
-        if self._size == 0:
+        if self._address == 0:
             return
         self._unregister_from_cuda()
-        _libc.free(self._address)
+        _free(self._address)
         self._address = 0
         self._size = 0
 
     def __del__(self):
-        if self._address != 0:
-            self.destroy()
+        self.destroy()
 
     def _register_to_cuda(self):
         try:
@@ -379,11 +428,10 @@ class HostMem:
                     self._address, self._size, drv.CU_MEMHOSTREGISTER_PORTABLE
                     | drv.CU_MEMHOSTREGISTER_DEVICEMAP))
         except CuError as e:
-            if e.error_code == drv.CUresult.CUDA_ERROR_INVALID_VALUE and self._size > (
-                    2 << 30
-            ) and platform.system() == "Linux" and platform.release()[:4] in [
-                    "6.11", "6.12", '6.13'
-            ]:
+            if int(e.error_code) == int(
+                    drv.CUresult.CUDA_ERROR_INVALID_VALUE
+            ) and self._size > (2 << 30) and platform.system(
+            ) == "Linux" and platform.release()[:4] in ["6.11", "6.12", '6.13']:
                 warnings.warn(
                     "There is a known bug in Linux kernel 6.11/6.12/6.13 preventing pinning more than 2GB of host memory. You can fix it by upgrading (>=6.14) or downgrading your kernel (<=6.10). See https://lore.kernel.org/all/20241030030116.670307-1-jhubbard@nvidia.com/"
                 )
@@ -391,12 +439,6 @@ class HostMem:
 
     def _unregister_from_cuda(self):
         _unwrap(drv.cuMemHostUnregister(self._address))
-
-
-def _posix_fallocate(fd: int, offset: int, length: int):
-    ret = _libc.posix_fallocate(fd, offset, length)
-    if ret != 0:
-        raise DiskOOMError(ret, "posix_fallocate failed")
 
 
 def resize_file(fd: int, new_size: int):
@@ -419,7 +461,7 @@ class DynamicBitset:
     ALL_SET_MASK = (1 << 64) - 1
 
     def __init__(self, capacity: int):
-        self._bits = array.array(self.TYPE_CODE, [0] * ((capacity + 63) // 64))
+        self._bits = array.array(self.TYPE_CODE, [0] * (div_up(capacity, 64)))
         self._num_set_bits = 0
 
     def set(self, index: int):
@@ -445,6 +487,9 @@ class DynamicBitset:
             self._bits.extend(array.array(self.TYPE_CODE, [0] * extra_elems))
         elif extra_elems < 0:
             self._bits = self._bits[:extra_elems]
+            if new_capacity % 64 != 0:
+                self._bits[-1] &= self.ALL_SET_MASK >> (64 -
+                                                        (new_capacity % 64))
 
     # check if any bit in the range [start, end) is set
     def any_set(self, start: int, end: int) -> bool:
@@ -457,19 +502,21 @@ class DynamicBitset:
                 return True
         else:
             if (start_word_mask & self._bits[start // 64]) != 0 or (
-                    end_word_mask & self._bits[end // 64]) != 0:
+                    end % 64 != 0
+                    and end_word_mask & self._bits[end // 64]) != 0:
                 return True
         return any(self._bits[i] != 0
                    for i in range(start // 64 + 1, end // 64))
 
 
 class SimplePool(Generic[T]):
-    __slots__ = ('_create_func', '_destroy_func', '_items', '_max_size',
-                 '_outstanding_count')
+    __slots__ = ('_create_func', '_destroy_func', '_init_size', '_max_size',
+                 '_outstanding_count', '_items')
     _create_func: Callable[[], T]
     _destroy_func: Callable[[T], None]
-    _items: deque[T]
+    _init_size: int
     _max_size: int | None
+    _items: deque[T] | None
     _outstanding_count: int  # number of items currently we gave out but not returned, i.e. get() but not put()
 
     def __init__(self,
@@ -479,27 +526,36 @@ class SimplePool(Generic[T]):
                  max_size: int | None = None):
         self._create_func = create_func
         self._destroy_func = destroy_func
-        self._items = deque[T]((create_func() for _ in range(init_size)),
-                               maxlen=max_size)
+        self._init_size = init_size
         self._max_size = max_size
+        self._items = None
+        self._outstanding_count = 0
 
     def clear(self):
         while True:
-            self._destroy_func(self._items.popleft())
+            self._destroy_func(self.items.popleft())
 
     def __del__(self):
         self.clear()
 
+    @property
+    def items(self) -> deque[T]:
+        if self._items is None:
+            self._items = deque[T](
+                (self._create_func() for _ in range(self._init_size)),
+                maxlen=self._max_size)
+        return self._items
+
     def get(self) -> T:
-        ret = self._items.popleft() if self._items else self._create_func()
+        ret = self.items.popleft() if self.items else self._create_func()
         self._outstanding_count += 1
         return ret
 
     def put(self, item: T):
         self._outstanding_count -= 1
-        if self._max_size is not None and len(self._items) >= self._max_size:
+        if self._max_size is not None and len(self.items) >= self._max_size:
             self._destroy_func(item)
-        self._items.appendleft(item)
+        self.items.appendleft(item)
 
     @property
     def outstanding_count(self) -> int:
@@ -509,7 +565,7 @@ class SimplePool(Generic[T]):
     @property
     def cached_count(self) -> int:
         'number of items currently in the pool'
-        return len(self._items)
+        return len(self.items)
 
     @property
     def total_count(self) -> int:
@@ -519,7 +575,7 @@ class SimplePool(Generic[T]):
 
 class GlobalPoolProvider(Generic[T]):
     __slots__ = ()
-    _pool: ClassVar[SimplePool]
+    _pool: ClassVar[SimplePool | None] = None
 
     @classmethod
     def register_pool(cls, pool: SimplePool[T]):
@@ -532,7 +588,7 @@ class GlobalPoolProvider(Generic[T]):
             cls._pool.clear()
 
     def pool(self) -> SimplePool[T]:
-        return self._pool
+        return unwrap_optional(self._pool)
 
 
 class ItemHolderBase(Generic[T], ABC):
@@ -578,6 +634,14 @@ class CachedCudaEvent(ItemHolderWithGlobalPool[drv.CUevent]):
     __slots__ = ()
 
     def __init__(self, stream: drv.CUstream):
+        if self._pool is None:
+            CachedCudaEvent.register_pool(SimplePool[drv.CUevent](
+                lambda: _unwrap(
+                    drv.cuEventCreate(drv.CUevent_flags.CU_EVENT_DISABLE_TIMING)
+                ),
+                lambda ev: _unwrap(drv.cuEventDestroy(ev)
+                                   ),  # type: ignore[arg-type]
+                init_size=1024))
         super().__init__()
         self._record(stream)
 
@@ -587,11 +651,11 @@ class CachedCudaEvent(ItemHolderWithGlobalPool[drv.CUevent]):
         """
         if self.is_closed():
             return True
-        err = drv.cuEventQuery(self.get())
-        if err == drv.CUDA_SUCCESS:
+        err, = drv.cuEventQuery(self.get())
+        if int(err) == int(drv.CUresult.CUDA_SUCCESS):
             self.close()
             return True
-        elif err == drv.CUDA_ERROR_NOT_READY:
+        elif int(err) == int(drv.CUresult.CUDA_ERROR_NOT_READY):
             return False
         else:
             raise CuError(err)
@@ -605,22 +669,13 @@ class CachedCudaEvent(ItemHolderWithGlobalPool[drv.CUevent]):
     def wait_in_stream(self, stream: drv.CUstream):
         if self.is_closed():
             return
-        _unwrap(
-            drv.cuStreamWaitEvent(stream, self.get(),
-                                  drv.CU_STREAM_WAIT_VALUE_COMPLETED))
+        _unwrap(drv.cuStreamWaitEvent(stream, self.get(), 0))
 
     def _record(self, stream: drv.CUstream):
         """
         Prefer new event instead of recording an existing event.
         """
         _unwrap(drv.cuEventRecord(self.get(), stream))
-
-
-CachedCudaEvent.register_pool(SimplePool[drv.CUevent](
-    lambda: _unwrap(drv.cuEventCreate(drv.CUevent_flags.CU_EVENT_DISABLE_TIMING)
-                    ),
-    lambda ev: _unwrap(drv.cuEventDestroy(ev)),  # type: ignore[arg-type]
-    init_size=1024))
 
 
 class _NullCudaEvent(CachedCudaEvent):
@@ -638,8 +693,11 @@ CachedCudaEvent.NULL = _NullCudaEvent()
 
 
 # @TODO: consider do this in a single batch call to C++.
-def stream_wait_events(stream: drv.CUstream, events: Iterable[CachedCudaEvent]):
+def stream_wait_events(stream: drv.CUstream,
+                       events: Iterable[CachedCudaEvent] | CachedCudaEvent):
     'Batched wait for multiple events with deduplication first.'
+    if isinstance(events, CachedCudaEvent):
+        events = (events, )
     if not isinstance(events, Set):
         events = set(events)
     for ev in events:
@@ -652,14 +710,26 @@ class CachedCudaStream(ItemHolderWithGlobalPool[drv.CUstream]):
     """
     __slots__ = ()
 
+    def __init__(self):
+        if self._pool is None:
+            CachedCudaStream.register_pool(SimplePool[drv.CUstream](
+                lambda: _unwrap(
+                    drv.cuStreamCreate(drv.CUstream_flags.CU_STREAM_NON_BLOCKING
+                                       )),
+                lambda stream: _unwrap(drv.cuStreamDestroy(stream)
+                                       ),  # type: ignore[arg-type]
+                init_size=128))
+        super().__init__()
+
     def wait_event(self, event: drv.CUevent) -> None:
         _unwrap(
             drv.cuStreamWaitEvent(self.get(), event,
                                   drv.CU_STREAM_WAIT_VALUE_COMPLETED))
 
     def wait_events(
-            self,
-            events: Sequence[CachedCudaEvent] | set[CachedCudaEvent]) -> None:
+        self, events: Sequence[CachedCudaEvent] | set[CachedCudaEvent]
+        | CachedCudaEvent
+    ) -> None:
         '''
         Wait for events with deduplication first.
         '''
@@ -668,13 +738,8 @@ class CachedCudaStream(ItemHolderWithGlobalPool[drv.CUstream]):
     def record_event(self) -> CachedCudaEvent:
         return CachedCudaEvent(self.get())
 
-
-CachedCudaStream.register_pool(SimplePool[drv.CUstream](
-    lambda: _unwrap(
-        drv.cuStreamCreate(drv.CUstream_flags.CU_STREAM_NON_BLOCKING)),
-    lambda stream: _unwrap(drv.cuStreamDestroy(stream)
-                           ),  # type: ignore[arg-type]
-    init_size=128))
+    def __cuda_stream__(self) -> tuple[int, int]:
+        return 0, int(self.get())
 
 
 class TemporaryCudaStream(CachedCudaStream):
@@ -682,48 +747,81 @@ class TemporaryCudaStream(CachedCudaStream):
     A cached non-blocking CUDA stream. Mainly used as temporary worker streams.
     Requires a list of prior events to wait for dependencies, and a finish event must be recorded before closing.
     """
-    __slots__ = ('_finish_event_recorded', )
-    _finish_event_recorded: bool
+    __slots__ = ('_finish_event')
+    _finish_event: CachedCudaEvent | None
 
     def __init__(self, prior_events: Sequence[CachedCudaEvent]
-                 | set[CachedCudaEvent]):
+                 | set[CachedCudaEvent] | CachedCudaEvent):
         super().__init__()
         self.wait_events(prior_events)
-        self._finish_event_recorded = False
+        self._finish_event = None
 
-    def close(self):
-        if not self._finish_event_recorded:
-            raise LogicError("finish event not recorded" +
-                             "".join(traceback.format_stack()))
-        super().close()
+    def __del__(self):
+        if self._finish_event is not None:
+            raise LogicError("finish event not taken")
 
-    def finish(self) -> CachedCudaEvent:
-        if self._finish_event_recorded:
-            raise LogicError("finish event already recorded")
-        self._finish_event_recorded = True
-        return self.record_event()
+    def take_finish_event(self) -> CachedCudaEvent:
+        ret = unwrap_optional(self._finish_event)
+        self._finish_event = None
+        return ret
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
+        self._finish_event = self.record_event()
 
 
 def merge_events(
-    events: Sequence[CachedCudaEvent] | set[CachedCudaEvent]
+    events: Sequence[CachedCudaEvent] | set[CachedCudaEvent] | CachedCudaEvent
 ) -> CachedCudaEvent:
+    if isinstance(events, CachedCudaEvent):
+        return events
     if len(events) == 0:
         return CachedCudaEvent.NULL
     if len(events) == 1:
         ev = next(iter(events))
         return ev if not ev.is_closed() else CachedCudaEvent.NULL
     with TemporaryCudaStream(events) as stream:
-        return stream.finish()
+        pass
+    return stream.take_finish_event()
+
+
+class MultiStreamExecutor:
+    __slots__ = ('_prior_event', '_streams', '_finish_event')
+    _prior_event: CachedCudaEvent
+    _streams: list[TemporaryCudaStream]
+    _finish_event: CachedCudaEvent | None
+
+    def __init__(self, prior_events: Sequence[CachedCudaEvent]
+                 | set[CachedCudaEvent] | CachedCudaEvent):
+        self._prior_event = merge_events(prior_events)
+        self._streams = []
+        self._finish_event = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        events = [s.take_finish_event() for s in self._streams]
+        self._finish_event = merge_events(events)
+
+    def __del__(self):
+        if self._finish_event is not None:
+            raise LogicError("finish event not taken")
+
+    def new_stream(self) -> TemporaryCudaStream:
+        stream = TemporaryCudaStream((self._prior_event, ))
+        self._streams.append(stream)
+        return stream
+
+    def take_finish_event(self) -> CachedCudaEvent:
+        ret = unwrap_optional(self._finish_event)
+        self._finish_event = None
+        return ret
 
 
 class SharedPoolProvider(Generic[T]):
-    __slots__ = ('_pool', )
     _pool: SimplePool[T]
 
     def __init__(self, pool: SimplePool[T]):
@@ -786,3 +884,15 @@ def query_total_gpu_memory() -> int:
 def query_free_gpu_memory() -> int:
     free, _ = _unwrap(drv.cuMemGetInfo())  # type: ignore[assignment]
     return free
+
+
+class CudaStreamWrapper:
+    'Just a wrapper to make it compatible with IsStreamT protocol. Does not own the stream.'
+    __slots__ = ('_stream', )
+    _stream: CudaStream
+
+    def __init__(self, stream: CudaStream):
+        self._stream = stream
+
+    def __cuda_stream__(self) -> tuple[int, int]:
+        return 0, int(self._stream)

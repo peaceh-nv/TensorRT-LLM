@@ -50,13 +50,25 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         .def_rw("src", &Task<DiskAddress, MemAddress>::src);
 
     // Bind copy functions
-    module.def("copy_disk_to_disk", copyDiskToDisk, nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"),
+    module.def(
+        "copy_disk_to_disk",
+        [](std::vector<Task<DiskAddress, DiskAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> CUresult
+        { return copyDiskToDisk(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
+        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"),
         "Copy data from disk to disk using CUDA host function");
 
-    module.def("copy_disk_to_host", copyDiskToHost, nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"),
+    module.def(
+        "copy_disk_to_host",
+        [](std::vector<Task<MemAddress, DiskAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> CUresult
+        { return copyDiskToHost(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
+        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"),
         "Copy data from disk to host using CUDA host function");
 
-    module.def("copy_host_to_disk", copyHostToDisk, nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"),
+    module.def(
+        "copy_host_to_disk",
+        [](std::vector<Task<DiskAddress, MemAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> CUresult
+        { return copyHostToDisk(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
+        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"),
         "Copy data from host to disk using CUDA host function");
 }
 

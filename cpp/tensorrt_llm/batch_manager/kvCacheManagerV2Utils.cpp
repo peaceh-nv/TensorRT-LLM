@@ -10,20 +10,6 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-// Template to extract the second argument type of a standalone function
-template <typename T>
-struct SecondArgType;
-
-template <typename Ret, typename Arg1, typename Arg2, typename... Rest>
-struct SecondArgType<Ret (*)(Arg1, Arg2, Rest...)>
-{
-    using type = Arg2;
-};
-
-// Helper alias
-template <typename T>
-using SecondArgType_t = typename SecondArgType<T>::type;
-
 template <typename Func>
 bool loopedReadWrite(Func&& func, ssize_t size) noexcept
 {
@@ -116,19 +102,22 @@ CUDA_CB void hostFnHostToDiskCopy(void* userData) noexcept
     }
 }
 
-CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept
+CUresult copyDiskToDisk(
+    std::vector<Task<DiskAddress, DiskAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept
 {
     auto const data = new UserData<DiskAddress, DiskAddress>{std::move(tasks), numBytes};
     return cuLaunchHostFunc(stream, hostFnDiskToDiskCopy, data);
 }
 
-CUresult copyDiskToHost(std::vector<Task<MemAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept
+CUresult copyDiskToHost(
+    std::vector<Task<MemAddress, DiskAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept
 {
     auto const data = new UserData<MemAddress, DiskAddress>{std::move(tasks), numBytes};
     return cuLaunchHostFunc(stream, hostFnDiskToHostCopy, data);
 }
 
-CUresult copyHostToDisk(std::vector<Task<DiskAddress, MemAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept
+CUresult copyHostToDisk(
+    std::vector<Task<DiskAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept
 {
     auto const data = new UserData<DiskAddress, MemAddress>{std::move(tasks), numBytes};
     return cuLaunchHostFunc(stream, hostFnHostToDiskCopy, data);

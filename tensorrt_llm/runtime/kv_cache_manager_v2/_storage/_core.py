@@ -1,4 +1,5 @@
 import abc
+import itertools
 import os
 import warnings
 from collections import deque
@@ -12,7 +13,7 @@ from .._cuda_virt_mem import PhysMem, PooledPhysMemAllocator, VirtMem
 from .._exceptions import LogicError, OutOfPagesError, ResourceBusyError
 from .._utils import (CachedCudaEvent, DynamicBitset, HomoTuple, HostMem,
                       div_up, query_total_gpu_memory, remove_if, resize_file,
-                      round_down, unwrap_optional)
+                      round_down, round_up, unwrap_optional)
 
 PoolGroupIndex = NewType("PoolGroupIndex", int)
 PoolIndex = NewType("PoolIndex", int)
@@ -103,8 +104,7 @@ class HostSlotPool(SlotPoolBase):
 
     def __init__(self, slot_size: int, num_slots: int):
         super().__init__(slot_size)
-        self._host_mem = HostMem(0)
-        self.resize(num_slots)
+        self._host_mem = HostMem(self.aligned_size(num_slots))
 
     @override
     def destroy(self):
@@ -112,7 +112,7 @@ class HostSlotPool(SlotPoolBase):
 
     @override
     def resize(self, new_num_slots: int) -> None:
-        self._host_mem.resize(new_num_slots * self.slot_size)
+        self._host_mem.resize(self.aligned_size(new_num_slots))
 
     @override
     def slot_address(self, slot: int) -> MemAddress:
@@ -122,6 +122,9 @@ class HostSlotPool(SlotPoolBase):
     @override
     def num_slots(self) -> int:
         return self._host_mem.size // self.slot_size
+
+    def aligned_size(self, num_slots: int) -> int:
+        return round_up(num_slots * self.slot_size, HostMem.ALIGNMENT)
 
 
 class DiskSlotPool(SlotPoolBase):
@@ -236,6 +239,7 @@ class SlotAllocator:
         self._occupied_mask = DynamicBitset(capacity)
         self._target_capacity = capacity
         self._overflow_slots = []
+        self._num_ready_overflow_slots = 0
 
     def __del__(self):
         assert (self._target_capacity == self._capacity
@@ -296,6 +300,8 @@ class SlotAllocator:
         return self._capacity
 
     def resize(self, new_num_slots: int) -> None:
+        if self._target_capacity != self._capacity:
+            self.cancel_scheduled_resize()
         assert self._check()
         if new_num_slots < self.num_slots and self._occupied_mask.any_set(
                 new_num_slots, self.num_slots):
@@ -317,6 +323,7 @@ class SlotAllocator:
             self._recycled_slots = new_recycled_slots
             self._num_ready_recycled_slots = new_num_ready_recycled_slots
             self._scrub_events()
+        self._target_capacity = self._capacity
         assert self._check()
 
     def schedule_resize(self, new_num_slots: int) -> None:
@@ -504,9 +511,10 @@ class GpuPoolGroup(PoolGroupBase):
         total_gpu_memory = query_total_gpu_memory()
         max_slot_size = max(slot_size_list)
         self._pools = tuple(
-            GpuSlotPool(slot_size,
-                        int(total_gpu_memory * slot_size /
-                            max_slot_size), shared_phys_mem_pool, num_slots)
+            GpuSlotPool(
+                slot_size,
+                round_down(int(total_gpu_memory * slot_size / max_slot_size),
+                           PhysMem.SIZE), shared_phys_mem_pool, num_slots)
             for slot_size in slot_size_list)
 
 
@@ -681,13 +689,22 @@ class CacheLevelStorage:
         ret = []
         # divide total_quota into pool groups based on init_ratio, then divide quote for each pool_group into pools based on slot_size.
         for slot_size_list, ratio in zip(slot_size_lists, ratio_list):
-            pool_group_quota = total_quota * ratio / sum_ratio
+            pool_group_quota = round_down(int(total_quota * ratio / sum_ratio),
+                                          pool_size_granularity)
+            num_grains = pool_group_quota // pool_size_granularity
             sum_slot_size = sum(slot_size_list)
             num_slots = min(
                 round_down(int(pool_group_quota *
                                (slot_size /
                                 sum_slot_size)), pool_size_granularity) //
                 slot_size for slot_size in slot_size_list)
+            for n in itertools.count(num_slots):
+                if sum(
+                        div_up(s * n, pool_size_granularity)
+                        for s in slot_size_list) <= num_grains:
+                    num_slots = n
+                else:
+                    break
             assert num_slots > 0, f"slot_size_list {slot_size_list} with ratio {ratio} is too small to fit in {total_quota} bytes"
             ret.append(num_slots)
         return tuple(ret)
@@ -724,8 +741,9 @@ class GpuCacheLevelStorage(CacheLevelStorage):
 
 
 class HostCacheLevelStorage(CacheLevelStorage):
-    __slots__ = ()
+    POOL_SIZE_GRANULARITY: ClassVar[int] = HostMem.ALIGNMENT
     TIER: ClassVar[CacheTier] = CacheTier.HOST_MEM
+    __slots__ = ()
 
     def __init__(self, total_quota: int,
                  slot_size_lists: Sequence[Sequence[int]],

@@ -2,32 +2,34 @@ import enum
 import warnings
 import weakref
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import Callable, Iterator, NewType, cast
+from typing import TYPE_CHECKING, Callable, Iterator, cast
 
-from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import (CopyTask,
-                                                                   batched_copy)
+from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
 
 from .._block_radix_tree import Block, UselessBlockError
-from .._common import (NDEBUG, BlockOrdinal, BlockOrdinalT, CacheLevel,
-                       CudaStream, LayerId, Priority, TokenIdExt)
+from .._common import (GPU_LEVEL, NDEBUG, BeamIndex, BlockOrdinal,
+                       BlockOrdinalT, CacheLevel, CudaStream, LayerId, Priority,
+                       TokenIdExt)
 from .._config import DataRole
 from .._exceptions import LogicError, OutOfPagesError
 from .._life_cycle_registry import LifeCycle, LifeCycleId
 from .._page import (CommittedPage, UncommittedPage, _PageHolder,
                      _SharedPageLock, batched_lock_to_gpu)
-from .._storage_manager import GPU_LEVEL, StorageManager
+from .._storage_manager import StorageManager
 from .._utils import (CachedCudaEvent, TemporaryCudaStream, TypedIndexList,
                       div_up, expect_type, filled_list, find_index,
                       get_uniform_attribute, map_optional, not_implemented,
                       stream_wait_events, to_typed, typed_enumerate, typed_len,
                       typed_map, typed_range, unwrap_optional, unwrap_weakref,
                       value_or)
-from ._kv_cache_manager import KVCacheManager
+
+if TYPE_CHECKING:
+    from ._kv_cache_manager import KVCacheManager
 
 BlockPage = _SharedPageLock | _PageHolder | None
-BeamIndex = NewType("BeamIndex", int)
 
 
 @dataclass(slots=True)
@@ -66,7 +68,7 @@ class _KVCache:
     __slots__ = ('_manager', '_lora_task_id', '_get_priority', '_cuda_stream',
                  '_status', '_beam_width', '_capacity', '_history_length',
                  '_commit_state', '_blocks', '_committed_tokens',
-                 '_real_num_committed_blocks', '_finish_event')
+                 '_num_committed_blocks', '_finish_event', '__weakref__')
 
     class Status(enum.Enum):
         ACTIVE = enum.auto()
@@ -80,10 +82,10 @@ class _KVCache:
         # user called stop_committing() or close()
         USER_STOP = enum.auto()
 
-    _manager: weakref.ref[KVCacheManager]
+    _manager: weakref.ref['KVCacheManager']
     _lora_task_id: int | None
     _get_priority: Callable[[BlockOrdinal, LifeCycle], Priority]
-    _cuda_stream: CudaStream
+    _cuda_stream: CudaStream | None
     _status: Status
     _beam_width: BeamIndex
     _capacity: int
@@ -97,15 +99,14 @@ class _KVCache:
     # set when switch away from ACTIVE, cleared when switching to ACTIVE.
     _finish_event: CachedCudaEvent | None
 
-    def __init__(self, manager: KVCacheManager, stream: CudaStream,
-                 lora_task_id: int | None,
+    def __init__(self, manager: 'KVCacheManager', lora_task_id: int | None,
                  input_tokens: Sequence[TokenIdExt] | None,
                  custom_priority_callback: Callable[[BlockOrdinal, LifeCycle],
-                                                    Priority], suspended: bool):
+                                                    Priority]):
         self._manager = weakref.ref(manager)
         self._lora_task_id = lora_task_id
         self._get_priority = custom_priority_callback
-        self._cuda_stream = stream
+        self._cuda_stream = None
         self._status = self.Status.SUSPENDED
         self._beam_width = BeamIndex(1)
         self._capacity = 0
@@ -118,23 +119,24 @@ class _KVCache:
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
         assert NDEBUG or self._check_sanity()
-        if not suspended:
-            self.resume()
 
     @property
-    def manager(self) -> KVCacheManager:
+    def manager(self) -> 'KVCacheManager':
         return unwrap_weakref(self._manager)
 
     @property
     def cuda_stream(self) -> CudaStream:
-        return self._cuda_stream
+        return unwrap_optional(self._cuda_stream)
 
     @cuda_stream.setter
     def cuda_stream(self, cuda_stream: CudaStream):
-        if self.is_active:
-            CachedCudaEvent(self._cuda_stream).wait_in_stream(cuda_stream)
+        if self._cuda_stream is not None:
+            if self.is_active:
+                CachedCudaEvent(self._cuda_stream).wait_in_stream(cuda_stream)
+            else:
+                self.finish_event.wait_in_stream(cuda_stream)
         else:
-            self.finish_event.wait_in_stream(cuda_stream)
+            assert self.status == self.Status.SUSPENDED and self._finish_event is None
         self._cuda_stream = cuda_stream
 
     @property
@@ -286,8 +288,10 @@ class _KVCache:
         num_committed_blocks = self._num_committed_blocks
         new_num_full_blocks = BlockOrdinal(self.num_committed_tokens //
                                            self.tokens_per_block)
-        for ordinal in typed_range(num_committed_blocks, new_num_full_blocks):
-            self._commit_block(ordinal, False)
+        with self._record_event():
+            for ordinal in typed_range(num_committed_blocks,
+                                       new_num_full_blocks):
+                self._commit_block(ordinal, False)
         if self.history_length < self.num_committed_tokens:
             self.history_length = self.num_committed_tokens
 
@@ -309,7 +313,8 @@ class _KVCache:
         assert self._commit_state == self.CommitState.ALLOWED
         if self.num_committed_tokens % self.tokens_per_block != 0:
             ordinal = self._to_block_ordinal(self.num_committed_tokens)
-            self._commit_block(ordinal, True)
+            with self._record_event():
+                self._commit_block(ordinal, True)
         warnings.warn(
             "[KVCacheManager] Not Implemented: check if the last committed pages are usable, in case some prior pages are already dropped. For SWA, this can be done only when we stop committing."
         )
@@ -318,19 +323,25 @@ class _KVCache:
     # Suspend, allow the KV cache manager to evict buffers from GPU, but don't drop them.
     # suspend+resume allows us to implement dynamic batch size. May also be used to support HSTU model.
     def suspend(self):
+        assert self.status == self.Status.ACTIVE
         assert self._check_sanity()
         assert self._finish_event is None
-        self._finish_event = CachedCudaEvent(self.cuda_stream)
-        for ordinal, beam_idx, lc_idx in self._active_pages():
-            beam_block = self._block(ordinal, beam_idx)
-            holder = expect_type(_SharedPageLock, beam_block[lc_idx]).holder
-            # after this assignment, __del__ of the original _SharedPageLock will use self.finish_event to indicate end of usage for the page.
-            beam_block[lc_idx] = holder
+        # used by _SharedPageLock.__del__
+        with self._record_event():
+            for ordinal, beam_idx, lc_idx in self._active_pages():
+                beam_block = self._block(ordinal, beam_idx)
+                holder = expect_type(_SharedPageLock, beam_block[lc_idx]).holder
+                # after this assignment, __del__ of the original _SharedPageLock will use self.finish_event to indicate end of usage for the page.
+                beam_block[lc_idx] = holder
+        self._status = self.Status.SUSPENDED
 
     # Resume, migrate buffers to GPU memory.
-    def resume(self) -> bool:
-        assert self._finish_event is not None
-        self._finish_event = None
+    def resume(self, cuda_stream: CudaStream | None = None) -> bool:
+        assert self.status == self.Status.SUSPENDED
+        if cuda_stream is not None:
+            self.cuda_stream = cuda_stream
+        assert self._cuda_stream is not None, "cuda_stream is never set"
+        assert self._finish_event is None
         pages = []
         for ordinal, beam_idx, lc_idx in self._active_pages():
             beam_block = self._block(ordinal, beam_idx)
@@ -346,6 +357,7 @@ class _KVCache:
             page = expect_type(_PageHolder, beam_block[lc_idx]).page
             assert page is lock.page
             beam_block[lc_idx] = lock
+        self._status = self.Status.ACTIVE
         return True
 
     def _active_pages(
@@ -396,7 +408,7 @@ class _KVCache:
     def _commit_block(self, ordinal: BlockOrdinal, is_last: bool):
         'Commit the block for reuse. Block must be full of tokens except for the last block.'
         assert self._commit_state == self.CommitState.ALLOWED
-        assert ordinal == self._num_committed_blocks
+        assert ordinal == self._num_committed_blocks or self._commit_state != self.CommitState.ALLOWED
         seq_block = self._blocks[ordinal]
         assert typed_len(seq_block.pages) == 1, 'Must have 1 beam only'
         beam_idx = BeamIndex(0)
@@ -435,7 +447,7 @@ class _KVCache:
                                         skip_wait=True) if locked else p.hold()
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
-            self._num_committed_blocks = ordinal
+            self._num_committed_blocks = BlockOrdinal(ordinal + 1)
         elif tree_block.is_full and self.manager.allow_seq_rebasing:
             # try to replace our pages with pages from the existing block.
             reuse_list = list[tuple[LifeCycleId, CommittedPage]]()
@@ -460,7 +472,7 @@ class _KVCache:
                 beam_block[lc] = lock
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
-            self._num_committed_blocks = ordinal
+            self._num_committed_blocks = BlockOrdinal(ordinal + 1)
         else:
             # We can't commit and can't reuse existing block. Just stop committing.
             self._commit_state = self.CommitState.VIRTUAL_STOP
@@ -487,23 +499,24 @@ class _KVCache:
         self, new_history_length: int
     ) -> list[tuple[BlockOrdinal, BeamIndex, LifeCycleId, _PageHolder]]:
         'For SWA layers, unlock out-of-window blocks.'
-        ret = list[tuple[BlockOrdinal, BeamIndex, LifeCycleId, _PageHolder]]()
-        for lc_idx, lc in self.manager._life_cycles.items():
-            if lc.window_size is None:
-                continue
-            # +1 because the next input token will be in the window.
-            get_end = lambda l: self._get_stale_range(l, lc)[1]
-            old_end = get_end(self.history_length)
-            new_end = get_end(new_history_length)
-            for ordinal in typed_range(old_end, new_end):
-                block = self._blocks[ordinal]
-                is_committed = block.is_committed
-                hold_for_commit = not is_committed and self._commit_state == self.CommitState.ALLOWED
-                for beam_idx, beam_block in typed_enumerate(block.pages):
-                    holder = expect_type(_SharedPageLock,
-                                         beam_block[lc_idx]).holder
-                    ret.append((ordinal, beam_idx, lc_idx, holder))
-                    beam_block[lc_idx] = holder if hold_for_commit else None
+        with self._record_event():
+            ret = list[tuple[BlockOrdinal, BeamIndex, LifeCycleId,
+                             _PageHolder]]()
+            for lc_idx, lc in self.manager._life_cycles.items():
+                if lc.window_size is None:
+                    continue
+                old_beg, old_end = self._get_stale_range(
+                    self.history_length, lc)
+                new_beg, new_end = self._get_stale_range(new_history_length, lc)
+                for ordinal in typed_range(max(old_end, new_beg), new_end):
+                    block = self._blocks[ordinal]
+                    is_committed = block.is_committed
+                    hold_for_commit = not is_committed and self._commit_state == self.CommitState.ALLOWED
+                    for beam_idx, beam_block in typed_enumerate(block.pages):
+                        holder = expect_type(_SharedPageLock,
+                                             beam_block[lc_idx]).holder
+                        ret.append((ordinal, beam_idx, lc_idx, holder))
+                        beam_block[lc_idx] = holder if hold_for_commit else None
         return ret
 
     def _lock_held_blocks(self,
@@ -554,9 +567,8 @@ class _KVCache:
 
     def _check_sanity(self) -> bool:
         is_closed = self.status == self.Status.CLOSED
-        assert is_closed == (len(self._blocks) == 0)
         if is_closed:
-            return True
+            return len(self._blocks) == 0
         assert (self.num_committed_tokens <= self.history_length <=
                 self.capacity)
         assert len(self._blocks) == div_up(self.capacity, self.tokens_per_block)
@@ -702,9 +714,9 @@ class _KVCache:
                                                        page.slot_id, p)
                             batched_copy(dst_tier, src_tier, slot_size[i],
                                          [CopyTask(dst, src)], stream.get())
-                            ready_event = CachedCudaEvent(stream)
-                            page.ready_event = ready_event
-                            slot.ready_event = ready_event
+                    ready_event = stream.take_finish_event()
+                    page.ready_event = ready_event
+                    slot.ready_event = ready_event
                     block[lc_idx] = UncommittedPage(self, ordinal, lc_idx, lvl,
                                                     slot, beam_idx).hold()
                     break  # success
@@ -718,3 +730,12 @@ class _KVCache:
         # drop the last block first
         while self._blocks:
             self._blocks.pop()
+
+    @contextmanager
+    def _record_event(self) -> Iterator[None]:
+        assert self._finish_event is None
+        self._finish_event = CachedCudaEvent(self.cuda_stream)
+        try:
+            yield
+        finally:
+            self._finish_event = None

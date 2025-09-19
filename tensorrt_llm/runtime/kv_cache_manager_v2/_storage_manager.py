@@ -1,12 +1,16 @@
 import os
 import warnings
 import weakref
-from typing import Iterator, Sequence, cast
+from typing import TYPE_CHECKING, Iterator, Sequence, cast
 
-from ._common import NDEBUG, Address, CacheLevel, CacheTier, LayerId
+from ._common import (GPU_LEVEL, NDEBUG, Address, CacheLevel, CacheTier,
+                      LayerId, MemAddress)
 from ._config import CacheTierConfig, DataRole, DiskCacheTierConfig
 from ._copy_engine import CopyTask, batched_copy
-from ._core._kv_cache_manager import KVCacheManager
+
+if TYPE_CHECKING:
+    from ._core._kv_cache_manager import KVCacheManager
+
 from ._eviction_controller import (EvictablePage, PageStatus,
                                    PerLevelEvictionController)
 from ._exceptions import OutOfPagesError
@@ -72,18 +76,17 @@ class CacheLevelManager:
             raise ValueError(f"Invalid cache tier: {config.tier}")
 
 
-GPU_LEVEL = CacheLevel(0)
-
-
 class StorageManager:
-    __slots__ = ('_parent', '_buffer_attr', '_life_cycle_grouping', '_levels')
-    _parent: weakref.ref[KVCacheManager]
+    __slots__ = ('_parent', '_buffer_attr', '_life_cycle_grouping', '_levels',
+                 '__weakref__')
+    _parent: weakref.ref['KVCacheManager']
     _buffer_attr: dict[BufferId, BufferAttr]
     _life_cycle_grouping: dict[LifeCycleId, PoolGroupIndex]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
 
-    def __init__(self, parent: KVCacheManager, config: StorageConfig):
-        assert config.cache_tiers[GPU_LEVEL].tier == CacheTier.GPU_MEM
+    def __init__(self, parent: 'KVCacheManager', config: StorageConfig):
+        assert config.cache_tiers[
+            GPU_LEVEL].tier == CacheTier.GPU_MEM, "The first cache tier must be GPU memory"
         self._parent = weakref.ref(parent)
         self._buffer_attr = config.buffer_attributes()
         self._life_cycle_grouping = config.life_cycle_grouping()
@@ -135,7 +138,7 @@ class StorageManager:
         return cast(TypedIndexList[LifeCycleId, HomoTuple[Slot]], ret)
 
     @property
-    def kv_cache_manager(self) -> KVCacheManager:
+    def kv_cache_manager(self) -> 'KVCacheManager':
         return unwrap_weakref(self._parent)
 
     @property
@@ -288,7 +291,7 @@ class StorageManager:
                 for pool_idx, tasks in enumerate(tasks_per_pool):
                     batched_copy(dst_tier, src_tier, slot_sizes[pool_idx],
                                  tasks, stream.get())
-                finish_event = stream.finish()
+            finish_event = stream.take_finish_event()
             for src, dst in zip(src_pages, dst_slots):
                 dst.ready_event = finish_event
                 src.ready_event = finish_event  # compulsory for the next owner getting this slot from the pool.
@@ -328,12 +331,12 @@ class StorageManager:
         self._levels[page.cache_level].controller.remove(page.node_ref)
 
     def get_mem_pool_base_address(self, layer_id: LayerId,
-                                  data_role: DataRole) -> int:
+                                  data_role: DataRole) -> MemAddress:
         storage = self._levels[GPU_LEVEL].storage
         attr = self.get_buffer_attr(layer_id, data_role)
         pool_group_index = self.get_pool_group_index(attr.life_cycle_id)
         return cast(
-            int,
+            MemAddress,
             storage.slot_address(pool_group_index, attr.pool_index, SlotId(0)))
 
     def get_page_indices(self, layer_id: LayerId, data_role: DataRole,

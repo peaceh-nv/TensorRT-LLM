@@ -1,4 +1,4 @@
-from typing import Iterator, NamedTuple, NewType
+from typing import Iterator, NamedTuple, NewType, cast
 
 from ._common import SlidingWindowSize
 from ._config import KVCacheManagerConfig
@@ -20,11 +20,13 @@ LifeCycleId = NewType("LifeCycleId", int)
 
 
 class LifeCycleRegistry:
-    __slots__ = ('_life_cycle_list', '_life_cycle_id_dict')
+    __slots__ = ('_life_cycle_list', '_life_cycle_id_dict', '__weakref__')
     _life_cycle_list: TypedIndexList[LifeCycleId, LifeCycle]
     _life_cycle_id_dict: dict[LifeCycle, LifeCycleId]
 
     def __init__(self, config: KVCacheManagerConfig):
+        self._life_cycle_list = cast(TypedIndexList[LifeCycleId, LifeCycle], [])
+        self._life_cycle_id_dict = dict[LifeCycle, LifeCycleId]()
         for layer in config.layers:
             details = LifeCycle.make(layer.window_size, layer.num_sink_tokens,
                                      config.tokens_per_block)

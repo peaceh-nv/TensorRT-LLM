@@ -2,16 +2,20 @@ import warnings
 import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from ._block_radix_tree import Block
-from ._common import BlockOrdinal, CacheLevel, Priority, TokenIdExt
-from ._core._kv_cache import BeamIndex, _KVCache
+from ._common import (GPU_LEVEL, BeamIndex, BlockOrdinal, CacheLevel, Priority,
+                      TokenIdExt)
+
+if TYPE_CHECKING:
+    from ._core._kv_cache import _KVCache
+    from ._storage_manager import StorageManager
+
 from ._eviction_controller import EvictionPolicy, PageStatus
 from ._exceptions import LogicError
 from ._life_cycle_registry import LifeCycleId
 from ._storage._core import Slot
-from ._storage_manager import GPU_LEVEL, StorageManager
 from ._utils import (CachedCudaEvent, get_uniform_attribute, merge_events,
                      partition, stream_wait_events, unwrap_weakref)
 
@@ -20,13 +24,13 @@ from ._utils import (CachedCudaEvent, get_uniform_attribute, merge_events,
 # So we prefer inheritance over composition to save some memory.
 @dataclass(slots=True)
 class Page(Slot):
-    _manager: weakref.ref[StorageManager]
+    _manager: weakref.ref['StorageManager']
     life_cycle: LifeCycleId
     cache_level: CacheLevel
     _priority: Priority
     # _holder is either None or a valid weakref.
-    _holder: weakref.ref['_PageHolder'] | None = field(default=None)
-    node_ref: EvictionPolicy.NodeRef | None = field(default=None)
+    _holder: weakref.ref['_PageHolder'] | None
+    node_ref: EvictionPolicy.NodeRef | None
 
     def __del__(self):
         assert self.status == PageStatus.DROPPABLE
@@ -36,7 +40,7 @@ class Page(Slot):
             assert not self.has_valid_slot
 
     @property
-    def manager(self) -> StorageManager:
+    def manager(self) -> 'StorageManager':
         return unwrap_weakref(self._manager)
 
     @property
@@ -58,7 +62,7 @@ class Page(Slot):
 
     # Prevent eviction. You need to migrate the page to GPU later.
     def lock(self,
-             kv_cache: _KVCache,
+             kv_cache: '_KVCache',
              skip_wait: bool = False) -> '_SharedPageLock':
         'If skip wait, you are responsible for making the page ready in kv_cache.cuda_stream.'
         return self.hold().lock(kv_cache, skip_wait)
@@ -82,50 +86,35 @@ class Page(Slot):
         raise LogicError("Unexpected call to this implementation.")
 
 
-# @TODO: may be unnecessary. Consider removing.
 @dataclass(slots=True)
-class UncommittedPageKey:
+class UncommittedPage(Page):
     #@TODO: consider move this to _PageHolder
-    kv_cache: weakref.ref[_KVCache]
+    kv_cache: weakref.ref['_KVCache']
     ordinal: BlockOrdinal
-    life_cycle: LifeCycleId
     beam_index: BeamIndex
+
+    tokens: list[TokenIdExt] = field(default_factory=list)
 
     @staticmethod
     def is_committed() -> bool:
         return False
 
-
-@dataclass(slots=True)
-class CommittedPageKey:
-    #@TODO: consider move this to _PageHolder
-    block: weakref.ref['Block']
-    life_cycle: LifeCycleId
-
-    @staticmethod
-    def is_committed() -> bool:
-        return True
-
-
-@dataclass(slots=True)
-class UncommittedPage(UncommittedPageKey, Page):
-    tokens: list[TokenIdExt] = []
-
     def __init__(self,
-                 kv_cache: _KVCache,
+                 kv_cache: '_KVCache',
                  ordinal: BlockOrdinal,
                  life_cycle: LifeCycleId,
                  cache_level: CacheLevel,
                  slot: Slot,
                  beam_index: BeamIndex = BeamIndex(0)):
-        UncommittedPageKey.__init__(self, weakref.ref(kv_cache), ordinal,
-                                    life_cycle, beam_index)
+        self.kv_cache = weakref.ref(kv_cache)
+        self.ordinal = ordinal
+        self.beam_index = beam_index
         manager = kv_cache.manager
         priority = kv_cache._get_priority(
             ordinal, manager._life_cycles.get_life_cycle(life_cycle))
         Page.__init__(self, slot.slot_id, slot.ready_event,
                       weakref.ref(manager._storage), life_cycle, cache_level,
-                      priority)
+                      priority, None, None)
 
     def convert_to_committed(self, block: Block) -> 'CommittedPage':
         'Moves the slot to a new committed page and add the new page to the block. The uncommitted page becomes invalid.'
@@ -141,20 +130,29 @@ class UncommittedPage(UncommittedPageKey, Page):
         return committed_page
 
     def __del__(self):
-        assert unwrap_weakref(self.kv_cache)._blocks[self.ordinal].pages[
-            self.beam_index][self.life_cycle] is None
+        check_page = lambda p: p is None or isinstance(p.page, CommittedPage)
+        assert check_page(
+            unwrap_weakref(self.kv_cache)._blocks[self.ordinal].pages[
+                self.beam_index][self.life_cycle])
         Page.__del__(self)
 
 
-@dataclass(slots=True)
-class CommittedPage(CommittedPageKey, Page):
+@dataclass(slots=True, weakref_slot=True)
+class CommittedPage(Page):
+    #@TODO: consider move this to _PageHolder
+    block: weakref.ref['Block']
 
-    def __init__(self, storage: StorageManager, block: Block,
+    @staticmethod
+    def is_committed() -> bool:
+        return True
+
+    def __init__(self, storage: 'StorageManager', block: Block,
                  life_cycle: LifeCycleId, cache_level: CacheLevel, slot: Slot,
                  priority: Priority):
-        CommittedPageKey.__init__(self, weakref.ref(block), life_cycle)
+        self.block = weakref.ref(block)
         Page.__init__(self, slot.slot_id, slot.ready_event,
-                      weakref.ref(storage), life_cycle, cache_level, priority)
+                      weakref.ref(storage), life_cycle, cache_level, priority,
+                      None, None)
 
     def __del__(self):
         block = unwrap_weakref(self.block)
@@ -168,7 +166,7 @@ class CommittedPage(CommittedPageKey, Page):
         Page.__del__(self)
 
 
-@dataclass(slots=True, init=False)
+@dataclass(slots=True, init=False, weakref_slot=True)
 class _PageHolder:
     'Prevents pages from being dropped.'
     page: Page
@@ -195,7 +193,7 @@ class _PageHolder:
 
     # Prevent eviction. You need to migrate the page to GPU later.
     def lock(self,
-             kv_cache: _KVCache,
+             kv_cache: '_KVCache',
              skip_wait: bool = False) -> '_SharedPageLock':
         if self._lock is None:
             lock = object.__new__(_UniqPageLock)
@@ -210,7 +208,7 @@ class _PageHolder:
         return lock.share(kv_cache, skip_wait)
 
 
-@dataclass(slots=True, init=False)
+@dataclass(slots=True, init=False, weakref_slot=True)
 class _UniqPageLock:
     'Locks pages to prevent eviction.'
     holder: _PageHolder
@@ -224,8 +222,10 @@ class _UniqPageLock:
         if holder.page.cache_level != CacheLevel(0):
             raise ValueError("Lock can be applied only on GPU memory pages.")
         self.holder = holder
+        self.finish_events = []
+        self.users = weakref.WeakSet()
 
-    def share(self, kv_cache: _KVCache, skip_wait) -> '_SharedPageLock':
+    def share(self, kv_cache: '_KVCache', skip_wait) -> '_SharedPageLock':
         ret = _SharedPageLock(self, kv_cache, skip_wait)
         self.users.add(ret)
         return ret
@@ -246,10 +246,10 @@ class _UniqPageLock:
             page.manager.schedule_for_eviction(page)
 
 
-@dataclass(slots=True, init=False)
+@dataclass(slots=True, init=False, weakref_slot=True)
 class _SharedPageLock:
     _uniq_lock: _UniqPageLock
-    _user: weakref.ref[_KVCache]
+    _user: weakref.ref['_KVCache']
 
     @property
     def page(self) -> Page:
@@ -259,7 +259,13 @@ class _SharedPageLock:
     def holder(self) -> _PageHolder:
         return self._uniq_lock.holder
 
-    def __init__(self, uniq_lock: _UniqPageLock, user: _KVCache,
+    def __hash__(self):
+        return hash(id(self))
+
+    def __eq__(self, other):
+        return self is other
+
+    def __init__(self, uniq_lock: _UniqPageLock, user: '_KVCache',
                  skip_wait: bool):
         self._uniq_lock = uniq_lock
         if not skip_wait:
@@ -271,10 +277,12 @@ class _SharedPageLock:
             unwrap_weakref(self._user).finish_event)
 
 
-def batched_lock_to_gpu(kv_cache: _KVCache,
-                        pages: Sequence[Page]) -> list[_SharedPageLock]:
+def batched_lock_to_gpu(kv_cache: '_KVCache',
+                        pages: Sequence[Page]) -> list['_SharedPageLock']:
     'Lock pages after migrating all pages to GPU. If migration fails, no locking happens.'
-    storage = get_uniform_attribute(pages, lambda p: p.manager)
+    storage = kv_cache.manager._storage
+    assert not pages or storage is get_uniform_attribute(
+        pages, lambda p: p.manager)
     partitioned = partition(
         pages, lambda p:
         (p.cache_level, storage.get_pool_group_index(p.life_cycle)))
