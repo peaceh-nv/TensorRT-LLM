@@ -7,8 +7,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import ClassVar, NewType, final, override
 
-from .._common import (BAD_FILE_DESCRIPTOR, Address, CacheTier, DiskAddress,
-                       FileDescriptor, MemAddress)
+from .._common import (BAD_FILE_DESCRIPTOR, NDEBUG, Address, CacheTier,
+                       DiskAddress, FileDescriptor, MemAddress)
 from .._cuda_virt_mem import PhysMem, PooledPhysMemAllocator, VirtMem
 from .._exceptions import LogicError, OutOfPagesError, ResourceBusyError
 from .._utils import (CachedCudaEvent, DynamicBitset, HomoTuple, HostMem,
@@ -200,6 +200,11 @@ class Slot:
     def has_valid_slot(self) -> bool:
         return self._slot_id is not None
 
+    def move_to_new_slot(self) -> 'Slot':
+        ret = Slot(None, CachedCudaEvent.NULL)
+        ret.set_slot(self)
+        return ret
+
     def set_slot(self, slot: 'Slot'):
         if self.has_valid_slot:
             raise LogicError("Slot is already set.")
@@ -263,7 +268,9 @@ class SlotAllocator:
         self._scrub_events()
         # prefererence: ready recycled slots > new slots > recycled slots that are not ready
         if self._num_ready_recycled_slots > 0:
+            assert self._recycled_slots
             slot = self._recycled_slots.popleft()
+            assert slot.has_valid_slot
             self._num_ready_recycled_slots -= 1
             assert slot.ready_event is CachedCudaEvent.NULL
         elif self._num_active_slots < self.num_slots:
@@ -271,6 +278,7 @@ class SlotAllocator:
             self._num_active_slots += 1
         else:
             slot = self._recycled_slots.popleft()
+            assert slot.has_valid_slot
         self._occupied_mask.set(slot.slot_id)
         return slot
 
@@ -281,9 +289,12 @@ class SlotAllocator:
         return tuple(self.allocate() for _ in range(num_slots))
 
     def release(self, slot: Slot):
+        assert slot.has_valid_slot
+        slot = slot.move_to_new_slot()
         if slot.slot_id >= self._capacity or not self._occupied_mask.get(
                 slot.slot_id):
             raise LogicError(f"Slot {slot.slot_id} is not occupied")
+        assert type(slot) is Slot and slot.has_valid_slot
         if slot.slot_id < self._target_capacity:
             self._recycled_slots.append(slot)
         else:
@@ -292,8 +303,6 @@ class SlotAllocator:
         self._occupied_mask.clear(slot.slot_id)
         self._scrub_events()
         assert self._check()
-        slot._slot_id = None
-        slot.ready_event = CachedCudaEvent.NULL
 
     @property
     def num_slots(self) -> int:
@@ -303,18 +312,21 @@ class SlotAllocator:
         if self._target_capacity != self._capacity:
             self.cancel_scheduled_resize()
         assert self._check()
+        old_num_slots = self.num_slots
         if new_num_slots < self.num_slots and self._occupied_mask.any_set(
                 new_num_slots, self.num_slots):
             raise ResourceBusyError("resize cannot remove occupied slots")
         self._occupied_mask.resize(new_num_slots)
         self._capacity = new_num_slots
-        self._num_active_slots = min(self._num_active_slots, self._capacity)
-        if new_num_slots < self._capacity:
+        self._num_active_slots = min(self._num_active_slots, new_num_slots)
+        if new_num_slots < old_num_slots:
             new_recycled_slots = deque[Slot]()
             new_num_ready_recycled_slots = 0
             for idx_recycled, slot in enumerate(self._recycled_slots):
+                assert type(slot) is Slot and slot.has_valid_slot
                 if slot.slot_id >= new_num_slots:
                     slot.ready_event.synchronize()
+                    slot._slot_id = None
                     slot.ready_event = CachedCudaEvent.NULL
                 else:
                     new_recycled_slots.append(slot)
@@ -324,10 +336,10 @@ class SlotAllocator:
             self._num_ready_recycled_slots = new_num_ready_recycled_slots
             self._scrub_events()
         self._target_capacity = self._capacity
-        assert self._check()
+        assert NDEBUG or self._check()
 
     def schedule_resize(self, new_num_slots: int) -> None:
-        assert self._check()
+        assert NDEBUG or self._check()
         if new_num_slots >= self.num_slots:
             self.cancel_scheduled_resize()
             self.resize(new_num_slots)
@@ -347,10 +359,10 @@ class SlotAllocator:
         self._target_capacity = new_num_slots
         self._try_trigger_shrink()
         self._scrub_events()
-        assert self._check()
+        assert NDEBUG or self._check()
 
     def cancel_scheduled_resize(self) -> None:
-        assert self._check()
+        assert NDEBUG or self._check()
         self._target_capacity = self._capacity
         self._recycled_slots.extend(
             remove_if(self._overflow_slots, lambda slot: True))
@@ -367,7 +379,7 @@ class SlotAllocator:
             if self._occupied_mask.get(id))
 
     def _try_trigger_shrink(self) -> bool:
-        assert self._check()
+        assert NDEBUG or self._check()
         if self.shrink_in_progress() and self._target_capacity + len(
                 self._overflow_slots) == self._capacity:
             assert len(set(s.slot_id for s in self._overflow_slots)) == len(
@@ -380,7 +392,7 @@ class SlotAllocator:
             self._capacity = self._target_capacity
             self._num_active_slots = min(self._num_active_slots, self._capacity)
             self._scrub_events()
-            assert self._check()
+            assert NDEBUG or self._check()
             return True
         return False
 

@@ -112,9 +112,10 @@ class UncommittedPage(Page):
         manager = kv_cache.manager
         priority = kv_cache._get_priority(
             ordinal, manager._life_cycles.get_life_cycle(life_cycle))
-        Page.__init__(self, slot.slot_id, slot.ready_event,
+        Page.__init__(self, None, CachedCudaEvent.NULL,
                       weakref.ref(manager._storage), life_cycle, cache_level,
                       priority, None, None)
+        self.set_slot(slot)
 
     def convert_to_committed(self, block: Block) -> 'CommittedPage':
         'Moves the slot to a new committed page and add the new page to the block. The uncommitted page becomes invalid.'
@@ -150,9 +151,9 @@ class CommittedPage(Page):
                  life_cycle: LifeCycleId, cache_level: CacheLevel, slot: Slot,
                  priority: Priority):
         self.block = weakref.ref(block)
-        Page.__init__(self, slot.slot_id, slot.ready_event,
-                      weakref.ref(storage), life_cycle, cache_level, priority,
-                      None, None)
+        Page.__init__(self, None, CachedCudaEvent.NULL, weakref.ref(storage),
+                      life_cycle, cache_level, priority, None, None)
+        self.set_slot(slot)
 
     def __del__(self):
         block = unwrap_weakref(self.block)

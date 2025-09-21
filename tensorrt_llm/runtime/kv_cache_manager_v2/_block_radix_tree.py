@@ -71,7 +71,16 @@ Child = TypeVar('Child', bound='Block | RootBlock')
 Children = dict[BlockKey, Child]
 
 
-def remove_subtree(root: 'RootBlock | Block'):
+def get_tree(block: 'RootBlock | Block') -> 'BlockRadixTree':
+    node = block
+    while not isinstance(node, BlockRadixTree):
+        node = node.prev
+    return node
+
+
+def remove_subtree(
+        root: 'RootBlock | Block',
+        yield_pages: bool = False) -> Iterator[weakref.ref['CommittedPage']]:
     # taking O(1) space
     # remove leaf blocks one by one, in post-order
     block: 'RootBlock | Block' = root
@@ -79,8 +88,12 @@ def remove_subtree(root: 'RootBlock | Block'):
         if block.next:
             block = next(iter(block.next.values()))
         else:
-            assert (isinstance(block, RootBlock)
-                    or not block.storage), "Storage is not cleared, yet"
+            if yield_pages and isinstance(block, Block):
+                yield from (page for page in block.storage if page is not None)
+                block.storage = filled_list(None, block.num_life_cycles)
+            assert (isinstance(block, RootBlock) or all(
+                page is None
+                for page in block.storage)), "Storage is not cleared, yet"
             prev_block: Block | RootBlock | BlockRadixTree = block.prev
             prev_block.next.pop(block.key)
             if block is root:
@@ -165,7 +178,7 @@ class RootBlock:
     next: Children['Block']
 
     def __init__(self, lora_task_id: int | None, prev: 'BlockRadixTree'):
-        self.key = Hasher(lora_task_id).digest
+        self.key = self.make_key(lora_task_id)
         assert self.key not in prev.next, "Root block already exists"
         self._prev = weakref.ref(prev)
         self.next = {}
@@ -186,6 +199,10 @@ class RootBlock:
     @property
     def tokens_per_block(self) -> int:
         return self.prev.tokens_per_block
+
+    @staticmethod
+    def make_key(lora_task_id: int | None) -> BlockKey:
+        return Hasher(lora_task_id).digest
 
 
 class Block:
@@ -300,10 +317,10 @@ class BlockRadixTree:
         self.next = {}
 
     def add_or_get_existing(self, lora_task_id: int | None) -> RootBlock:
-        try:
-            return RootBlock(lora_task_id, self)
-        except DuplicateKeyError as e:
-            return self.next[e.key]
+        key = RootBlock.make_key(lora_task_id)
+        if key in self.next:
+            return self.next[key]
+        return RootBlock(lora_task_id, self)
 
     @property
     def tokens_per_block(self) -> int:
@@ -317,11 +334,15 @@ class BlockRadixTree:
     def num_life_cycles(self) -> LifeCycleId:
         return self.life_cycles.size
 
-    def clear(self):
+    def clear(
+            self,
+            yield_pages: bool = False
+    ) -> Iterator[weakref.ref['CommittedPage']]:
         # taking O(1) space
         # remove leaf blocks one by one, in post-order
-        for block in self.next.values():
-            remove_subtree(block)
+        while self.next:
+            block = next(iter(self.next.values()))
+            yield from remove_subtree(block, yield_pages)
         assert not self.next
 
     # yields tuples of (block, num_matched_tokens). num_matched_tokens should be equal to tokens_per_block except the last one.

@@ -7,17 +7,17 @@ from dataclasses import dataclass
 from itertools import chain
 from typing import TYPE_CHECKING, Callable, Iterator, cast
 
-from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
-
 from .._block_radix_tree import Block, UselessBlockError
 from .._common import (GPU_LEVEL, NDEBUG, BeamIndex, BlockOrdinal,
                        BlockOrdinalT, CacheLevel, CudaStream, LayerId, Priority,
                        TokenIdExt)
 from .._config import DataRole
+from .._copy_engine import CopyTask, batched_copy
 from .._exceptions import LogicError, OutOfPagesError
 from .._life_cycle_registry import LifeCycle, LifeCycleId
 from .._page import (CommittedPage, UncommittedPage, _PageHolder,
                      _SharedPageLock, batched_lock_to_gpu)
+from .._storage._config import BufferId
 from .._storage_manager import StorageManager
 from .._utils import (CachedCudaEvent, TemporaryCudaStream, TypedIndexList,
                       div_up, expect_type, filled_list, find_index,
@@ -93,6 +93,10 @@ class _KVCache:
     _commit_state: CommitState
 
     _blocks: TypedIndexList[BlockOrdinal, SeqBlock]
+    # we maintain _page_indices to accelerate the get_page_indices() API. In principle it can be computed on the fly, but that would be slow due to python.
+    _page_indices: TypedIndexList[BeamIndex, dict[BufferId,
+                                                  TypedIndexList[BlockOrdinal,
+                                                                 int]]]
     _committed_tokens: list[TokenIdExt]
     # Sometimes we can't commit a block because all its tokens are already covered by another block in the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric difference, 2. if our block is a partial block, we can't write to memory of the other blocks. Internally, we stop committing from such a block, but still give user an illusion that the block is committed.
     _num_committed_blocks: BlockOrdinal
@@ -116,6 +120,9 @@ class _KVCache:
         self._committed_tokens = []
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
+        self._page_indices = filled_list(
+            dict[BufferId, TypedIndexList[BlockOrdinal, int]](),
+            self.beam_width)
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
         assert NDEBUG or self._check_sanity()
@@ -146,12 +153,14 @@ class _KVCache:
 
     # destroy ownership of memory blocks, so KV cache manager can decide to evict or drop them.
     def close(self):
+        assert NDEBUG or self._check_sanity()
         if self.status == self.Status.CLOSED:
             return
         self.stop_committing()
         if self.status == self.Status.ACTIVE:
             # suspend first, just to record finish_event.
             self.suspend()
+        assert NDEBUG or self._check_sanity()
         self._clear_blocks()
         self._status = self.Status.CLOSED
 
@@ -171,6 +180,7 @@ class _KVCache:
     # Get the indices of memory blocks for each beam.
     # Due to constraints of the current kernels, K/V data blocks and the correspondding quant scale blocks
     # share the same indices, so the output for DataRole.KEY_DATA and DataRole.KEY_BLOCK_SCALE are the same.
+    # @TODO: use one API for all, so we can get pages only once per life cycle.
     def get_page_indices(
         self,
         layer_id: LayerId,
@@ -182,14 +192,9 @@ class _KVCache:
         storage = self._storage
         lc = storage.get_buffer_attr(layer_id, data_role).life_cycle_id
         pages = (map_optional(
-            p.pages[beam_id][lc] if beam_id < len(p.pages) else None,
-            lambda h: h.page) for p in self._blocks)
+            b.pages[beam_id][lc] if beam_id < len(b.pages) else None,
+            lambda h: h.page) for b in self._blocks)
         return storage.get_page_indices(layer_id, data_role, pages)
-
-    # Currently always equals to page size. In the future, that will change when kernels support page stride.
-    def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int:
-        attr = self._storage.get_buffer_attr(layer_id, data_role)
-        return attr.size
 
     # reserve space for next inference. Request new blocks from KVCacheManager if necessary.
     # if capacity is increased and beam_width > 1, blocks containing new tokens should be allocated for each beam.
@@ -366,8 +371,7 @@ class _KVCache:
             stale_start, stale_end = self._get_stale_range(
                 self.history_length, lc)
             sink_blocks = typed_range(stale_start)
-            window_blocks = typed_range(stale_end,
-                                        self._to_block_ordinal(self.capacity))
+            window_blocks = typed_range(stale_end, typed_len(self._blocks))
             for ordinal in chain(sink_blocks, window_blocks):
                 block = self._blocks[ordinal]
                 for beam_idx, _ in typed_enumerate(block.pages):
@@ -486,7 +490,7 @@ class _KVCache:
         # @TODO: add test for this.
         for lc_idx, lc in self.manager._life_cycles.items():
             start, end = self._get_stale_range(self.history_length, lc)
-            start = min(start, self._num_committed_blocks)
+            start = max(start, self._num_committed_blocks)
             for ordinal in typed_range(start, end):
                 block = self._blocks[ordinal]
                 assert not block.is_committed
@@ -505,8 +509,7 @@ class _KVCache:
             for lc_idx, lc in self.manager._life_cycles.items():
                 if lc.window_size is None:
                     continue
-                old_beg, old_end = self._get_stale_range(
-                    self.history_length, lc)
+                _, old_end = self._get_stale_range(self.history_length, lc)
                 new_beg, new_end = self._get_stale_range(new_history_length, lc)
                 for ordinal in typed_range(max(old_end, new_beg), new_end):
                     block = self._blocks[ordinal]

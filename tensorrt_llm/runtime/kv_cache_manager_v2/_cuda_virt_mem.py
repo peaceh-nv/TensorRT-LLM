@@ -6,11 +6,12 @@ from ._utils import ItemHolderWithSharedPool, PooledFactoryBase, _unwrap, div_up
 
 # Physical memory
 class NativePhysMemAllocator:
-    __slots__ = ('_device_id', '_size', '_prop')
+    __slots__ = ('_device_id', '_size', '_prop', '_outstanding_handles')
 
     _device_id: int
     _size: int
     _prop: drv.CUmemAllocationProp
+    _outstanding_handles: set[int]  # allocated byt not released
 
     def __init__(self, size: int):
         self._device_id = _unwrap(
@@ -21,14 +22,27 @@ class NativePhysMemAllocator:
         prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         prop.location.id = self._device_id
         self._prop = prop
+        self._outstanding_handles = set()
 
     def allocate(self) -> drv.CUmemGenericAllocationHandle:
-        return _unwrap(drv.cuMemCreate(self._size, self._prop, 0))
+        handle = _unwrap(drv.cuMemCreate(self._size, self._prop, 0))
+        int_handle = int(handle)  # type: ignore[arg-type]
+        assert (int_handle not in self._outstanding_handles) and int_handle != 0
+        self._outstanding_handles.add(int_handle)
+        return handle
 
     def release(self, handle: drv.CUmemGenericAllocationHandle):
         if handle == drv.CUmemGenericAllocationHandle(0):
             return
-        _unwrap(drv.cuMemFree(handle))
+        assert int(handle) in self._outstanding_handles
+        self._outstanding_handles.remove(int(handle))
+        try:
+            _unwrap(drv.cuMemRelease(handle))
+        except:
+            print(
+                f"Failed to release handle {handle}. num_oustanding = {len(self._outstanding_handles)}"
+            )
+            raise
 
     @property
     def device_id(self) -> int:

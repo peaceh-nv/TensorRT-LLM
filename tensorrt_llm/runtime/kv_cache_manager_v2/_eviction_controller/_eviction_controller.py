@@ -160,6 +160,10 @@ class PerLevelEvictionController:  # for one cache level
             TypedIndexList,
             [PrioritizedLRUEvictionPolicy() for _ in range(num_pool_groups)])
 
+    def __del__(self):
+        assert all(len(p) == 0
+                   for p in self._policies), "Eviction controller is not empty"
+
     def _get_policy(self, life_cycle: LifeCycleId) -> EvictionPolicy:
         pg_idx = self._life_cycle_grouping[life_cycle]
         return self._policies[pg_idx]

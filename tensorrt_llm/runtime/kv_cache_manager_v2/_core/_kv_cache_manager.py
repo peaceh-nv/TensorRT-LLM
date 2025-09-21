@@ -5,9 +5,10 @@ from .._common import (BlockOrdinal, CacheLevel, CacheTier, LayerId, MemAddress,
                        Priority, TokenIdExt)
 from .._config import DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LifeCycle, LifeCycleRegistry
+from .._page import PageStatus
 from .._storage._config import create_storage_config
 from .._storage_manager import StorageManager
-from .._utils import HomoTuple
+from .._utils import HomoTuple, unwrap_weakref
 from ._kv_cache import _KVCache
 
 
@@ -24,10 +25,23 @@ class KVCacheManager:
         storage_config = create_storage_config(config)
         self._storage = StorageManager(self, storage_config)
 
+    def __del__(self):
+        self.clear_reusable_blocks()
+
+    def clear_reusable_blocks(self):
+        for ref in self._radix_tree.clear(yield_pages=True):
+            assert unwrap_weakref(ref).status == PageStatus.DROPPABLE
+            self._storage.exclude_from_eviction(unwrap_weakref(ref))
+
     # Get the base address of the memory pool holding pages for the given layer and data role.
     def get_mem_pool_base_address(self, layer_id: LayerId,
                                   data_role: DataRole) -> MemAddress:
         return self._storage.get_mem_pool_base_address(layer_id, data_role)
+
+    # Currently always equals to page size. In the future, that will change when kernels support page stride.
+    def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int:
+        attr = self._storage.get_buffer_attr(layer_id, data_role)
+        return attr.size
 
     # lora_task_id: match lora_task_id before matching any tokens.
     # stream: blocks are allocated and made ready in this stream. Later grow() also makes blocks ready in this stream, and later commit() calls also assume data are written in this stream.

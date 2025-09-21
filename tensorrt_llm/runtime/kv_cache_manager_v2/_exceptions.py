@@ -27,7 +27,10 @@ class CuError(RuntimeError):
 
     def __init__(self, error_code: drv.CUresult):
         self.error_code = error_code
-        super().__init__(f"CUDA driver error: {error_code}")
+        err, err_str = drv.cuGetErrorString(error_code)
+        if err != drv.CUresult.CUDA_SUCCESS:
+            err_str = "<Failed to get error string with cuGetErrorString>"
+        super().__init__(f"CUDA driver error: {error_code} ({err_str})")
 
 
 class CuOOMError(CuError, OutOfMemoryError):

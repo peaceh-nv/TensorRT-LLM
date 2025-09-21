@@ -201,8 +201,6 @@ class StagingBufferManager:
 
 
 class CopyEngine:
-    __slots__ = ()
-
     # use cached_property so it's created only on first access, when cuda context has been initialized.
     @cached_property
     def staging_buffer_manager(self) -> StagingBufferManager:

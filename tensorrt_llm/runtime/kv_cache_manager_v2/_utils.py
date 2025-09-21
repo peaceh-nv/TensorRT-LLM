@@ -32,8 +32,8 @@ def _unwrap(ret: drv.CUresult
             | tuple[drv.CUresult, Any, Any]):
     if isinstance(ret, drv.CUresult):
         if int(ret) != int(drv.CUresult.CUDA_SUCCESS):  # type: ignore[arg-type]
-            if int(ret) == int(drv.CUresult.CUDA_ERROR_OUT_OF_MEMORY
-                               ):  # type: ignore[arg-type]
+            if int(ret) == int(  # type: ignore[arg-type]
+                    drv.CUresult.CUDA_ERROR_OUT_OF_MEMORY):
                 raise CuOOMError()
             raise CuError(ret)
     else:
@@ -532,7 +532,7 @@ class SimplePool(Generic[T]):
         self._outstanding_count = 0
 
     def clear(self):
-        while True:
+        while self.items:
             self._destroy_func(self.items.popleft())
 
     def __del__(self):
@@ -547,6 +547,10 @@ class SimplePool(Generic[T]):
         return self._items
 
     def get(self) -> T:
+        if self._outstanding_count > (self._max_size or 1000) * 10:
+            warnings.warn(
+                f"Outstanding count {self._outstanding_count} is greater than max size {(self._max_size or 1000) * 10}. This may be a sign of leak."
+            )
         ret = self.items.popleft() if self.items else self._create_func()
         self._outstanding_count += 1
         return ret
@@ -624,6 +628,9 @@ class ItemHolderBase(Generic[T], ABC):
 class ItemHolderWithGlobalPool(GlobalPoolProvider[T], ItemHolderBase[T]):
     __slots__ = ()
 
+    def __del__(self):
+        ItemHolderBase.__del__(self)
+
 
 class CachedCudaEvent(ItemHolderWithGlobalPool[drv.CUevent]):
     """
@@ -693,11 +700,8 @@ CachedCudaEvent.NULL = _NullCudaEvent()
 
 
 # @TODO: consider do this in a single batch call to C++.
-def stream_wait_events(stream: drv.CUstream,
-                       events: Iterable[CachedCudaEvent] | CachedCudaEvent):
+def stream_wait_events(stream: drv.CUstream, events: Iterable[CachedCudaEvent]):
     'Batched wait for multiple events with deduplication first.'
-    if isinstance(events, CachedCudaEvent):
-        events = (events, )
     if not isinstance(events, Set):
         events = set(events)
     for ev in events:
@@ -727,9 +731,8 @@ class CachedCudaStream(ItemHolderWithGlobalPool[drv.CUstream]):
                                   drv.CU_STREAM_WAIT_VALUE_COMPLETED))
 
     def wait_events(
-        self, events: Sequence[CachedCudaEvent] | set[CachedCudaEvent]
-        | CachedCudaEvent
-    ) -> None:
+            self,
+            events: Sequence[CachedCudaEvent] | set[CachedCudaEvent]) -> None:
         '''
         Wait for events with deduplication first.
         '''
@@ -751,14 +754,15 @@ class TemporaryCudaStream(CachedCudaStream):
     _finish_event: CachedCudaEvent | None
 
     def __init__(self, prior_events: Sequence[CachedCudaEvent]
-                 | set[CachedCudaEvent] | CachedCudaEvent):
+                 | set[CachedCudaEvent]):
         super().__init__()
         self.wait_events(prior_events)
         self._finish_event = None
 
     def __del__(self):
+        super().__del__()
         if self._finish_event is not None:
-            raise LogicError("finish event not taken")
+            warnings.warn("[KVCacheManager] finish event not taken")
 
     def take_finish_event(self) -> CachedCudaEvent:
         ret = unwrap_optional(self._finish_event)
@@ -773,10 +777,8 @@ class TemporaryCudaStream(CachedCudaStream):
 
 
 def merge_events(
-    events: Sequence[CachedCudaEvent] | set[CachedCudaEvent] | CachedCudaEvent
+    events: Sequence[CachedCudaEvent] | set[CachedCudaEvent]
 ) -> CachedCudaEvent:
-    if isinstance(events, CachedCudaEvent):
-        return events
     if len(events) == 0:
         return CachedCudaEvent.NULL
     if len(events) == 1:
@@ -794,7 +796,7 @@ class MultiStreamExecutor:
     _finish_event: CachedCudaEvent | None
 
     def __init__(self, prior_events: Sequence[CachedCudaEvent]
-                 | set[CachedCudaEvent] | CachedCudaEvent):
+                 | set[CachedCudaEvent]):
         self._prior_event = merge_events(prior_events)
         self._streams = []
         self._finish_event = None
@@ -804,6 +806,7 @@ class MultiStreamExecutor:
 
     def __exit__(self, exc_type, exc_value, traceback):
         events = [s.take_finish_event() for s in self._streams]
+        self._streams.clear()
         self._finish_event = merge_events(events)
 
     def __del__(self):
