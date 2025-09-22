@@ -1,3 +1,5 @@
+import os
+import sys
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -6,13 +8,17 @@ from typing import ClassVar, NamedTuple, Sequence
 
 import cuda.bindings.driver as drv
 
-import tensorrt_llm.bindings
+############# for faster debugging #############
+sys.path.append(os.path.abspath(os.path.join(__file__, "../../..")))
+import bindings
 
 from ._common import Address, CacheTier, CudaStream, MemAddress
 from ._utils import (CachedCudaEvent, HomoTuple, HostMem, _unwrap, div_up,
                      stream_wait_events)
 
-nb_utils = tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils
+################################################
+
+nb_utils = bindings.internal.batch_manager.kv_cache_manager_v2_utils
 
 
 class CopyTask(NamedTuple):
