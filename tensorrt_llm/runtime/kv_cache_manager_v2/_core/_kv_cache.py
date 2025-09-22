@@ -1,3 +1,4 @@
+import array
 import enum
 import warnings
 import weakref
@@ -8,6 +9,7 @@ from itertools import chain
 from typing import TYPE_CHECKING, Callable, Iterator, cast
 
 from .._block_radix_tree import Block, UselessBlockError
+from .._buffer_registry import MirroredBufGroupId
 from .._common import (GPU_LEVEL, NDEBUG, BeamIndex, BlockOrdinal,
                        BlockOrdinalT, CacheLevel, CudaStream, LayerId, Priority,
                        TokenIdExt)
@@ -15,9 +17,8 @@ from .._config import DataRole
 from .._copy_engine import CopyTask, batched_copy
 from .._exceptions import LogicError, OutOfPagesError
 from .._life_cycle_registry import LifeCycle, LifeCycleId
-from .._page import (CommittedPage, UncommittedPage, _PageHolder,
-                     _SharedPageLock, batched_lock_to_gpu)
-from .._storage._config import BufferId
+from .._page import (BatchedLockTarget, CommittedPage, UncommittedPage,
+                     _PageHolder, _SharedPageLock, batched_lock_to_gpu)
 from .._storage_manager import StorageManager
 from .._utils import (CachedCudaEvent, TemporaryCudaStream, TypedIndexList,
                       div_up, expect_type, filled_list, find_index,
@@ -67,8 +68,9 @@ class SeqBlock:
 class _KVCache:
     __slots__ = ('_manager', '_lora_task_id', '_get_priority', '_cuda_stream',
                  '_status', '_beam_width', '_capacity', '_history_length',
-                 '_commit_state', '_blocks', '_committed_tokens',
-                 '_num_committed_blocks', '_finish_event', '__weakref__')
+                 '_commit_state', '_blocks', '_page_indices',
+                 '_committed_tokens', '_num_committed_blocks', '_finish_event',
+                 '__weakref__')
 
     class Status(enum.Enum):
         ACTIVE = enum.auto()
@@ -94,9 +96,8 @@ class _KVCache:
 
     _blocks: TypedIndexList[BlockOrdinal, SeqBlock]
     # we maintain _page_indices to accelerate the get_page_indices() API. In principle it can be computed on the fly, but that would be slow due to python.
-    _page_indices: TypedIndexList[BeamIndex, dict[BufferId,
-                                                  TypedIndexList[BlockOrdinal,
-                                                                 int]]]
+    _page_indices: TypedIndexList[BeamIndex, TypedIndexList[MirroredBufGroupId,
+                                                            array.array]]
     _committed_tokens: list[TokenIdExt]
     # Sometimes we can't commit a block because all its tokens are already covered by another block in the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric difference, 2. if our block is a partial block, we can't write to memory of the other blocks. Internally, we stop committing from such a block, but still give user an illusion that the block is committed.
     _num_committed_blocks: BlockOrdinal
@@ -117,12 +118,13 @@ class _KVCache:
         self._history_length = 0
         self._commit_state = self.CommitState.ALLOWED
         self._blocks = cast(TypedIndexList, [])
+        self._page_indices = filled_list(
+            filled_list(
+                array.array('i'), self.manager._storage.buffer_registry.
+                num_mirrored_buffer_groups), self.beam_width)
         self._committed_tokens = []
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
-        self._page_indices = filled_list(
-            dict[BufferId, TypedIndexList[BlockOrdinal, int]](),
-            self.beam_width)
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
         assert NDEBUG or self._check_sanity()
@@ -237,7 +239,11 @@ class _KVCache:
                     # We have already waited for ready_event of the slots.
                     block[beam_index][lc] = UncommittedPage(
                         self, ordinal, lc, GPU_LEVEL, slot,
-                        beam_index).lock(self, skip_wait=True)
+                        beam_index).lock(self,
+                                         beam_index,
+                                         ordinal,
+                                         lc,
+                                         skip_wait=True)
             self._blocks.append(SeqBlock(block, None))
         self._capacity = capacity
         self._history_length = history_length
@@ -347,13 +353,13 @@ class _KVCache:
             self.cuda_stream = cuda_stream
         assert self._cuda_stream is not None, "cuda_stream is never set"
         assert self._finish_event is None
-        pages = []
+        tasks = list[BatchedLockTarget]()
         for ordinal, beam_idx, lc_idx in self._active_pages():
             beam_block = self._block(ordinal, beam_idx)
             page = expect_type(_PageHolder, beam_block[lc_idx]).page
-            pages.append(page)
+            tasks.append(BatchedLockTarget(page, beam_idx, ordinal, lc_idx))
         try:
-            locks = batched_lock_to_gpu(self, pages)
+            locks = batched_lock_to_gpu(self, tasks)
         except OutOfPagesError:
             return False
         for (ordinal, beam_idx, lc_idx), lock in zip(self._active_pages(),
@@ -447,8 +453,9 @@ class _KVCache:
                 p = page.convert_to_committed(tree_block)
                 tree_block.storage[lc] = weakref.ref(p)
                 # The page comes from uncommitted page of self, so safe to skip wait.
-                beam_block[lc] = p.lock(self,
-                                        skip_wait=True) if locked else p.hold()
+                beam_block[lc] = p.lock(
+                    self, beam_idx, ordinal, lc,
+                    skip_wait=True) if locked else p.hold()
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
@@ -466,12 +473,16 @@ class _KVCache:
                              holder.page).convert_to_committed(tree_block)
                     # The page comes from uncommitted page of self, so safe to skip wait.
                     beam_block[lc] = p.lock(
-                        self, skip_wait=True) if locked else p.hold()
+                        self, beam_idx, ordinal, lc,
+                        skip_wait=True) if locked else p.hold()
                 else:
                     if locked:
                         beam_block[lc] = cast(_SharedPageLock, holder).holder
                     reuse_list.append((lc, existing_page))
-            locks = batched_lock_to_gpu(self, [p for _, p in reuse_list])
+            locks = batched_lock_to_gpu(self, [
+                BatchedLockTarget(p, beam_idx, ordinal, lc)
+                for lc, p in reuse_list
+            ])
             for (lc, _), lock in zip(reuse_list, locks):
                 beam_block[lc] = lock
             seq_block.tree_block = tree_block
@@ -527,13 +538,13 @@ class _KVCache:
                                                      LifeCycleId,
                                                      _PageHolder]]):
         'Revert _unlock_unused_blocks() by locking the held blocks.'
-        pages = []
-        for ordinal, beam_idx, lc_idx, holder in backup_holders:
-            pages.append(holder.page)
-        locks = batched_lock_to_gpu(self, pages)
-        for (ordinal, beam_idx, lc_idx,
-             holder), lock in zip(backup_holders, locks):
-            self._block(ordinal, beam_idx)[lc_idx] = lock
+        locks = batched_lock_to_gpu(self, [
+            BatchedLockTarget(holder.page, beam_idx, ordinal, lc)
+            for ordinal, beam_idx, lc, holder in backup_holders
+        ])
+        for lock in locks:
+            user = lock._user
+            self._block(user.ordinal, user.beam_index)[user.life_cycle] = lock
 
     @property
     def _storage(self) -> StorageManager:
@@ -742,3 +753,6 @@ class _KVCache:
             yield
         finally:
             self._finish_event = None
+
+    def _update_page_indices(self, beam_idx: BeamIndex, indices: Iterator[int]):
+        ...

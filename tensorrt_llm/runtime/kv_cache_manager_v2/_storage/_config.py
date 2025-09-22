@@ -5,8 +5,9 @@ from typing import NamedTuple
 from .._common import LayerId
 from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LifeCycle, LifeCycleId, LifeCycleRegistry
-from .._storage._core import PoolGroupIndex, PoolIndex
-from .._utils import HomoTuple, get_uniform_attribute, is_sorted
+from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
+from .._utils import (HomoTuple, TypedIndexList, exact_div, filled_list,
+                      get_uniform_attribute, is_sorted, make_typed)
 
 
 class BufferId(NamedTuple):
@@ -27,7 +28,7 @@ class CoalescedBuffer:
 
 @dataclass(slots=True)
 class PageConfig:
-    'A page is a group of coalesced buffers. Each coalesced buffer has multiple buffers with the same size. Multiple coalesced buffers can be in the same slotpage if they share the same life cycle and coalesced size.'
+    'A page is a group of coalesced buffers. Each coalesced buffer has multiple buffers with the same size. Multiple coalesced buffers can be in the same page if they share the same life cycle and coalesced size.'
     coalesced_buffers: list[CoalescedBuffer]
 
     @property
@@ -51,6 +52,9 @@ class SlotConfig:
 
     def __post_init__(self) -> None:
         assert is_sorted(self.pages, key=lambda s: s.slot_size, reverse=True)
+        assert all(
+            len(p.coalesced_buffers) == len(self.pages[0].coalesced_buffers)
+            for p in self.pages)
 
     @property
     def life_cycle_id(self) -> LifeCycleId:
@@ -78,13 +82,30 @@ class BufferAttr(NamedTuple):
     size: int
 
 
+class SlotToPageIndices(NamedTuple):
+    'Both offset and stride are in number of original buffers.'
+    buffers: TypedIndexList[
+        PoolIndex,
+        BufferId]  # mirrored buffers in different pools of the same pool group.
+    scale: int
+    bias: int
+
+    def __call__(self, slot_id: SlotId) -> int:
+        return self.bias + slot_id * self.scale
+
+
 @dataclass(slots=True, frozen=True)
 class StorageConfig:
     cache_tiers: HomoTuple[CacheTierConfig]
     pool_groups: HomoTuple[PoolGroupConfig]
 
-    def life_cycle_grouping(self) -> dict[LifeCycleId, PoolGroupIndex]:
-        ret = dict[LifeCycleId, PoolGroupIndex]()
+    @property
+    def num_life_cycles(self) -> LifeCycleId:
+        return LifeCycleId(sum(len(pg.slots) for pg in self.pool_groups))
+
+    def life_cycle_grouping(
+            self) -> TypedIndexList[LifeCycleId, PoolGroupIndex]:
+        ret = filled_list(PoolGroupIndex(-1), self.num_life_cycles)
         for pg_idx, pg in enumerate(self.pool_groups):
             pg_idx = PoolGroupIndex(pg_idx)
             for s in pg.slots:
@@ -103,6 +124,35 @@ class StorageConfig:
                             ret[b] = BufferAttr(life_cycle_id, PoolIndex(pool),
                                                 offset, cb.single_buffer_size)
                             offset += cb.single_buffer_size
+        return ret
+
+    def slot_to_page_indices(
+            self) -> TypedIndexList[LifeCycleId, list[SlotToPageIndices]]:
+        ret = make_typed(lambda: list[SlotToPageIndices](),
+                         self.num_life_cycles)
+        for pg in self.pool_groups:
+            for slot in pg.slots:
+                life_cycle = slot.life_cycle_id
+                for pool_idx, page in enumerate(slot.pages):
+                    offset = 0
+                    idx_buf = 0
+                    for cb in page.coalesced_buffers:
+                        for b in cb.buffer_ids:
+                            bias = exact_div(offset, cb.single_buffer_size)
+                            scale = exact_div(page.slot_size,
+                                              cb.single_buffer_size)
+                            if pool_idx == 0:
+                                ret[life_cycle].append(
+                                    SlotToPageIndices(
+                                        filled_list(b, PoolIndex(1)), scale,
+                                        bias))
+                            else:
+                                cvt = ret[life_cycle][idx_buf]
+                                assert cvt.bias == bias
+                                assert cvt.scale == scale
+                                cvt.buffers.append(b)
+                            offset += cb.single_buffer_size
+                            idx_buf += 1
         return ret
 
     def __post_init__(self) -> None:

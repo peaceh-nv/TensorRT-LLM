@@ -3,6 +3,7 @@ import warnings
 import weakref
 from typing import TYPE_CHECKING, Iterator, Sequence, cast
 
+from ._buffer_registry import BufferRegistry
 from ._common import (GPU_LEVEL, NDEBUG, Address, CacheLevel, CacheTier,
                       LayerId, MemAddress)
 from ._config import CacheTierConfig, DataRole, DiskCacheTierConfig
@@ -17,13 +18,14 @@ from ._exceptions import OutOfPagesError
 from ._life_cycle_registry import LifeCycleId
 from ._page import Page
 from ._storage import CacheLevelStorage
-from ._storage._config import BufferAttr, BufferId, StorageConfig
+from ._storage._config import (BufferAttr, BufferId, SlotToPageIndices,
+                               StorageConfig)
 from ._storage._core import (DiskCacheLevelStorage, GpuCacheLevelStorage,
                              HostCacheLevelStorage, PoolGroupBase,
                              PoolGroupIndex, PoolIndex, Slot, SlotId)
 from ._utils import (Array2D, CachedCudaEvent, HomoTuple, TemporaryCudaStream,
                      TypedIndexList, exact_div, filled_array2d, filled_list,
-                     get_uniform_attribute, partition, remove_if,
+                     get_uniform_attribute, make_typed, partition, remove_if,
                      typed_enumerate, typed_range, unwrap_weakref)
 
 
@@ -77,17 +79,26 @@ class CacheLevelManager:
 
 
 class StorageManager:
-    __slots__ = ('_parent', '_buffer_attr', '_life_cycle_grouping', '_levels',
+    __slots__ = ('_parent', '_slot_to_page_indices', 'buffer_registry',
+                 '_buffer_attr', '_life_cycle_grouping', '_levels',
                  '__weakref__')
     _parent: weakref.ref['KVCacheManager']
+    # Callables to convert slot_id to public page_indices.
+    _slot_to_page_indices: TypedIndexList[LifeCycleId, list[SlotToPageIndices]]
+    buffer_registry: BufferRegistry
+    # Contains the same information as _slot_to_page_indices but in a inverse way. For ref-check only.
     _buffer_attr: dict[BufferId, BufferAttr]
-    _life_cycle_grouping: dict[LifeCycleId, PoolGroupIndex]
+    _life_cycle_grouping: TypedIndexList[LifeCycleId, PoolGroupIndex]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
 
     def __init__(self, parent: 'KVCacheManager', config: StorageConfig):
         assert config.cache_tiers[
             GPU_LEVEL].tier == CacheTier.GPU_MEM, "The first cache tier must be GPU memory"
         self._parent = weakref.ref(parent)
+        self._slot_to_page_indices = config.slot_to_page_indices()
+        self.buffer_registry = BufferRegistry()
+        for cvt in sum(self._slot_to_page_indices, []):
+            self.buffer_registry.register_mirrored_buffers(cvt.buffers)
         self._buffer_attr = config.buffer_attributes()
         self._life_cycle_grouping = config.life_cycle_grouping()
         slot_size_lists = [pg.slot_size_list for pg in config.pool_groups]
@@ -117,7 +128,7 @@ class StorageManager:
         goals = filled_array2d(self.num_cache_levels, self.num_pool_groups, 0)
         for lc in typed_range(self.num_life_cycles):
             goals[level, self.get_pool_group_index(lc)] += num_slots[lc]
-        fallen_pages = filled_list(list[Page](), self.num_pool_groups)
+        fallen_pages = make_typed(lambda: list[Page](), self.num_pool_groups)
         self._prepare_free_slots(goals, level, fallen_pages)
         ret = filled_list(HomoTuple[Slot](), self.num_life_cycles)
         storage = self._levels[level].storage
@@ -183,7 +194,7 @@ class StorageManager:
         storage = self._levels[lvl_id].storage
         ctrl = self._levels[lvl_id].controller
         num_to_evict = filled_list(0, self.num_pool_groups)
-        held_pages = filled_list(list[Page](), self.num_pool_groups)
+        held_pages = make_typed(lambda: list[Page](), self.num_pool_groups)
         for pg_idx in typed_range(self.num_pool_groups):
             goal = goals[lvl_id, pg_idx]
             fallen = len(fallen_pages[pg_idx])
@@ -206,7 +217,7 @@ class StorageManager:
                     "Impossible to meet the goal ({goal} free slots) for group {pg_idx}"
                 )
         evicted = ctrl.evict(num_to_evict)
-        accepted_pages = filled_list(list[Page](), self.num_pool_groups)
+        accepted_pages = make_typed(lambda: list[Page](), self.num_pool_groups)
         if self.is_last_level(lvl_id):
             for pg_idx in typed_range(self.num_pool_groups):
                 old_free_cnt = storage.get_num_free_slots(pg_idx)
@@ -364,3 +375,14 @@ class StorageManager:
                      slot_id: SlotId, pool_idx: PoolIndex) -> Address:
         return self._levels[level].storage.slot_address(pg_idx, pool_idx,
                                                         slot_id)
+
+    def get_page_indices_for_slot(self, life_cycle: LifeCycleId,
+                                  slot_id: SlotId) -> Iterator[int]:
+        converters = self._slot_to_page_indices[life_cycle]
+        return (cvt(slot_id) for cvt in converters)
+
+    def get_buffers(
+        self, life_cycle: LifeCycleId
+    ) -> Iterator[TypedIndexList[PoolIndex, BufferId]]:
+        converters = self._slot_to_page_indices[life_cycle]
+        return (cvt.buffers for cvt in converters)

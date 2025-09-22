@@ -2,7 +2,7 @@ import warnings
 import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 from ._block_radix_tree import Block
 from ._common import (GPU_LEVEL, BeamIndex, BlockOrdinal, CacheLevel, Priority,
@@ -63,9 +63,13 @@ class Page(Slot):
     # Prevent eviction. You need to migrate the page to GPU later.
     def lock(self,
              kv_cache: '_KVCache',
+             beam_index: BeamIndex,
+             ordinal: BlockOrdinal,
+             life_cycle: LifeCycleId,
              skip_wait: bool = False) -> '_SharedPageLock':
         'If skip wait, you are responsible for making the page ready in kv_cache.cuda_stream.'
-        return self.hold().lock(kv_cache, skip_wait)
+        return self.hold().lock(kv_cache, beam_index, ordinal, life_cycle,
+                                skip_wait)
 
     @property
     def status(self) -> PageStatus:
@@ -195,6 +199,9 @@ class _PageHolder:
     # Prevent eviction. You need to migrate the page to GPU later.
     def lock(self,
              kv_cache: '_KVCache',
+             beam_index: BeamIndex,
+             ordinal: BlockOrdinal,
+             life_cycle: LifeCycleId,
              skip_wait: bool = False) -> '_SharedPageLock':
         if self._lock is None:
             lock = object.__new__(_UniqPageLock)
@@ -206,7 +213,7 @@ class _PageHolder:
             manager = self.page.manager
             manager.exclude_from_eviction(self.page)
             assert not self.page.scheduled_for_eviction
-        return lock.share(kv_cache, skip_wait)
+        return lock.share(kv_cache, beam_index, ordinal, life_cycle, skip_wait)
 
 
 @dataclass(slots=True, init=False, weakref_slot=True)
@@ -226,8 +233,11 @@ class _UniqPageLock:
         self.finish_events = []
         self.users = weakref.WeakSet()
 
-    def share(self, kv_cache: '_KVCache', skip_wait) -> '_SharedPageLock':
-        ret = _SharedPageLock(self, kv_cache, skip_wait)
+    def share(self, kv_cache: '_KVCache', beam_index: BeamIndex,
+              ordinal: BlockOrdinal, life_cycle: LifeCycleId,
+              skip_wait: bool) -> '_SharedPageLock':
+        ret = _SharedPageLock(self, kv_cache, beam_index, ordinal, life_cycle,
+                              skip_wait)
         self.users.add(ret)
         return ret
 
@@ -247,10 +257,17 @@ class _UniqPageLock:
             page.manager.schedule_for_eviction(page)
 
 
+class LockOwner(NamedTuple):
+    kv_cache: weakref.ref['_KVCache']
+    beam_index: BeamIndex
+    ordinal: BlockOrdinal
+    life_cycle: LifeCycleId
+
+
 @dataclass(slots=True, init=False, weakref_slot=True)
 class _SharedPageLock:
     _uniq_lock: _UniqPageLock
-    _user: weakref.ref['_KVCache']
+    _user: LockOwner
 
     @property
     def page(self) -> Page:
@@ -266,30 +283,47 @@ class _SharedPageLock:
     def __eq__(self, other):
         return self is other
 
-    def __init__(self, uniq_lock: _UniqPageLock, user: '_KVCache',
-                 skip_wait: bool):
+    def __init__(self, uniq_lock: _UniqPageLock, kv_cache: '_KVCache',
+                 beam_index: BeamIndex, ordinal: BlockOrdinal,
+                 life_cycle: LifeCycleId, skip_wait: bool):
         self._uniq_lock = uniq_lock
         if not skip_wait:
-            self.page.ready_event.wait_in_stream(user.cuda_stream)
-        self._user = weakref.ref(user)
+            self.page.ready_event.wait_in_stream(kv_cache.cuda_stream)
+        self._user = LockOwner(weakref.ref(kv_cache), beam_index, ordinal,
+                               life_cycle)
 
     def __del__(self):
         self._uniq_lock.finish_events.append(
-            unwrap_weakref(self._user).finish_event)
+            unwrap_weakref(self._user.kv_cache).finish_event)
 
 
-def batched_lock_to_gpu(kv_cache: '_KVCache',
-                        pages: Sequence[Page]) -> list['_SharedPageLock']:
+class BatchedLockTarget(NamedTuple):
+    page: Page
+    beam_index: BeamIndex
+    ordinal: BlockOrdinal
+    life_cycle: LifeCycleId
+
+
+def batched_lock_to_gpu(
+        kv_cache: '_KVCache',
+        tasks: Sequence[BatchedLockTarget]) -> list['_SharedPageLock']:
     'Lock pages after migrating all pages to GPU. If migration fails, no locking happens.'
     storage = kv_cache.manager._storage
-    assert not pages or storage is get_uniform_attribute(
-        pages, lambda p: p.manager)
+    assert not tasks or storage is get_uniform_attribute(
+        tasks, lambda p: p.page.manager)
     partitioned = partition(
-        pages, lambda p:
-        (p.cache_level, storage.get_pool_group_index(p.life_cycle)))
+        tasks, lambda p:
+        (p.page.cache_level, storage.get_pool_group_index(p.life_cycle)))
     for (lvl, pg_idx), part in partitioned.items():
         if lvl == GPU_LEVEL:
             continue
-        storage.batched_migrate(pg_idx, GPU_LEVEL, lvl, part, update_src=True)
-    stream_wait_events(kv_cache.cuda_stream, (p.ready_event for p in pages))
-    return [p.lock(kv_cache, skip_wait=True) for p in pages]
+        storage.batched_migrate(pg_idx,
+                                GPU_LEVEL,
+                                lvl, [p.page for p in part],
+                                update_src=True)
+    stream_wait_events(kv_cache.cuda_stream,
+                       (p.page.ready_event for p in tasks))
+    return [
+        page.lock(kv_cache, beam_index, ordinal, life_cycle, skip_wait=True)
+        for page, beam_index, ordinal, life_cycle in tasks
+    ]

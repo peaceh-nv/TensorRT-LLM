@@ -17,6 +17,7 @@ from .._utils import (CachedCudaEvent, DynamicBitset, HomoTuple, HostMem,
 
 PoolGroupIndex = NewType("PoolGroupIndex", int)
 PoolIndex = NewType("PoolIndex", int)
+SlotId = NewType('SlotId', int)
 
 
 class SlotPoolBase(abc.ABC):
@@ -172,9 +173,6 @@ class DiskSlotPool(SlotPoolBase):
     @override
     def num_slots(self) -> int:
         return self.file_size // self.slot_size
-
-
-SlotId = NewType('SlotId', int)
 
 
 @dataclass(slots=True)
