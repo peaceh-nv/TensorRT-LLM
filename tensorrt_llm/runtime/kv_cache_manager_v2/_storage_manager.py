@@ -1,11 +1,12 @@
 import os
 import warnings
 import weakref
+from functools import lru_cache
 from typing import TYPE_CHECKING, Iterator, Sequence, cast
 
-from ._buffer_registry import BufferRegistry
+from ._buffer_registry import BufferRegistry, MirroredBufGroupId
 from ._common import (GPU_LEVEL, NDEBUG, Address, CacheLevel, CacheTier,
-                      LayerId, MemAddress)
+                      LayerId, MemAddress, PageIndex)
 from ._config import CacheTierConfig, DataRole, DiskCacheTierConfig
 from ._copy_engine import CopyTask, batched_copy
 
@@ -341,6 +342,7 @@ class StorageManager:
         assert page.node_ref is not None
         self._levels[page.cache_level].controller.remove(page.node_ref)
 
+    @lru_cache(maxsize=None)
     def get_mem_pool_base_address(self, layer_id: LayerId,
                                   data_role: DataRole) -> MemAddress:
         storage = self._levels[GPU_LEVEL].storage
@@ -350,8 +352,10 @@ class StorageManager:
             MemAddress,
             storage.slot_address(pool_group_index, attr.pool_index, SlotId(0)))
 
-    def get_page_indices(self, layer_id: LayerId, data_role: DataRole,
-                         pages: Iterator[Page | None]) -> Iterator[int | None]:
+    def get_page_indices_ref(
+            self, layer_id: LayerId, data_role: DataRole,
+            pages: Iterator[Page | None]) -> Iterator[int | None]:
+        'Reference implementation. Not fast enough for production.'
         attr = self.get_buffer_attr(layer_id, data_role)
         pg_idx = self.get_pool_group_index(attr.life_cycle_id)
         pool_idx = attr.pool_index
@@ -376,13 +380,17 @@ class StorageManager:
         return self._levels[level].storage.slot_address(pg_idx, pool_idx,
                                                         slot_id)
 
-    def get_page_indices_for_slot(self, life_cycle: LifeCycleId,
-                                  slot_id: SlotId) -> Iterator[int]:
+    def get_page_indices_for_slot(
+            self, life_cycle: LifeCycleId,
+            slot_id: SlotId) -> Iterator[tuple[MirroredBufGroupId, PageIndex]]:
         converters = self._slot_to_page_indices[life_cycle]
-        return (cvt(slot_id) for cvt in converters)
+        get_id = self.buffer_registry.get_mirrored_buffer_group_index
+        return ((get_uniform_attribute(cvt.buffers, get_id), cvt(slot_id))
+                for cvt in converters)
 
-    def get_buffers(
-        self, life_cycle: LifeCycleId
-    ) -> Iterator[TypedIndexList[PoolIndex, BufferId]]:
+    def get_buffers(self,
+                    life_cycle: LifeCycleId) -> Iterator[MirroredBufGroupId]:
         converters = self._slot_to_page_indices[life_cycle]
-        return (cvt.buffers for cvt in converters)
+        get_id = self.buffer_registry.get_mirrored_buffer_group_index
+        return (get_uniform_attribute(cvt.buffers, get_id)
+                for cvt in converters)

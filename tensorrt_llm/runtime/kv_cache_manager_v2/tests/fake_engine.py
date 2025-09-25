@@ -5,12 +5,11 @@ from typing import NamedTuple
 
 from kv_cache_manager_v2 import (BeamIndex, CudaStream, KVCacheManagerConfig,
                                  LayerId, TokenIdExt, _KVCache)
-from kv_cache_manager_v2._common import MemAddress
+from kv_cache_manager_v2._common import BAD_PAGE_INDEX, NDEBUG, MemAddress
 from kv_cache_manager_v2._config import AttentionLayerConfig, DataRole
-from kv_cache_manager_v2._utils import (CachedCudaEvent, MultiStreamExecutor,
-                                        chunked, coalesce, div_up, exact_div,
+from kv_cache_manager_v2._utils import (div_up, exact_div,
                                         get_uniform_attribute, overlap,
-                                        typed_range)
+                                        typed_range, value_or)
 
 from .kernels import check_values, fill_values
 
@@ -56,25 +55,21 @@ class FakeEngine:
         assert batch
         manager = get_uniform_attribute(batch,
                                         lambda step: step.kv_cache.manager)
-        with MultiStreamExecutor((CachedCudaEvent(stream), )) as executor:
-            for req_id, kv_cache, input, history in batch:
-                for layer_id, layer_cfg in self.layers.items():
-                    for buf_id, buf in enumerate(layer_cfg.buffers):
-                        role = buf.role
-                        stride = manager.get_page_stride(layer_id, role)
-                        assert stride == buf.size
-                        for beam in typed_range(kv_cache.beam_width):
-                            with executor.new_stream() as s:
-                                # check history
-                                # self._check_pages(kv_cache, req_id, layer_id,
-                                #                   buf_id, beam, history,
-                                #                   s.handle)
-                                # write new token
-                                if input:
-                                    self._write_new_tokens(
-                                        kv_cache, req_id, layer_id, buf_id,
-                                        beam, input, s.handle)
-        executor.take_finish_event().wait_in_stream(stream)
+        for req_id, kv_cache, input, history in batch:
+            for layer_id, layer_cfg in self.layers.items():
+                for buf_id, buf in enumerate(layer_cfg.buffers):
+                    role = buf.role
+                    assert NDEBUG or buf.size == manager.get_page_stride(
+                        layer_id, role)
+                    for beam in typed_range(kv_cache.beam_width):
+                        # check history
+                        self._check_pages(kv_cache, req_id, layer_id, buf_id,
+                                          beam, history, stream)
+                        # write new token
+                        if input:
+                            self._write_new_tokens(kv_cache, req_id,
+                                                   len(history), layer_id,
+                                                   buf_id, beam, input, stream)
 
     def _check_pages(self, kv_cache: _KVCache, req_id: int, layer_id: LayerId,
                      buf_id: int, beam: BeamIndex,
@@ -89,35 +84,33 @@ class FakeEngine:
         stride = manager.get_page_stride(layer_id, role)
         pages = kv_cache.get_page_indices(layer_id, role, beam)
         capacity = kv_cache.capacity
-        history_len = kv_cache.history_length
+        history_len = len(history)
         assert len(history) == history_len
         window = (0, capacity) if layer_cfg.window_size is None else (max(
             0, history_len + 1 - layer_cfg.window_size), capacity)
-        sink = coalesce(layer_cfg.num_sink_tokens, 0)
+        sink = value_or(layer_cfg.num_sink_tokens, 0)
         # check history
-        with MultiStreamExecutor((CachedCudaEvent(stream), )) as executor:
-            pages_per_stream = 16
-            for chunk in chunked(enumerate(pages), pages_per_stream):
-                with executor.new_stream() as s:
-                    for ordinal, page in chunk:
-                        page_range = (tokens_per_block * ordinal,
-                                      tokens_per_block * (ordinal + 1))
-                        need_page = overlap(page_range, (0, sink)) or overlap(
-                            page_range, window)
-                        assert bool(need_page) == (page is not None)
-                        if page is None:
-                            continue
-                        addr = MemAddress(pool + stride * page)
-                        tokens = history[tokens_per_block *
-                                         ordinal:tokens_per_block *
-                                         (ordinal + 1)]
-                        check_values(addr, token_bytes, req_id, layer_id,
-                                     buf_id, beam, tokens, s.handle)
-        executor.take_finish_event().wait_in_stream(stream)
+        for ordinal, page in enumerate(pages):
+            if page == BAD_PAGE_INDEX:
+                continue
+            page_range = (tokens_per_block * ordinal,
+                          tokens_per_block * (ordinal + 1))
+            need_page = overlap(page_range,
+                                (0, sink)) or overlap(page_range, window)
+            if need_page:
+                assert page != BAD_PAGE_INDEX
+            else:
+                assert kv_cache.history_length != history_len or page == BAD_PAGE_INDEX
+            addr = MemAddress(pool + stride * page)
+            tokens = history[tokens_per_block * ordinal:tokens_per_block *
+                             (ordinal + 1)]
+            check_values(addr, token_bytes, req_id, layer_id, buf_id, beam,
+                         tokens, stream)
 
     def _write_new_tokens(self, kv_cache: _KVCache, req_id: int,
-                          layer_id: LayerId, buf_id: int, beam: BeamIndex,
-                          input: Sequence[TokenIdExt], stream: CudaStream):
+                          history_len: int, layer_id: LayerId, buf_id: int,
+                          beam: BeamIndex, input: Sequence[TokenIdExt],
+                          stream: CudaStream):
         manager = kv_cache.manager
         tokens_per_block = self.tokens_per_block
         layer_cfg = self.layers[layer_id]
@@ -126,9 +119,10 @@ class FakeEngine:
         token_bytes = exact_div(buf.size, self.tokens_per_block)
         pool = manager.get_mem_pool_base_address(layer_id, role)
         stride = manager.get_page_stride(layer_id, role)
-        pages = kv_cache.get_page_indices(layer_id, role, beam)
+        pages = kv_cache.get_page_indices(
+            layer_id, role,
+            beam)[:div_up(history_len + len(input), tokens_per_block)]
         capacity = kv_cache.capacity
-        history_len = kv_cache.history_length
         input_range = (history_len, history_len + len(input))
         assert input_range[1] <= capacity
         ordinal_beg = input_range[0] // tokens_per_block
@@ -136,7 +130,7 @@ class FakeEngine:
         ordinal = None
         for i, page in enumerate(pages):
             ordinal = ordinal_beg + i
-            assert page is not None
+            assert page != BAD_PAGE_INDEX
             addr = MemAddress(pool + stride * page + token_bytes *
                               (history_len % tokens_per_block))
             page_range = (tokens_per_block * ordinal,

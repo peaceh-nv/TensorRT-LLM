@@ -6,26 +6,27 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import TYPE_CHECKING, Callable, Iterator, cast
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, cast
 
 from .._block_radix_tree import Block, UselessBlockError
 from .._buffer_registry import MirroredBufGroupId
-from .._common import (GPU_LEVEL, NDEBUG, BeamIndex, BlockOrdinal,
-                       BlockOrdinalT, CacheLevel, CudaStream, LayerId, Priority,
-                       TokenIdExt)
+from .._common import (BAD_PAGE_INDEX, GPU_LEVEL, NDEBUG, BeamIndex,
+                       BlockOrdinal, BlockOrdinalT, CacheLevel, CudaStream,
+                       LayerId, PageIndex, Priority, TokenIdExt)
 from .._config import DataRole
 from .._copy_engine import CopyTask, batched_copy
 from .._exceptions import LogicError, OutOfPagesError
 from .._life_cycle_registry import LifeCycle, LifeCycleId
 from .._page import (BatchedLockTarget, CommittedPage, UncommittedPage,
                      _PageHolder, _SharedPageLock, batched_lock_to_gpu)
+from .._storage._config import BufferId
 from .._storage_manager import StorageManager
-from .._utils import (CachedCudaEvent, TemporaryCudaStream, TypedIndexList,
-                      div_up, expect_type, filled_list, find_index,
-                      get_uniform_attribute, map_optional, not_implemented,
-                      stream_wait_events, to_typed, typed_enumerate, typed_len,
-                      typed_map, typed_range, unwrap_optional, unwrap_weakref,
-                      value_or)
+from .._utils import (CachedCudaEvent, HomoTuple, TemporaryCudaStream,
+                      TypedIndexList, div_up, expect_type, filled_list,
+                      find_index, get_uniform_attribute, make_typed,
+                      map_optional, not_implemented, stream_wait_events,
+                      to_typed, typed_enumerate, typed_len, typed_map,
+                      typed_range, unwrap_optional, unwrap_weakref, value_or)
 
 if TYPE_CHECKING:
     from ._kv_cache_manager import KVCacheManager
@@ -70,7 +71,7 @@ class _KVCache:
                  '_status', '_beam_width', '_capacity', '_history_length',
                  '_commit_state', '_blocks', '_page_indices',
                  '_committed_tokens', '_num_committed_blocks', '_finish_event',
-                 '__weakref__')
+                 '_buffer_to_mirrored_index', '__weakref__')
 
     class Status(enum.Enum):
         ACTIVE = enum.auto()
@@ -96,13 +97,17 @@ class _KVCache:
 
     _blocks: TypedIndexList[BlockOrdinal, SeqBlock]
     # we maintain _page_indices to accelerate the get_page_indices() API. In principle it can be computed on the fly, but that would be slow due to python.
-    _page_indices: TypedIndexList[BeamIndex, TypedIndexList[MirroredBufGroupId,
-                                                            array.array]]
+    _page_indices: TypedIndexList[BeamIndex,
+                                  TypedIndexList[MirroredBufGroupId,
+                                                 array.array[PageIndex]]]
     _committed_tokens: list[TokenIdExt]
     # Sometimes we can't commit a block because all its tokens are already covered by another block in the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric difference, 2. if our block is a partial block, we can't write to memory of the other blocks. Internally, we stop committing from such a block, but still give user an illusion that the block is committed.
     _num_committed_blocks: BlockOrdinal
     # set when switch away from ACTIVE, cleared when switching to ACTIVE.
     _finish_event: CachedCudaEvent | None
+
+    # available in self.manager._storage.buffer_registry, put here to accelerate the get_page_indices() API.
+    _buffer_to_mirrored_index: dict[BufferId, MirroredBufGroupId]
 
     def __init__(self, manager: 'KVCacheManager', lora_task_id: int | None,
                  input_tokens: Sequence[TokenIdExt] | None,
@@ -118,13 +123,14 @@ class _KVCache:
         self._history_length = 0
         self._commit_state = self.CommitState.ALLOWED
         self._blocks = cast(TypedIndexList, [])
-        self._page_indices = filled_list(
-            filled_list(
-                array.array('i'), self.manager._storage.buffer_registry.
+        self._page_indices = make_typed(
+            lambda: make_typed(
+                lambda: array.array('i'), self.manager._storage.buffer_registry.
                 num_mirrored_buffer_groups), self.beam_width)
         self._committed_tokens = []
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
+        self._buffer_to_mirrored_index = manager._storage.buffer_registry._buffer_to_mirrored_index
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
         assert NDEBUG or self._check_sanity()
@@ -182,21 +188,27 @@ class _KVCache:
     # Get the indices of memory blocks for each beam.
     # Due to constraints of the current kernels, K/V data blocks and the correspondding quant scale blocks
     # share the same indices, so the output for DataRole.KEY_DATA and DataRole.KEY_BLOCK_SCALE are the same.
-    # @TODO: use one API for all, so we can get pages only once per life cycle.
     def get_page_indices(
         self,
         layer_id: LayerId,
         data_role: DataRole,
         beam_id: BeamIndex = BeamIndex(0)
-    ) -> Iterator[int | None]:
-        assert beam_id < self.beam_width
-        assert self.is_active
-        storage = self._storage
-        lc = storage.get_buffer_attr(layer_id, data_role).life_cycle_id
-        pages = (map_optional(
-            b.pages[beam_id][lc] if beam_id < len(b.pages) else None,
-            lambda h: h.page) for b in self._blocks)
-        return storage.get_page_indices(layer_id, data_role, pages)
+    ) -> array.array[PageIndex]:
+        mirrored_buf_group_id = self._buffer_to_mirrored_index[BufferId(
+            layer_id, data_role)]
+        ret = self._page_indices[beam_id][mirrored_buf_group_id]
+        assert NDEBUG or ret == array.array(
+            'i',
+            (value_or(i, BAD_PAGE_INDEX)
+             for i in self._get_page_indices_ref(layer_id, data_role, beam_id)))
+        return ret
+
+    def get_all_page_indices(
+            self, beam_id: BeamIndex,
+            buf_ids: Iterable[BufferId]) -> Iterator[array.array[PageIndex]]:
+        for buf_id in buf_ids:
+            mirrored_buf_group_id = self._buffer_to_mirrored_index[buf_id]
+            yield self._page_indices[beam_id][mirrored_buf_group_id]
 
     # reserve space for next inference. Request new blocks from KVCacheManager if necessary.
     # if capacity is increased and beam_width > 1, blocks containing new tokens should be allocated for each beam.
@@ -214,37 +226,50 @@ class _KVCache:
         if capacity < history_length:
             raise ValueError("History length cannot be greater than capacity")
         backup_holders = self._unlock_stale_blocks(history_length)
-        old_num_blocks = div_up(self._capacity, self.tokens_per_block)
-        new_num_blocks = div_up(capacity, self.tokens_per_block)
+        old_num_blocks = BlockOrdinal(
+            div_up(self._capacity, self.tokens_per_block))
+        new_num_blocks = BlockOrdinal(div_up(capacity, self.tokens_per_block))
         beam_width = BeamIndex(self.beam_width)
-        num_new_slots = (new_num_blocks - old_num_blocks) * beam_width
         num_life_cycles = self._storage.num_life_cycles
-        num_new_slots = filled_list(num_new_slots, num_life_cycles)
-        try:
-            slots = self._storage.new_gpu_slots(num_new_slots)
-        except OutOfPagesError:
-            self._lock_held_blocks(backup_holders)
-            return False
-        stream_wait_events(self.cuda_stream,
-                           (s.ready_event for s in sum(slots, ())))
-        for ordinal in range(old_num_blocks, new_num_blocks):
-            ordinal = BlockOrdinal(ordinal)
-            idx_new_block = ordinal - old_num_blocks
-            block = filled_list(
-                filled_list(cast(BlockPage, None), num_life_cycles), beam_width)
-            for beam_index in typed_range(beam_width):
-                for lc in typed_range(num_life_cycles):
-                    idx_slot = beam_width * idx_new_block + beam_index
-                    slot = slots[lc][idx_slot]
-                    # We have already waited for ready_event of the slots.
-                    block[beam_index][lc] = UncommittedPage(
-                        self, ordinal, lc, GPU_LEVEL, slot,
-                        beam_index).lock(self,
-                                         beam_index,
-                                         ordinal,
-                                         lc,
-                                         skip_wait=True)
-            self._blocks.append(SeqBlock(block, None))
+        if new_num_blocks < old_num_blocks:
+            del self._blocks[new_num_blocks:]
+            for beam_indices in self._page_indices:
+                for indices in beam_indices:
+                    assert all(i == BAD_PAGE_INDEX
+                               for i in indices[new_num_blocks:])
+                    del indices[new_num_blocks:]
+        elif new_num_blocks > old_num_blocks:
+            num_new_blocks = new_num_blocks - old_num_blocks
+            for beam_indices in self._page_indices:
+                for indices in beam_indices:
+                    indices.extend([BAD_PAGE_INDEX] * num_new_blocks)
+            num_new_slots = filled_list(num_new_blocks * beam_width,
+                                        num_life_cycles)
+            try:
+                slots = self._storage.new_gpu_slots(num_new_slots)
+            except OutOfPagesError:
+                self._lock_held_blocks(backup_holders)
+                return False
+            stream_wait_events(self.cuda_stream,
+                               (s.ready_event for s in sum(slots, ())))
+            for ordinal in typed_range(old_num_blocks, new_num_blocks):
+                idx_new_block = ordinal - old_num_blocks
+                block = make_typed(
+                    lambda: filled_list(cast(BlockPage, None), num_life_cycles),
+                    beam_width)
+                for beam_index in typed_range(beam_width):
+                    for lc in typed_range(num_life_cycles):
+                        idx_slot = beam_width * idx_new_block + beam_index
+                        slot = slots[lc][idx_slot]
+                        # We have already waited for ready_event of the slots.
+                        block[beam_index][lc] = UncommittedPage(
+                            self, ordinal, lc, GPU_LEVEL, slot,
+                            beam_index).lock(self,
+                                             beam_index,
+                                             ordinal,
+                                             lc,
+                                             skip_wait=True)
+                self._blocks.append(SeqBlock(block, None))
         self._capacity = capacity
         self._history_length = history_length
         assert NDEBUG or self._check_sanity()
@@ -326,6 +351,9 @@ class _KVCache:
             ordinal = self._to_block_ordinal(self.num_committed_tokens)
             with self._record_event():
                 self._commit_block(ordinal, True)
+        else:
+            self._commit_state = self.CommitState.USER_STOP
+            self._on_stop_committing()
         warnings.warn(
             "[KVCacheManager] Not Implemented: check if the last committed pages are usable, in case some prior pages are already dropped. For SWA, this can be done only when we stop committing."
         )
@@ -678,9 +706,9 @@ class _KVCache:
         # fill self._blocks
         self._blocks = to_typed(BlockOrdinalT, [
             SeqBlock(
-                filled_list(
-                    filled_list(cast(BlockPage, None), life_cycles.size),
-                    self.beam_width),
+                make_typed(
+                    lambda: filled_list(cast(BlockPage, None), life_cycles.size
+                                        ), self.beam_width),
                 b[0] if b[1] == tokens_per_block else None) for b in matched
         ])
 
@@ -754,5 +782,30 @@ class _KVCache:
         finally:
             self._finish_event = None
 
-    def _update_page_indices(self, beam_idx: BeamIndex, indices: Iterator[int]):
-        ...
+    def _update_page_indices(
+        self, beam_idx: BeamIndex, ordinal: BlockOrdinal,
+        indices: Iterable[tuple[MirroredBufGroupId, PageIndex]]
+    ) -> HomoTuple[tuple[MirroredBufGroupId, PageIndex]]:
+        beam = self._page_indices[beam_idx]
+        ret = list[tuple[MirroredBufGroupId, PageIndex]]()
+        for buf_group_id, page_idx in indices:
+            arr = beam[buf_group_id]
+            old = PageIndex(arr[ordinal])
+            ret.append((buf_group_id, old))
+            arr[ordinal] = page_idx
+        return tuple(ret)
+
+    def _get_page_indices_ref(
+        self,
+        layer_id: LayerId,
+        data_role: DataRole,
+        beam_id: BeamIndex = BeamIndex(0)
+    ) -> Iterator[int | None]:
+        assert beam_id < self.beam_width
+        assert self.is_active
+        storage = self._storage
+        lc = storage.get_buffer_attr(layer_id, data_role).life_cycle_id
+        pages = (map_optional(
+            b.pages[beam_id][lc] if beam_id < len(b.pages) else None,
+            lambda h: h.page) for b in self._blocks)
+        return storage.get_page_indices_ref(layer_id, data_role, pages)

@@ -1,8 +1,8 @@
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
-from .._common import LayerId
+from .._common import LayerId, PageIndex
 from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
@@ -75,23 +75,25 @@ class PoolGroupConfig:
         return get_uniform_attribute(self.slots, lambda s: s.slot_size_list)
 
 
-class BufferAttr(NamedTuple):
+@dataclass(slots=True, frozen=True)
+class BufferAttr:
     life_cycle_id: LifeCycleId
     pool_index: PoolIndex
     offset: int
     size: int
 
 
-class SlotToPageIndices(NamedTuple):
+@dataclass(slots=True, frozen=True)
+class SlotToPageIndices:
     'Both offset and stride are in number of original buffers.'
     buffers: TypedIndexList[
         PoolIndex,
         BufferId]  # mirrored buffers in different pools of the same pool group.
     scale: int
-    bias: int
+    bias: PageIndex
 
-    def __call__(self, slot_id: SlotId) -> int:
-        return self.bias + slot_id * self.scale
+    def __call__(self, slot_id: SlotId) -> PageIndex:
+        return PageIndex(self.bias + slot_id * self.scale)
 
 
 @dataclass(slots=True, frozen=True)
@@ -143,9 +145,8 @@ class StorageConfig:
                                               cb.single_buffer_size)
                             if pool_idx == 0:
                                 ret[life_cycle].append(
-                                    SlotToPageIndices(
-                                        filled_list(b, PoolIndex(1)), scale,
-                                        bias))
+                                    SlotToPageIndices(cast(TypedIndexList, [b]),
+                                                      scale, PageIndex(bias)))
                             else:
                                 cvt = ret[life_cycle][idx_buf]
                                 assert cvt.bias == bias

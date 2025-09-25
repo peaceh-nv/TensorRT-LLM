@@ -1,6 +1,7 @@
 import array
 import atexit
 import ctypes
+import dataclasses
 import errno
 import functools
 import itertools
@@ -15,7 +16,8 @@ from collections.abc import Set
 from ctypes.util import find_library
 from itertools import pairwise
 from typing import (Any, Callable, ClassVar, Generic, Iterable, Iterator,
-                    MutableSequence, Protocol, Sequence, Type, TypeVar, cast)
+                    MutableSequence, Protocol, Reversible, Sequence, Type,
+                    TypeVar, cast)
 
 import cuda.bindings.driver as drv
 
@@ -90,10 +92,6 @@ def unwrap_weakref(value: weakref.ref[T]) -> T:
     return unwrap_optional(value())
 
 
-def coalesce(value: T | None, fallback: T) -> T:
-    return value if value is not None else fallback
-
-
 def map_optional(value: T | None, func: Callable[[T], U]) -> U | None:
     return func(value) if value is not None else None
 
@@ -158,6 +156,15 @@ def not_implemented(func):
     return wrapper
 
 
+def unpackable(cls):
+
+    def __iter__(self):
+        return (getattr(self, f.name) for f in dataclasses.fields(self))
+
+    cls.__iter__ = __iter__
+    return cls
+
+
 def expect_type(ExpectedType: Type[T], value: Any) -> T:
     'Similar to typing.cast, but does runtime checking with assert.'
     assert isinstance(
@@ -187,6 +194,9 @@ class TypedIndexList(Protocol[Index, T]):
         ...
 
     def __setitem__(self, index: Index, value: T) -> None:
+        ...
+
+    def __delitem__(self, index: Index | slice) -> None:
         ...
 
     def __iter__(self) -> Iterator[T]:
@@ -296,8 +306,8 @@ def filled_array2d(rows: Row, cols: Col, val: T) -> Array2D[Row, Col, T]:
 Index = TypeVar('Index', bound=int, contravariant=True)
 
 
-def typed_range(*args: Index) -> Iterator[Index]:
-    return (cast(Index, i) for i in range(*args))
+def typed_range(*args: Index) -> Reversible[Index]:
+    return cast(Reversible[Index], range(*args))
 
 
 def find(seq: Sequence[T], predicate: Callable[[T], bool], default: U) -> T | U:

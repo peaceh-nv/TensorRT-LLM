@@ -1,12 +1,13 @@
 import warnings
 import weakref
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 from ._block_radix_tree import Block
-from ._common import (GPU_LEVEL, BeamIndex, BlockOrdinal, CacheLevel, Priority,
-                      TokenIdExt)
+from ._buffer_registry import MirroredBufGroupId
+from ._common import (BAD_PAGE_INDEX, GPU_LEVEL, NDEBUG, BeamIndex,
+                      BlockOrdinal, CacheLevel, PageIndex, Priority, TokenIdExt)
 
 if TYPE_CHECKING:
     from ._core._kv_cache import _KVCache
@@ -136,9 +137,10 @@ class UncommittedPage(Page):
 
     def __del__(self):
         check_page = lambda p: p is None or isinstance(p.page, CommittedPage)
-        assert check_page(
-            unwrap_weakref(self.kv_cache)._blocks[self.ordinal].pages[
-                self.beam_index][self.life_cycle])
+        assert len(unwrap_weakref(
+            self.kv_cache)._blocks) <= self.ordinal or check_page(
+                unwrap_weakref(self.kv_cache)._blocks[self.ordinal].pages[
+                    self.beam_index][self.life_cycle])
         Page.__del__(self)
 
 
@@ -195,6 +197,9 @@ class _PageHolder:
             block = page.block()
             if block is None or block.is_orphan:
                 page.manager.exclude_from_eviction(page)
+        elif self.page.scheduled_for_eviction:
+            page = cast(UncommittedPage, self.page)
+            page.manager.exclude_from_eviction(page)
 
     # Prevent eviction. You need to migrate the page to GPU later.
     def lock(self,
@@ -291,10 +296,25 @@ class _SharedPageLock:
             self.page.ready_event.wait_in_stream(kv_cache.cuda_stream)
         self._user = LockOwner(weakref.ref(kv_cache), beam_index, ordinal,
                                life_cycle)
+        indices = self._get_page_indices()
+        old_indices = kv_cache._update_page_indices(beam_index, ordinal,
+                                                    indices)
+        assert all(old_idx == BAD_PAGE_INDEX for _, old_idx in old_indices)
 
     def __del__(self):
         self._uniq_lock.finish_events.append(
             unwrap_weakref(self._user.kv_cache).finish_event)
+        ref_old_indices = tuple(self._get_page_indices())
+        new_indices = ((id, BAD_PAGE_INDEX) for id, _ in ref_old_indices)
+        old_indices = unwrap_weakref(self._user.kv_cache)._update_page_indices(
+            self._user.beam_index, self._user.ordinal, new_indices)
+        assert NDEBUG or old_indices == ref_old_indices
+
+    def _get_page_indices(
+            self) -> Iterator[tuple[MirroredBufGroupId, PageIndex]]:
+        storage = unwrap_weakref(self._user.kv_cache).manager._storage
+        return storage.get_page_indices_for_slot(self._user.life_cycle,
+                                                 self.page.slot_id)
 
 
 class BatchedLockTarget(NamedTuple):

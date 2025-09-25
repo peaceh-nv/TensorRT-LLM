@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, NewType
 
 import cuda.bindings.driver as drv
 
-NDEBUG = False
+NDEBUG = True
 
 
 # Can extend to more tiers in the future, e.g. object storage like AWS S3.
@@ -47,6 +47,9 @@ MemAddress = NewType("MemAddress", int)
 FileDescriptor = NewType("FileDescriptor", int)
 
 BAD_FILE_DESCRIPTOR = FileDescriptor(-1)
+
+PageIndex = NewType("PageIndex", int)
+BAD_PAGE_INDEX = PageIndex(-1)
 
 
 @dataclass(slots=True)
