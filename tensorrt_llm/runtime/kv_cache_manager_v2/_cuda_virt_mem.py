@@ -15,7 +15,7 @@ class NativePhysMemAllocator:
 
     def __init__(self, size: int):
         self._device_id = _unwrap(
-            drv.cuCtxGetDevice())  # type: ignore[attr-defined]
+            drv.cuCtxGetDevice())  # type: ignore[assignment]
         self._size = size
         prop = drv.CUmemAllocationProp()
         prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
@@ -26,7 +26,7 @@ class NativePhysMemAllocator:
 
     def allocate(self) -> drv.CUmemGenericAllocationHandle:
         handle = _unwrap(drv.cuMemCreate(self._size, self._prop, 0))
-        int_handle = int(handle)  # type: ignore[arg-type]
+        int_handle = int(handle)  # type: ignore[assignment]
         assert (int_handle not in self._outstanding_handles) and int_handle != 0
         self._outstanding_handles.add(int_handle)
         return handle

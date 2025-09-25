@@ -4,8 +4,8 @@ from .._block_radix_tree import BlockRadixTree
 from .._common import (BlockOrdinal, CacheLevel, CacheTier, LayerId, MemAddress,
                        Priority, TokenIdExt)
 from .._config import DataRole, KVCacheManagerConfig
+from .._eviction_controller import PageStatus
 from .._life_cycle_registry import LifeCycle, LifeCycleRegistry
-from .._page import PageStatus
 from .._storage._config import create_storage_config
 from .._storage_manager import StorageManager
 from .._utils import HomoTuple, unwrap_weakref

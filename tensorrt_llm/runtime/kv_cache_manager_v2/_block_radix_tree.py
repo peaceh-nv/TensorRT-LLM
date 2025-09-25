@@ -146,7 +146,7 @@ class DuplicateKeyError(RuntimeError):
     key: BlockKey
 
     def __init__(self, key: BlockKey):
-        super().__init__(f"Block with key {key} already exists")
+        super().__init__(f"Block with key {key.hex()} already exists")
         self.key = key
 
 
@@ -155,7 +155,7 @@ class UselessBlockError(RuntimeError):
 
     def __init__(self, block: 'Block'):
         super().__init__(
-            "Block is useless because all its tokens are covered by another block with key = {block.key}"
+            f"Block is useless because all its tokens are covered by another block with key = {block.key.hex()}"
         )
         self.block = block
 

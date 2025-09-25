@@ -33,8 +33,9 @@ def _unwrap(ret: drv.CUresult
             ]
             | tuple[drv.CUresult, Any, Any]):
     if isinstance(ret, drv.CUresult):
-        if int(ret) != int(drv.CUresult.CUDA_SUCCESS):  # type: ignore[arg-type]
-            if int(ret) == int(  # type: ignore[arg-type]
+        if int(ret) != int(
+                drv.CUresult.CUDA_SUCCESS):  # type: ignore[assignment]
+            if int(ret) == int(  # type: ignore[assignment]
                     drv.CUresult.CUDA_ERROR_OUT_OF_MEMORY):
                 raise CuOOMError()
             raise CuError(ret)
@@ -73,9 +74,10 @@ def overlap(a: tuple[int, int], b: tuple[int,
 
 T = TypeVar('T')
 U = TypeVar('U')
-Index = TypeVar('Index', bound=int, contravariant=True)
-Row = TypeVar('Row', bound=int, contravariant=True)
-Col = TypeVar('Col', bound=int, contravariant=True)
+Index = TypeVar('IndexI', bound=int, contravariant=True)
+IndexO = TypeVar('IndexO', bound=int, covariant=True)
+Row = TypeVar('Row', bound=int)
+Col = TypeVar('Col', bound=int)
 
 
 def value_or(opt: T | None, default: T) -> T:
@@ -181,8 +183,6 @@ def is_sorted(iterable: Iterable[T],
 
 HomoTuple = tuple[T, ...]
 
-Index = TypeVar('Index', bound=int, contravariant=True)
-
 
 class TypedIndexList(Protocol[Index, T]):
     """
@@ -244,8 +244,8 @@ def make_typed(generator: Callable[[], T],
                 [generator() for _ in range(int(count))])
 
 
-def typed_len(iterable: TypedIndexList[Index, T]) -> Index:
-    return cast(Index, len(iterable))
+def typed_len(iterable: TypedIndexList[IndexO, T]) -> IndexO:
+    return cast(IndexO, len(iterable))
 
 
 def typed_enumerate(
@@ -301,9 +301,6 @@ class Array2D(Generic[Row, Col, T]):
 
 def filled_array2d(rows: Row, cols: Col, val: T) -> Array2D[Row, Col, T]:
     return Array2D(rows, cols, [val] * rows * cols)
-
-
-Index = TypeVar('Index', bound=int, contravariant=True)
 
 
 def typed_range(*args: Index) -> Reversible[Index]:
@@ -646,7 +643,7 @@ class ItemHolderWithGlobalPool(GlobalPoolProvider[T], ItemHolderBase[T]):
     __slots__ = ()
 
     def __del__(self):
-        ItemHolderBase.__del__(self)
+        self.close()
 
 
 class CachedCudaEvent(ItemHolderWithGlobalPool[drv.CUevent]):
@@ -663,8 +660,9 @@ class CachedCudaEvent(ItemHolderWithGlobalPool[drv.CUevent]):
                 lambda: _unwrap(
                     drv.cuEventCreate(drv.CUevent_flags.CU_EVENT_DISABLE_TIMING)
                 ),
-                lambda ev: _unwrap(drv.cuEventDestroy(ev)
-                                   ),  # type: ignore[arg-type]
+                lambda ev: _unwrap(
+                    drv.cuEventDestroy(ev)  # type: ignore[arg-type]
+                ),
                 init_size=1024))
         super().__init__()
         self._record(stream)
@@ -737,8 +735,9 @@ class CachedCudaStream(ItemHolderWithGlobalPool[drv.CUstream]):
                 lambda: _unwrap(
                     drv.cuStreamCreate(drv.CUstream_flags.CU_STREAM_NON_BLOCKING
                                        )),
-                lambda stream: _unwrap(drv.cuStreamDestroy(stream)
-                                       ),  # type: ignore[arg-type]
+                lambda stream: _unwrap(
+                    drv.cuStreamDestroy(stream)  # type: ignore[arg-type]
+                ),
                 init_size=128))
         super().__init__()
 
@@ -777,9 +776,9 @@ class TemporaryCudaStream(CachedCudaStream):
         self._finish_event = None
 
     def __del__(self):
-        super().__del__()
         if self._finish_event is not None:
             warnings.warn("[KVCacheManager] finish event not taken")
+        super().__del__()
 
     def take_finish_event(self) -> CachedCudaEvent:
         ret = unwrap_optional(self._finish_event)
@@ -856,7 +855,10 @@ class ItemHolderWithSharedPool(SharedPoolProvider[T], ItemHolderBase[T]):
 
     def __init__(self, pool: SimplePool[T]):
         SharedPoolProvider.__init__(self, pool)
-        ItemHolderBase.__init__(self)
+        ItemHolderBase.__init__(self)  # type: ignore[arg-type]
+
+    def __del__(self):
+        self.close()
 
 
 HolderT = TypeVar('HolderT', bound=ItemHolderWithSharedPool)
@@ -897,12 +899,12 @@ class PooledFactory(PooledFactoryBase[T, ItemHolderWithSharedPool]):
 
 
 def query_total_gpu_memory() -> int:
-    _, total = _unwrap(drv.cuMemGetInfo())  # type: ignore[assignment]
+    _, total = _unwrap(drv.cuMemGetInfo())  # type: ignore[arg-type]
     return total
 
 
 def query_free_gpu_memory() -> int:
-    free, _ = _unwrap(drv.cuMemGetInfo())  # type: ignore[assignment]
+    free, _ = _unwrap(drv.cuMemGetInfo())  # type: ignore[arg-type]
     return free
 
 

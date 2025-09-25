@@ -97,9 +97,8 @@ class _KVCache:
 
     _blocks: TypedIndexList[BlockOrdinal, SeqBlock]
     # we maintain _page_indices to accelerate the get_page_indices() API. In principle it can be computed on the fly, but that would be slow due to python.
-    _page_indices: TypedIndexList[BeamIndex,
-                                  TypedIndexList[MirroredBufGroupId,
-                                                 array.array[PageIndex]]]
+    _page_indices: TypedIndexList[BeamIndex, TypedIndexList[MirroredBufGroupId,
+                                                            array.array[int]]]
     _committed_tokens: list[TokenIdExt]
     # Sometimes we can't commit a block because all its tokens are already covered by another block in the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric difference, 2. if our block is a partial block, we can't write to memory of the other blocks. Internally, we stop committing from such a block, but still give user an illusion that the block is committed.
     _num_committed_blocks: BlockOrdinal
@@ -192,8 +191,7 @@ class _KVCache:
         self,
         layer_id: LayerId,
         data_role: DataRole,
-        beam_id: BeamIndex = BeamIndex(0)
-    ) -> array.array[PageIndex]:
+        beam_id: BeamIndex = BeamIndex(0)) -> array.array[int]:
         mirrored_buf_group_id = self._buffer_to_mirrored_index[BufferId(
             layer_id, data_role)]
         ret = self._page_indices[beam_id][mirrored_buf_group_id]
@@ -205,7 +203,7 @@ class _KVCache:
 
     def get_all_page_indices(
             self, beam_id: BeamIndex,
-            buf_ids: Iterable[BufferId]) -> Iterator[array.array[PageIndex]]:
+            buf_ids: Iterable[BufferId]) -> Iterator[array.array[int]]:
         for buf_id in buf_ids:
             mirrored_buf_group_id = self._buffer_to_mirrored_index[buf_id]
             yield self._page_indices[beam_id][mirrored_buf_group_id]
@@ -730,7 +728,7 @@ class _KVCache:
                 assert ordinal == len(
                     matched) - 1 and self._blocks[ordinal].tree_block is None
                 page = holder.page
-                assert page.manager is manager
+                assert page.manager is manager._storage
                 storage = manager._storage
                 num_slots = filled_list(0, life_cycles.size)
                 num_slots[lc_idx] = 1
@@ -807,5 +805,6 @@ class _KVCache:
         lc = storage.get_buffer_attr(layer_id, data_role).life_cycle_id
         pages = (map_optional(
             b.pages[beam_id][lc] if beam_id < len(b.pages) else None,
-            lambda h: h.page) for b in self._blocks)
+            lambda h: cast(_PageHolder | _SharedPageLock, h).page)
+                 for b in self._blocks)
         return storage.get_page_indices_ref(layer_id, data_role, pages)

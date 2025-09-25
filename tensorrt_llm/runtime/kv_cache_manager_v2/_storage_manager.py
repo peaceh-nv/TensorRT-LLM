@@ -105,7 +105,8 @@ class StorageManager:
         slot_size_lists = [pg.slot_size_list for pg in config.pool_groups]
         # @TODO: accept an optional avg_seq_len param and consider sliding window.
         init_ratio = [
-            sum(pg.slot_size_list) * len(pg.slots) for pg in config.pool_groups
+            float(sum(pg.slot_size_list) * len(pg.slots))
+            for pg in config.pool_groups
         ]
         total = sum(init_ratio)
         init_ratio = [x / total for x in init_ratio]
@@ -147,7 +148,7 @@ class StorageManager:
                 for s in slots:
                     storage.release(pg_idx, s)
             raise
-        return cast(TypedIndexList[LifeCycleId, HomoTuple[Slot]], ret)
+        return ret
 
     @property
     def kv_cache_manager(self) -> 'KVCacheManager':

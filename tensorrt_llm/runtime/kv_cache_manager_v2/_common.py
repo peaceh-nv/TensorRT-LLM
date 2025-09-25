@@ -1,6 +1,6 @@
 import enum
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NewType
+from typing import TYPE_CHECKING, ClassVar, NewType, Self
 
 import cuda.bindings.driver as drv
 
@@ -68,6 +68,10 @@ class Priority(int):
     _DEFAULT_VALUE = 35
     _MIN_VALUE = 0
     _MAX_VALUE = 100
+
+    DEFAULT: ClassVar[Self]
+    MIN: ClassVar[Self]
+    MAX: ClassVar[Self]
 
     def __new__(cls, value: int):
         if value < cls._MIN_VALUE or value > cls._MAX_VALUE:
