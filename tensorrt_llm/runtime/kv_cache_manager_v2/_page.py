@@ -1,11 +1,10 @@
 import warnings
 import weakref
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 from ._block_radix_tree import Block
-from ._buffer_registry import MirroredBufGroupId
 from ._common import (BAD_PAGE_INDEX, GPU_LEVEL, NDEBUG, BeamIndex,
                       BlockOrdinal, CacheLevel, PageIndex, Priority, TokenIdExt)
 
@@ -298,20 +297,21 @@ class _SharedPageLock:
                                life_cycle)
         indices = self._get_page_indices()
         old_indices = kv_cache._update_page_indices(beam_index, ordinal,
-                                                    indices)
-        assert all(old_idx == BAD_PAGE_INDEX for _, old_idx in old_indices)
+                                                    life_cycle, indices)
+        assert NDEBUG or all(old_idx == BAD_PAGE_INDEX
+                             for old_idx in old_indices)
 
     def __del__(self):
         self._uniq_lock.finish_events.append(
             unwrap_weakref(self._user.kv_cache).finish_event)
-        ref_old_indices = tuple(self._get_page_indices())
-        new_indices = ((id, BAD_PAGE_INDEX) for id, _ in ref_old_indices)
+        ref_old_indices = self._get_page_indices()
+        new_indices = [BAD_PAGE_INDEX for _ in ref_old_indices]
         old_indices = unwrap_weakref(self._user.kv_cache)._update_page_indices(
-            self._user.beam_index, self._user.ordinal, new_indices)
+            self._user.beam_index, self._user.ordinal, self._user.life_cycle,
+            new_indices)
         assert NDEBUG or old_indices == ref_old_indices
 
-    def _get_page_indices(
-            self) -> Iterator[tuple[MirroredBufGroupId, PageIndex]]:
+    def _get_page_indices(self) -> list[PageIndex]:
         storage = unwrap_weakref(self._user.kv_cache).manager._storage
         return storage.get_page_indices_for_slot(self._user.life_cycle,
                                                  self.page.slot_id)

@@ -9,10 +9,10 @@ from itertools import chain
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator, cast
 
 from .._block_radix_tree import Block, UselessBlockError
-from .._buffer_registry import MirroredBufGroupId
 from .._common import (BAD_PAGE_INDEX, GPU_LEVEL, NDEBUG, BeamIndex,
                        BlockOrdinal, BlockOrdinalT, CacheLevel, CudaStream,
-                       LayerId, PageIndex, Priority, TokenIdExt)
+                       LayerId, MirroredBufGroupId, PageIndex, Priority,
+                       TokenIdExt)
 from .._config import DataRole
 from .._copy_engine import CopyTask, batched_copy
 from .._exceptions import LogicError, OutOfPagesError
@@ -71,7 +71,8 @@ class _KVCache:
                  '_status', '_beam_width', '_capacity', '_history_length',
                  '_commit_state', '_blocks', '_page_indices',
                  '_committed_tokens', '_num_committed_blocks', '_finish_event',
-                 '_buffer_to_mirrored_index', '__weakref__')
+                 '_buffer_to_mirrored_index', '_mirrored_indices',
+                 '__weakref__')
 
     class Status(enum.Enum):
         ACTIVE = enum.auto()
@@ -107,6 +108,9 @@ class _KVCache:
 
     # available in self.manager._storage.buffer_registry, put here to accelerate the get_page_indices() API.
     _buffer_to_mirrored_index: dict[BufferId, MirroredBufGroupId]
+    # available with self.manager._storage.get_mirrored_buffer_group_indices(). Cached here to accelerate the get_page_indices() API.
+    _mirrored_indices: TypedIndexList[LifeCycleId,
+                                      HomoTuple[MirroredBufGroupId]]
 
     def __init__(self, manager: 'KVCacheManager', lora_task_id: int | None,
                  input_tokens: Sequence[TokenIdExt] | None,
@@ -130,6 +134,11 @@ class _KVCache:
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
         self._buffer_to_mirrored_index = manager._storage.buffer_registry._buffer_to_mirrored_index
+        self._mirrored_indices = cast(
+            TypedIndexList[LifeCycleId, HomoTuple[MirroredBufGroupId]], [
+                manager._storage.get_mirrored_buffer_group_indices(lc)
+                for lc in typed_range(manager._life_cycles.size)
+            ])
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
         assert NDEBUG or self._check_sanity()
@@ -780,18 +789,18 @@ class _KVCache:
         finally:
             self._finish_event = None
 
-    def _update_page_indices(
-        self, beam_idx: BeamIndex, ordinal: BlockOrdinal,
-        indices: Iterable[tuple[MirroredBufGroupId, PageIndex]]
-    ) -> HomoTuple[tuple[MirroredBufGroupId, PageIndex]]:
+    def _update_page_indices(self, beam_idx: BeamIndex, ordinal: BlockOrdinal,
+                             lc: LifeCycleId,
+                             indices: list[PageIndex]) -> list[PageIndex]:
         beam = self._page_indices[beam_idx]
-        ret = list[tuple[MirroredBufGroupId, PageIndex]]()
-        for buf_group_id, page_idx in indices:
+        for i, (buf_group_id,
+                page_idx) in enumerate(zip(self._mirrored_indices[lc],
+                                           indices)):
             arr = beam[buf_group_id]
             old = PageIndex(arr[ordinal])
-            ret.append((buf_group_id, old))
             arr[ordinal] = page_idx
-        return tuple(ret)
+            indices[i] = old
+        return indices
 
     def _get_page_indices_ref(
         self,

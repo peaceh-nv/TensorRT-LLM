@@ -27,7 +27,7 @@ from ._storage._core import (DiskCacheLevelStorage, GpuCacheLevelStorage,
 from ._utils import (Array2D, CachedCudaEvent, HomoTuple, TemporaryCudaStream,
                      TypedIndexList, exact_div, filled_array2d, filled_list,
                      get_uniform_attribute, make_typed, partition, remove_if,
-                     typed_enumerate, typed_range, unwrap_weakref)
+                     typed_enumerate, typed_len, typed_range, unwrap_weakref)
 
 
 class CacheLevelManager:
@@ -85,7 +85,9 @@ class StorageManager:
                  '__weakref__')
     _parent: weakref.ref['KVCacheManager']
     # Callables to convert slot_id to public page_indices.
-    _slot_to_page_indices: TypedIndexList[LifeCycleId, list[SlotToPageIndices]]
+    _slot_to_page_indices: TypedIndexList[LifeCycleId,
+                                          TypedIndexList[MirroredBufGroupId,
+                                                         SlotToPageIndices]]
     buffer_registry: BufferRegistry
     # Contains the same information as _slot_to_page_indices but in a inverse way. For ref-check only.
     _buffer_attr: dict[BufferId, BufferAttr]
@@ -98,8 +100,9 @@ class StorageManager:
         self._parent = weakref.ref(parent)
         self._slot_to_page_indices = config.slot_to_page_indices()
         self.buffer_registry = BufferRegistry()
-        for cvt in sum(self._slot_to_page_indices, []):
-            self.buffer_registry.register_mirrored_buffers(cvt.buffers)
+        for lc_converters in self._slot_to_page_indices:
+            for cvt in lc_converters:
+                self.buffer_registry.register_mirrored_buffers(cvt.buffers)
         self._buffer_attr = config.buffer_attributes()
         self._life_cycle_grouping = config.life_cycle_grouping()
         slot_size_lists = [pg.slot_size_list for pg in config.pool_groups]
@@ -381,17 +384,20 @@ class StorageManager:
         return self._levels[level].storage.slot_address(pg_idx, pool_idx,
                                                         slot_id)
 
-    def get_page_indices_for_slot(
-            self, life_cycle: LifeCycleId,
-            slot_id: SlotId) -> Iterator[tuple[MirroredBufGroupId, PageIndex]]:
+    def get_page_indices_for_slot(self, life_cycle: LifeCycleId,
+                                  slot_id: SlotId) -> list[PageIndex]:
         converters = self._slot_to_page_indices[life_cycle]
-        get_id = self.buffer_registry.get_mirrored_buffer_group_index
-        return ((get_uniform_attribute(cvt.buffers, get_id), cvt(slot_id))
-                for cvt in converters)
+        return [PageIndex(cvt.scale * slot_id + cvt.bias) for cvt in converters]
+        # return [cvt(slot_id)) for cvt in converters]
 
-    def get_buffers(self,
-                    life_cycle: LifeCycleId) -> Iterator[MirroredBufGroupId]:
+    @lru_cache(maxsize=None)
+    def get_mirrored_buffer_group_indices(
+            self, life_cycle: LifeCycleId) -> HomoTuple[MirroredBufGroupId]:
         converters = self._slot_to_page_indices[life_cycle]
         get_id = self.buffer_registry.get_mirrored_buffer_group_index
-        return (get_uniform_attribute(cvt.buffers, get_id)
-                for cvt in converters)
+        return tuple(
+            get_uniform_attribute(cvt.buffers, get_id) for cvt in converters)
+
+    def get_num_mirrored_buffer_groups(
+            self, life_cycle: LifeCycleId) -> MirroredBufGroupId:
+        return typed_len(self._slot_to_page_indices[life_cycle])

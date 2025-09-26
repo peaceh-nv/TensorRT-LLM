@@ -1,10 +1,9 @@
-from typing import NewType, cast
+from typing import cast
 
+from ._common import MirroredBufGroupId
 from ._storage._config import BufferId
 from ._storage._core import PoolIndex
 from ._utils import TypedIndexList, typed_len
-
-MirroredBufGroupId = NewType("MirroredBufGroupId", int)
 
 
 class BufferRegistry:

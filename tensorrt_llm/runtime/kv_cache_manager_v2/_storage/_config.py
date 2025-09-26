@@ -2,7 +2,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import NamedTuple, cast
 
-from .._common import LayerId, PageIndex
+from .._common import LayerId, MirroredBufGroupId, PageIndex
 from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
@@ -129,9 +129,12 @@ class StorageConfig:
         return ret
 
     def slot_to_page_indices(
-            self) -> TypedIndexList[LifeCycleId, list[SlotToPageIndices]]:
-        ret = make_typed(lambda: list[SlotToPageIndices](),
-                         self.num_life_cycles)
+        self
+    ) -> TypedIndexList[LifeCycleId, TypedIndexList[MirroredBufGroupId,
+                                                    SlotToPageIndices]]:
+        ret = make_typed(
+            lambda: cast(TypedIndexList[MirroredBufGroupId, SlotToPageIndices],
+                         []), self.num_life_cycles)
         for pg in self.pool_groups:
             for slot in pg.slots:
                 life_cycle = slot.life_cycle_id
@@ -148,7 +151,8 @@ class StorageConfig:
                                     SlotToPageIndices(cast(TypedIndexList, [b]),
                                                       scale, PageIndex(bias)))
                             else:
-                                cvt = ret[life_cycle][idx_buf]
+                                cvt = ret[life_cycle][MirroredBufGroupId(
+                                    idx_buf)]
                                 assert cvt.bias == bias
                                 assert cvt.scale == scale
                                 cvt.buffers.append(b)

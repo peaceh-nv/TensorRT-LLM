@@ -33,8 +33,8 @@ def _unwrap(ret: drv.CUresult
             ]
             | tuple[drv.CUresult, Any, Any]):
     if isinstance(ret, drv.CUresult):
-        if int(ret) != int(
-                drv.CUresult.CUDA_SUCCESS):  # type: ignore[assignment]
+        if int(ret) != int(  # type: ignore[assignment]
+                drv.CUresult.CUDA_SUCCESS):
             if int(ret) == int(  # type: ignore[assignment]
                     drv.CUresult.CUDA_ERROR_OUT_OF_MEMORY):
                 raise CuOOMError()
@@ -74,7 +74,7 @@ def overlap(a: tuple[int, int], b: tuple[int,
 
 T = TypeVar('T')
 U = TypeVar('U')
-Index = TypeVar('IndexI', bound=int, contravariant=True)
+Index = TypeVar('Index', bound=int, contravariant=True)
 IndexO = TypeVar('IndexO', bound=int, covariant=True)
 Row = TypeVar('Row', bound=int)
 Col = TypeVar('Col', bound=int)

@@ -1,7 +1,8 @@
 import hashlib
 import warnings
 import weakref
-from typing import TYPE_CHECKING, Iterable, Iterator, Sequence, TypeVar, cast
+from typing import (TYPE_CHECKING, ClassVar, Iterable, Iterator, Sequence,
+                    TypeVar, cast)
 
 from ._common import NDEBUG, BlockOrdinal, TokenId, TokenIdExt
 from ._eviction_controller import PageStatus
@@ -31,23 +32,25 @@ class Hasher:
     __slots__ = ('_hasher')
     _hasher: 'hashlib._Hash'
 
+    BYTE_TYPE: ClassVar[type] = type(bytes)
+    INT_TYPE: ClassVar[type] = type(int)
+
     def __init__(self, data: int | bytes | None | Iterable = None):
         self._hasher = hashlib.sha256()
-        self.update(data)
+        if data is not None:
+            self.update(data)
 
-    def update(self, data: int | bytes | None | Iterable) -> 'Hasher':
-        if isinstance(data, int):
-            assert data >= 0 and data < (1 << 64)
-            self._hasher.update(data.to_bytes(8, 'little'))
-        elif isinstance(data, bytes):
-            self._hasher.update(data)
-        elif data is None:
-            pass
-        elif isinstance(data, Iterable):
-            for item in data:
-                self.update(item)
-        else:
-            raise ValueError(f"Unsupported type: {type(data)}")
+    def update(self, data: int | bytes | Iterable) -> 'Hasher':
+        match data:
+            case int():
+                assert data >= 0 and data < (1 << 64)
+                self._hasher.update(cast(int, data).to_bytes(8, 'little'))
+            case bytes():
+                self._hasher.update(cast(bytes, data))
+            case _:
+                assert isinstance(data, Iterable)
+                for item in data:
+                    self.update(item)
         return self
 
     @property
@@ -64,7 +67,7 @@ def sequence_to_blockchain_keys(
     digest = Hasher(lora_task_id).digest
     yield (), digest
     for token_block in chunked(tokens, tokens_per_block):
-        yield tuple(token_block), Hasher((digest, token_block)).digest
+        yield token_block, Hasher((digest, token_block)).digest
 
 
 Child = TypeVar('Child', bound='Block | RootBlock')
