@@ -11,26 +11,26 @@ from kv_cache_manager_v2 import (AttentionLayerConfig, BufferConfig,
                                  HostCacheTierConfig, KVCacheManager,
                                  KVCacheManagerConfig, LayerId, TokenId,
                                  TokenIdExt, _KVCache)
+from kv_cache_manager_v2._exceptions import OutOfPagesError
 from kv_cache_manager_v2._utils import (TemporaryCudaStream, round_up,
                                         typed_range)
-from kv_cache_manager_v2.tests.fake_engine import FakeEngine, Role
+from kv_cache_manager_v2.tests.fake_engine import FakeEngine, Role, Step
 from parameterized import parameterized
 
 
 class TestNaive(unittest.TestCase):
-    cfg: KVCacheManagerConfig
     engine: FakeEngine
+    cfg: KVCacheManagerConfig
     manager: KVCacheManager
 
     def setUp(self):
         err, = cudart.cudaFree(0)
         assert int(err) == int(cudart.cudaError_t.cudaSuccess)
-        self._init_cfg(gpu_quota=256 << 20,
-                       host_quota=256 << 20,
-                       disk_quota=1 << 30,
-                       num_layers=36,
-                       window_size=128,
-                       sink_tokens=48)
+
+    def prepare(self, gpu_quota: int, host_quota: int, disk_quota: int,
+                num_layers: int, window_size: int, sink_tokens: int):
+        self._init_cfg(gpu_quota, host_quota, disk_quota, num_layers,
+                       window_size, sink_tokens)
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
 
@@ -59,9 +59,12 @@ class TestNaive(unittest.TestCase):
                 for layer_id in typed_range(LayerId(num_layers))
             ])
 
-    def run_naive(self, interval: int = 1) -> float:
+    def run_naive(self,
+                  seq_len: int,
+                  interval: int = 1,
+                  refcheck: bool = True) -> float:
         prompt_len = 1
-        decode_len = 1024 * 10 - prompt_len
+        decode_len = seq_len - prompt_len
 
         class Request(NamedTuple):
             id: int
@@ -88,7 +91,9 @@ class TestNaive(unittest.TestCase):
             capacity = kv_cache.capacity
             history = prompt[:num_reused]
             input = prompt[num_reused:]
-            # self.engine.execute([Step(req_id, kv_cache, input, history)], stream)
+            if refcheck:
+                self.engine.execute([Step(req_id, kv_cache, input, history)],
+                                    stream)
             kv_cache.commit(input)
             history.extend(input)
             # decode
@@ -99,11 +104,16 @@ class TestNaive(unittest.TestCase):
                     kv_cache.capacity = round_up(required_capacity, interval)
                     capacity = kv_cache.capacity
                 input_token = TokenId(next(token_gen))
-                # self.engine.execute([Step(req_id, kv_cache, [input_token], history)], stream)
+                if refcheck:
+                    self.engine.execute(
+                        [Step(req_id, kv_cache, [input_token], history)],
+                        stream)
                 history.append(input_token)
             kv_cache.commit(history[kv_cache.history_length:])
             # last check
-            # self.engine.execute([Step(req_id, kv_cache, [], history)], stream)
+            if refcheck:
+                self.engine.execute([Step(req_id, kv_cache, [], history)],
+                                    stream)
             toc = time.perf_counter()
             time_taken = toc - tic
             # print(f"Time taken: {time_taken} seconds")
@@ -112,15 +122,34 @@ class TestNaive(unittest.TestCase):
         self.manager.clear_reusable_blocks()
         return time_taken
 
+    def test_eviction(self):
+        self.prepare(8 << 20, 8 << 20, 1 << 30, 36, 128, 1)
+        # if we have n blocks, we need 8192*2*18*(1+5+n) bytes of memory. For the (1+5+n), 1 is for sink blocks, 5 is for SWA (window=128), n is for full attention.
+        max_seq_len = 32 * 22  # 23 blocks will require more than 8MB memory
+        seq_len = max_seq_len
+        self.run_naive(seq_len, 1, True)
+        self.assertRaises(OutOfPagesError,
+                          lambda: self.run_naive(seq_len + 1, 1, False))
+
+    def test_naive(self):
+        self.prepare(256 << 20, 256 << 20, 1 << 30, 36, 128, 48)
+        self.run_naive(512, 1, True)
+
     @parameterized.expand([(2**i, ) for i in range(12)])
-    def test_naive(self, interval):
+    # @parameterized.expand([(32, )])
+    def test_naive_perf(self, interval):
+        self.skipTest("Skipping perf test")
+        self.prepare(256 << 20, 256 << 20, 1 << 30, 36, 128, 48)
+        self.run_naive(10240, interval, False)  # warm up for numba jit
         profiler = None
-        if True:
+        if False:
             import cProfile
             profiler = cProfile.Profile()
             profiler.enable()
-        #time_taken = [self.run_naive(interval) for _ in range(11)]
-        time_taken = [self.run_naive(32)]
+        time_taken = [
+            self.run_naive(10240, interval, False)
+            for _ in range(11 if profiler is None else 1)
+        ]
         median_time_taken = median(time_taken)
         print(f"Median time taken: {median_time_taken}")
         if profiler is not None:

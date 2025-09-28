@@ -131,15 +131,22 @@ class StorageManager:
     def new_slots(
         self, level: CacheLevel, num_slots: TypedIndexList[LifeCycleId, int]
     ) -> TypedIndexList[LifeCycleId, HomoTuple[Slot]]:
-        goals = filled_array2d(self.num_cache_levels, self.num_pool_groups, 0)
+        pg_num_slots = filled_list(0, self.num_pool_groups)
         for lc in typed_range(self.num_life_cycles):
-            goals[level, self.get_pool_group_index(lc)] += num_slots[lc]
-        fallen_pages = make_typed(lambda: list[Page](), self.num_pool_groups)
-        self._prepare_free_slots(goals, level, fallen_pages)
-        ret = filled_list(HomoTuple[Slot](), self.num_life_cycles)
+            pg_num_slots[self.get_pool_group_index(lc)] += num_slots[lc]
         storage = self._levels[level].storage
-        assert all(goals[level, pg] <= storage.get_num_free_slots(pg)
-                   for pg in typed_range(self.num_pool_groups))
+        if any(pg_num_slots[pg] > storage.get_num_free_slots(pg)
+               for pg in typed_range(self.num_pool_groups)):
+            goals = filled_array2d(self.num_cache_levels, self.num_pool_groups,
+                                   0)
+            for pg in typed_range(self.num_pool_groups):
+                goals[level, pg] = pg_num_slots[pg]
+            fallen_pages = make_typed(lambda: list[Page](),
+                                      self.num_pool_groups)
+            self._prepare_free_slots(goals, level, fallen_pages)
+            assert all(goals[level, pg] <= storage.get_num_free_slots(pg)
+                       for pg in typed_range(self.num_pool_groups))
+        ret = filled_list(HomoTuple[Slot](), self.num_life_cycles)
         try:
             for life_cycle in typed_range(self.num_life_cycles):
                 pg_idx = self.get_pool_group_index(life_cycle)
@@ -268,13 +275,14 @@ class StorageManager:
                 (p.cache_level, self.get_pool_group_index(p.life_cycle)))
             accepted_pages[pg_idx].clear()
             for (src_lvl, pg_idx), pages in partitioned.items():
+                dst_lvl = lvl_id
                 self.batched_migrate(pg_idx,
-                                     lvl_id,
+                                     dst_lvl,
                                      src_lvl,
                                      pages,
                                      update_src=True)
                 for p in pages:
-                    self._levels[src_lvl].controller.schedule_for_eviction(p)
+                    self._levels[dst_lvl].controller.schedule_for_eviction(p)
         return
 
     def batched_migrate(self, pool_group_index: PoolGroupIndex,
@@ -296,6 +304,7 @@ class StorageManager:
             prior_events: set[CachedCudaEvent] = set()
             tasks_per_pool: list[list[CopyTask]] = [[]] * num_pools
             for src, dst in zip(src_pages, dst_slots):
+                assert src.node_ref is None
                 prior_events.update((dst.ready_event, src.ready_event))
                 dst_addresses = dst_pool_group.slot_address(dst.slot_id)
                 src_addresses = src_pool_group.slot_address(src.slot_id)

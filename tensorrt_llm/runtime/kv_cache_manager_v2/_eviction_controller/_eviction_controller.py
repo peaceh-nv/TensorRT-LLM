@@ -172,7 +172,7 @@ class PerLevelEvictionController:  # for one cache level
     def schedule_for_eviction(self,
                               page: EvictablePage,
                               evict_first: bool = False):
-        assert page.node_ref is None
+        assert page.node_ref is None and page.cache_level == self._cache_level
         page.node_ref = self._get_policy(page.life_cycle).push(
             page, evict_first)
         assert unwrap_optional(page.node_ref).value is page
