@@ -1,8 +1,7 @@
 import hashlib
 import warnings
 import weakref
-from typing import (TYPE_CHECKING, ClassVar, Iterable, Iterator, Sequence,
-                    TypeVar, cast)
+from typing import TYPE_CHECKING, Iterable, Iterator, Sequence, TypeVar, cast
 
 from ._common import NDEBUG, BlockOrdinal, TokenId, TokenIdExt
 from ._eviction_controller import PageStatus
@@ -32,25 +31,30 @@ class Hasher:
     __slots__ = ('_hasher')
     _hasher: 'hashlib._Hash'
 
-    BYTE_TYPE: ClassVar[type] = type(bytes)
-    INT_TYPE: ClassVar[type] = type(int)
-
-    def __init__(self, data: int | bytes | None | Iterable = None):
+    def __init__(self, data: int | bytes | None | Sequence[int | bytes] = None):
         self._hasher = hashlib.sha256()
         if data is not None:
             self.update(data)
 
-    def update(self, data: int | bytes | Iterable) -> 'Hasher':
-        match data:
-            case int():
-                assert data >= 0 and data < (1 << 64)
-                self._hasher.update(cast(int, data).to_bytes(8, 'little'))
-            case bytes():
-                self._hasher.update(cast(bytes, data))
-            case _:
-                assert isinstance(data, Iterable)
-                for item in data:
-                    self.update(item)
+    # This function is perf-critical. Expect compromised code quality.
+    def update(self, data: int | bytes | Sequence[int | bytes]) -> 'Hasher':
+        data_type = type(data)
+        if data_type is int:
+            assert NDEBUG or (data >= 0 and data < (1 << 64)
+                              )  # type: ignore[operator]
+            self._hasher.update(data.to_bytes(
+                8, 'little'))  # type: ignore[attr-defined]
+        elif data_type is bytes:
+            self._hasher.update(data)  # type: ignore[attr-defined]
+        else:
+            assert NDEBUG or isinstance(data, Iterable)
+            for item in data:  # type: ignore[attr-defined]
+                assert NDEBUG or (type(item) is int and
+                                  (item >= 0
+                                   and item < (1 << 64))) or type(item) is bytes
+                self._hasher.update(
+                    item.to_bytes(8, 'little') if type(item) is int else
+                    item)  # type: ignore[attr-defined]
         return self
 
     @property
@@ -67,7 +71,7 @@ def sequence_to_blockchain_keys(
     digest = Hasher(lora_task_id).digest
     yield (), digest
     for token_block in chunked(tokens, tokens_per_block):
-        yield token_block, Hasher((digest, token_block)).digest
+        yield token_block, Hasher(digest).update(token_block).digest
 
 
 Child = TypeVar('Child', bound='Block | RootBlock')
@@ -225,7 +229,7 @@ class Block:
 
     @staticmethod
     def make_key(prev_key: BlockKey, tokens: Sequence[TokenIdExt]) -> BlockKey:
-        return Hasher((prev_key, tokens)).digest
+        return Hasher(prev_key).update(tokens).digest
 
     def __init__(self, tokens: Sequence[TokenIdExt], prev: 'Block | RootBlock'):
         assert prev.tokens_per_block == prev.prev.tokens_per_block, 'prev must be a full block'

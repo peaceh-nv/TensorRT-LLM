@@ -2,7 +2,7 @@ from typing import Callable, Protocol, cast, runtime_checkable
 
 from llist import sllist, sllistnode
 
-from .._common import CacheLevel, Priority
+from .._common import NDEBUG, CacheLevel, Priority
 from .._eviction_controller import PageStatus
 from .._exceptions import OutOfPagesError
 from .._life_cycle_registry import LifeCycleId
@@ -183,7 +183,7 @@ class PerLevelEvictionController:  # for one cache level
     def evict(
         self, min_num_pages: TypedIndexList[PoolGroupIndex, int]
     ) -> TypedIndexList[PoolGroupIndex, list[EvictablePage]]:
-        assert len(min_num_pages) == self.num_pool_groups
+        assert NDEBUG or len(min_num_pages) == self.num_pool_groups
         ret = make_typed(lambda: list[EvictablePage](), self.num_pool_groups)
         try:
             for pg_idx, count in enumerate(min_num_pages):

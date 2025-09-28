@@ -5,8 +5,8 @@ from typing import Iterator
 
 import cuda.bindings.driver as drv
 from cuda.core.experimental import Kernel, Program, ProgramOptions
-from kv_cache_manager_v2._common import (NDEBUG, CudaStream, LayerId,
-                                         MemAddress, TokenIdExt)
+from kv_cache_manager_v2._common import (CudaStream, LayerId, MemAddress,
+                                         TokenIdExt)
 from kv_cache_manager_v2._utils import _unwrap, chunked, div_up, exact_div
 
 MAX_TOKENS = 32
@@ -108,7 +108,9 @@ extern "C" __global__ void checkValues(Value const* data, uint32_t valuesPerToke
 @lru_cache(maxsize=None)
 def get_kernel(name: str) -> Kernel:
     assert name in ("fillValues", "checkValues")
-    return get_program(not NDEBUG).get_kernel(name)
+    debug = False
+    # debug = not NDEBUG
+    return get_program(debug).get_kernel(name)
 
 
 class Value(ctypes.Structure):

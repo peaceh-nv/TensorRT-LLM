@@ -95,4 +95,4 @@ class Priority(int):
 
 Priority._init_constants()
 
-MirroredBufGroupId = NewType("MirroredBufGroupId", int)
+TiedBufGroupId = NewType("TiedBufGroupId", int)

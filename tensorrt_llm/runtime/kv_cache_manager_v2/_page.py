@@ -12,12 +12,17 @@ if TYPE_CHECKING:
     from ._core._kv_cache import _KVCache
     from ._storage_manager import StorageManager
 
+import numba as nb
+import numpy as np
+import numpy.typing as npt
+
 from ._eviction_controller import EvictionPolicy, PageStatus
 from ._exceptions import LogicError
 from ._life_cycle_registry import LifeCycleId
-from ._storage._core import Slot
+from ._storage._core import Slot, SlotId
 from ._utils import (CachedCudaEvent, get_uniform_attribute, merge_events,
-                     partition, stream_wait_events, unwrap_weakref)
+                     partition, stream_wait_events, unwrap_optional,
+                     unwrap_weakref)
 
 
 # We will have a huge amount of pages for large storage capacity.
@@ -268,6 +273,12 @@ class LockOwner(NamedTuple):
     life_cycle: LifeCycleId
 
 
+@nb.njit(cache=True)
+def _compute_page_indices(slot_id: SlotId, scale: npt.NDArray[np.int32],
+                          bias: npt.NDArray[np.int32]) -> npt.NDArray[np.int32]:
+    return slot_id * scale + bias
+
+
 @dataclass(slots=True, init=False, weakref_slot=True)
 class _SharedPageLock:
     _uniq_lock: _UniqPageLock
@@ -299,22 +310,29 @@ class _SharedPageLock:
         old_indices = kv_cache._update_page_indices(beam_index, ordinal,
                                                     life_cycle, indices)
         assert NDEBUG or all(old_idx == BAD_PAGE_INDEX
-                             for old_idx in old_indices)
+                             for old_idx in unwrap_optional(old_indices))
 
     def __del__(self):
         self._uniq_lock.finish_events.append(
             unwrap_weakref(self._user.kv_cache).finish_event)
-        ref_old_indices = self._get_page_indices()
-        new_indices = [BAD_PAGE_INDEX for _ in ref_old_indices]
+        num_indices = len(
+            unwrap_weakref(
+                self._user.kv_cache).manager._storage._slot_to_page_indices[
+                    self._user.life_cycle].tied_buffer_groups)
+        new_indices = [BAD_PAGE_INDEX] * num_indices
         old_indices = unwrap_weakref(self._user.kv_cache)._update_page_indices(
             self._user.beam_index, self._user.ordinal, self._user.life_cycle,
             new_indices)
-        assert NDEBUG or old_indices == ref_old_indices
+        assert NDEBUG or old_indices == self._get_page_indices()
 
     def _get_page_indices(self) -> list[PageIndex]:
         storage = unwrap_weakref(self._user.kv_cache).manager._storage
-        return storage.get_page_indices_for_slot(self._user.life_cycle,
-                                                 self.page.slot_id)
+        converter = storage._slot_to_page_indices[self._user.life_cycle]
+        # this is faster, with hand-written inlining and numba jit.
+        return _compute_page_indices(self.page.slot_id, converter.scale,
+                                     converter.bias).tolist()
+        # return storage.get_page_indices_for_slot(self._user.life_cycle,
+        #                                          self.page.slot_id)
 
 
 class BatchedLockTarget(NamedTuple):

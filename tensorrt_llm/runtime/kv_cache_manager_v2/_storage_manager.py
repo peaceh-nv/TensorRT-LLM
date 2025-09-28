@@ -4,7 +4,7 @@ import weakref
 from functools import lru_cache
 from typing import TYPE_CHECKING, Iterator, Sequence, cast
 
-from ._buffer_registry import BufferRegistry, MirroredBufGroupId
+from ._buffer_registry import BufferRegistry, TiedBufGroupId
 from ._common import (GPU_LEVEL, NDEBUG, Address, CacheLevel, CacheTier,
                       LayerId, MemAddress, PageIndex)
 from ._config import CacheTierConfig, DataRole, DiskCacheTierConfig
@@ -82,17 +82,16 @@ class CacheLevelManager:
 class StorageManager:
     __slots__ = ('_parent', '_slot_to_page_indices', 'buffer_registry',
                  '_buffer_attr', '_life_cycle_grouping', '_levels',
-                 '__weakref__')
+                 '_cached_num_pool_groups', '__weakref__')
     _parent: weakref.ref['KVCacheManager']
     # Callables to convert slot_id to public page_indices.
-    _slot_to_page_indices: TypedIndexList[LifeCycleId,
-                                          TypedIndexList[MirroredBufGroupId,
-                                                         SlotToPageIndices]]
+    _slot_to_page_indices: TypedIndexList[LifeCycleId, SlotToPageIndices]
     buffer_registry: BufferRegistry
     # Contains the same information as _slot_to_page_indices but in a inverse way. For ref-check only.
     _buffer_attr: dict[BufferId, BufferAttr]
     _life_cycle_grouping: TypedIndexList[LifeCycleId, PoolGroupIndex]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
+    _cached_num_pool_groups: PoolGroupIndex
 
     def __init__(self, parent: 'KVCacheManager', config: StorageConfig):
         assert config.cache_tiers[
@@ -101,8 +100,8 @@ class StorageManager:
         self._slot_to_page_indices = config.slot_to_page_indices()
         self.buffer_registry = BufferRegistry()
         for lc_converters in self._slot_to_page_indices:
-            for cvt in lc_converters:
-                self.buffer_registry.register_mirrored_buffers(cvt.buffers)
+            for tied_buffers in lc_converters.tied_buffer_groups:
+                self.buffer_registry.register_mirrored_buffers(tied_buffers)
         self._buffer_attr = config.buffer_attributes()
         self._life_cycle_grouping = config.life_cycle_grouping()
         slot_size_lists = [pg.slot_size_list for pg in config.pool_groups]
@@ -118,6 +117,8 @@ class StorageManager:
             CacheLevelManager(self, i, config.cache_tiers[i], slot_size_lists,
                               init_ratio) for i in typed_range(num_levels)
         ])
+        self._cached_num_pool_groups = get_uniform_attribute(
+            self._levels, lambda l: l.storage.num_pool_groups)
 
     def get_pool_group_index(self, life_cycle: LifeCycleId) -> PoolGroupIndex:
         return self._life_cycle_grouping[life_cycle]
@@ -163,8 +164,7 @@ class StorageManager:
 
     @property
     def num_pool_groups(self) -> PoolGroupIndex:
-        return get_uniform_attribute(self._levels,
-                                     lambda l: l.storage.num_pool_groups)
+        return self._cached_num_pool_groups
 
     @property
     def num_cache_levels(self) -> CacheLevel:
@@ -239,7 +239,8 @@ class StorageManager:
                 num_accepted = min(new_free_cnt - goal,
                                    len(fallen_pages[pg_idx]))
                 assert num_accepted >= 0
-                accepted_pages[pg_idx] = fallen_pages[pg_idx][-num_accepted:]
+                accepted_pages[pg_idx] = fallen_pages[pg_idx][
+                    -num_accepted:] if num_accepted > 0 else []
                 fallen_pages[pg_idx].clear()
         else:
             assert all(len(g) == 0 for g in held_pages)
@@ -253,8 +254,10 @@ class StorageManager:
                     old_free_cnt + num_evicted - goals[lvl_id, pg_idx],
                     len(fallen_pages[pg_idx]))
                 assert num_accepted >= 0
-                accepted_pages[pg_idx] = fallen_pages[pg_idx][-num_accepted:]
-                del fallen_pages[pg_idx][-num_accepted:]
+                if num_accepted > 0:
+                    accepted_pages[pg_idx] = fallen_pages[pg_idx][
+                        -num_accepted:]
+                    del fallen_pages[pg_idx][-num_accepted:]
             self._prepare_free_slots(goals, CacheLevel(lvl_id + 1),
                                      fallen_pages)
         assert all(len(f) == 0 for f in fallen_pages)
@@ -386,18 +389,20 @@ class StorageManager:
 
     def get_page_indices_for_slot(self, life_cycle: LifeCycleId,
                                   slot_id: SlotId) -> list[PageIndex]:
-        converters = self._slot_to_page_indices[life_cycle]
-        return [PageIndex(cvt.scale * slot_id + cvt.bias) for cvt in converters]
-        # return [cvt(slot_id)) for cvt in converters]
+        converter = self._slot_to_page_indices[life_cycle]
+        return (converter.scale * slot_id + converter.bias).tolist()
+        # return converter(slot_id).tolist()
 
     @lru_cache(maxsize=None)
     def get_mirrored_buffer_group_indices(
-            self, life_cycle: LifeCycleId) -> HomoTuple[MirroredBufGroupId]:
-        converters = self._slot_to_page_indices[life_cycle]
+            self, life_cycle: LifeCycleId) -> HomoTuple[TiedBufGroupId]:
+        converter = self._slot_to_page_indices[life_cycle]
         get_id = self.buffer_registry.get_mirrored_buffer_group_index
         return tuple(
-            get_uniform_attribute(cvt.buffers, get_id) for cvt in converters)
+            get_uniform_attribute(grp, get_id)
+            for grp in converter.tied_buffer_groups)
 
-    def get_num_mirrored_buffer_groups(
-            self, life_cycle: LifeCycleId) -> MirroredBufGroupId:
-        return typed_len(self._slot_to_page_indices[life_cycle])
+    def get_num_tied_buffer_groups(self,
+                                   life_cycle: LifeCycleId) -> TiedBufGroupId:
+        return typed_len(
+            self._slot_to_page_indices[life_cycle].tied_buffer_groups)

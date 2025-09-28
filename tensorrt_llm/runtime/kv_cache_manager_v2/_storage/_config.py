@@ -2,7 +2,10 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import NamedTuple, cast
 
-from .._common import LayerId, MirroredBufGroupId, PageIndex
+import numpy as np
+import numpy.typing as npt
+
+from .._common import LayerId, TiedBufGroupId
 from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
@@ -86,14 +89,22 @@ class BufferAttr:
 @dataclass(slots=True, frozen=True)
 class SlotToPageIndices:
     'Both offset and stride are in number of original buffers.'
-    buffers: TypedIndexList[
+    tied_buffer_groups: TypedIndexList[TiedBufGroupId, TypedIndexList[
         PoolIndex,
-        BufferId]  # mirrored buffers in different pools of the same pool group.
-    scale: int
-    bias: PageIndex
+        BufferId]]  # tied buffer groups in different pools of the same pool group.
+    scale: npt.NDArray[np.int32]  # same length as len(buffers)
+    bias: npt.NDArray[np.int32]  # same length as len(buffers)
 
-    def __call__(self, slot_id: SlotId) -> PageIndex:
-        return PageIndex(self.bias + slot_id * self.scale)
+    def __call__(self, slot_id: SlotId) -> npt.NDArray[np.int32]:
+        return self.bias + slot_id * self.scale
+
+    @classmethod
+    def create(cls) -> 'SlotToPageIndices':
+        return cls(
+            cast(
+                TypedIndexList[TiedBufGroupId, TypedIndexList[PoolIndex,
+                                                              BufferId]], []),
+            np.array([], dtype=np.int32), np.array([], dtype=np.int32))
 
 
 @dataclass(slots=True, frozen=True)
@@ -129,35 +140,35 @@ class StorageConfig:
         return ret
 
     def slot_to_page_indices(
-        self
-    ) -> TypedIndexList[LifeCycleId, TypedIndexList[MirroredBufGroupId,
-                                                    SlotToPageIndices]]:
-        ret = make_typed(
-            lambda: cast(TypedIndexList[MirroredBufGroupId, SlotToPageIndices],
-                         []), self.num_life_cycles)
+            self) -> TypedIndexList[LifeCycleId, SlotToPageIndices]:
+        ret = make_typed(SlotToPageIndices.create, self.num_life_cycles)
         for pg in self.pool_groups:
             for slot in pg.slots:
                 life_cycle = slot.life_cycle_id
+                lst: list[tuple[list[BufferId], int, int]] = []
                 for pool_idx, page in enumerate(slot.pages):
                     offset = 0
-                    idx_buf = 0
+                    idx_buf = TiedBufGroupId(0)
                     for cb in page.coalesced_buffers:
                         for b in cb.buffer_ids:
                             bias = exact_div(offset, cb.single_buffer_size)
                             scale = exact_div(page.slot_size,
                                               cb.single_buffer_size)
                             if pool_idx == 0:
-                                ret[life_cycle].append(
-                                    SlotToPageIndices(cast(TypedIndexList, [b]),
-                                                      scale, PageIndex(bias)))
+                                lst.append(([b], scale, bias))
                             else:
-                                cvt = ret[life_cycle][MirroredBufGroupId(
-                                    idx_buf)]
-                                assert cvt.bias == bias
-                                assert cvt.scale == scale
-                                cvt.buffers.append(b)
+                                assert scale, bias == lst[idx_buf][1:]
+                                assert pool_idx == len(lst[idx_buf][0])
+                                lst[idx_buf][0].append(b)
                             offset += cb.single_buffer_size
-                            idx_buf += 1
+                            idx_buf = TiedBufGroupId(idx_buf + 1)
+                buffers = cast(
+                    TypedIndexList[TiedBufGroupId, TypedIndexList[PoolIndex,
+                                                                  BufferId]],
+                    [b for b, _, _ in lst])
+                scale = np.array([scale for _, scale, _ in lst], dtype=np.int32)
+                bias = np.array([bias for _, _, bias in lst], dtype=np.int32)
+                ret[life_cycle] = SlotToPageIndices(buffers, scale, bias)
         return ret
 
     def __post_init__(self) -> None:

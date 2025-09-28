@@ -300,7 +300,7 @@ class SlotAllocator:
             self._try_trigger_shrink()
         self._occupied_mask.clear(slot.slot_id)
         self._scrub_events()
-        assert self._check()
+        assert NDEBUG or self._check()
 
     @property
     def num_slots(self) -> int:
@@ -309,7 +309,7 @@ class SlotAllocator:
     def resize(self, new_num_slots: int) -> None:
         if self._target_capacity != self._capacity:
             self.cancel_scheduled_resize()
-        assert self._check()
+        assert NDEBUG or self._check()
         old_num_slots = self.num_slots
         if new_num_slots < self.num_slots and self._occupied_mask.any_set(
                 new_num_slots, self.num_slots):
@@ -466,7 +466,7 @@ class PoolGroupBase:
         if new_num_slots is None:
             new_num_slots = self._get_num_slots_from_pools()
         self._slot_allocator.resize(new_num_slots)
-        assert self._check(True)
+        assert NDEBUG or self._check(True)
 
     def resize_pools(self, new_num_slots: int | None) -> None:
         """
@@ -477,7 +477,7 @@ class PoolGroupBase:
             new_num_slots = self._slot_allocator.num_slots
         for pool in self._pools:
             pool.resize(new_num_slots)
-        assert self._check(True)
+        assert NDEBUG or self._check(True)
 
     def allocate(self) -> Slot:
         return self._slot_allocator.allocate()

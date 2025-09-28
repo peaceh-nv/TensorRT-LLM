@@ -11,8 +11,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Iterator, cast
 from .._block_radix_tree import Block, UselessBlockError
 from .._common import (BAD_PAGE_INDEX, GPU_LEVEL, NDEBUG, BeamIndex,
                        BlockOrdinal, BlockOrdinalT, CacheLevel, CudaStream,
-                       LayerId, MirroredBufGroupId, PageIndex, Priority,
-                       TokenIdExt)
+                       LayerId, PageIndex, Priority, TiedBufGroupId, TokenIdExt)
 from .._config import DataRole
 from .._copy_engine import CopyTask, batched_copy
 from .._exceptions import LogicError, OutOfPagesError
@@ -71,7 +70,7 @@ class _KVCache:
                  '_status', '_beam_width', '_capacity', '_history_length',
                  '_commit_state', '_blocks', '_page_indices',
                  '_committed_tokens', '_num_committed_blocks', '_finish_event',
-                 '_buffer_to_mirrored_index', '_mirrored_indices',
+                 '_buffer_to_mirrored_index', '_tied_grp_indices',
                  '__weakref__')
 
     class Status(enum.Enum):
@@ -86,7 +85,7 @@ class _KVCache:
         # user called stop_committing() or close()
         USER_STOP = enum.auto()
 
-    _manager: weakref.ref['KVCacheManager']
+    _manager: 'KVCacheManager'
     _lora_task_id: int | None
     _get_priority: Callable[[BlockOrdinal, LifeCycle], Priority]
     _cuda_stream: CudaStream | None
@@ -98,7 +97,7 @@ class _KVCache:
 
     _blocks: TypedIndexList[BlockOrdinal, SeqBlock]
     # we maintain _page_indices to accelerate the get_page_indices() API. In principle it can be computed on the fly, but that would be slow due to python.
-    _page_indices: TypedIndexList[BeamIndex, TypedIndexList[MirroredBufGroupId,
+    _page_indices: TypedIndexList[BeamIndex, TypedIndexList[TiedBufGroupId,
                                                             array.array[int]]]
     _committed_tokens: list[TokenIdExt]
     # Sometimes we can't commit a block because all its tokens are already covered by another block in the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric difference, 2. if our block is a partial block, we can't write to memory of the other blocks. Internally, we stop committing from such a block, but still give user an illusion that the block is committed.
@@ -107,16 +106,15 @@ class _KVCache:
     _finish_event: CachedCudaEvent | None
 
     # available in self.manager._storage.buffer_registry, put here to accelerate the get_page_indices() API.
-    _buffer_to_mirrored_index: dict[BufferId, MirroredBufGroupId]
+    _buffer_to_mirrored_index: dict[BufferId, TiedBufGroupId]
     # available with self.manager._storage.get_mirrored_buffer_group_indices(). Cached here to accelerate the get_page_indices() API.
-    _mirrored_indices: TypedIndexList[LifeCycleId,
-                                      HomoTuple[MirroredBufGroupId]]
+    _tied_grp_indices: TypedIndexList[LifeCycleId, HomoTuple[TiedBufGroupId]]
 
     def __init__(self, manager: 'KVCacheManager', lora_task_id: int | None,
                  input_tokens: Sequence[TokenIdExt] | None,
                  custom_priority_callback: Callable[[BlockOrdinal, LifeCycle],
                                                     Priority]):
-        self._manager = weakref.ref(manager)
+        self._manager = manager
         self._lora_task_id = lora_task_id
         self._get_priority = custom_priority_callback
         self._cuda_stream = None
@@ -134,8 +132,8 @@ class _KVCache:
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
         self._buffer_to_mirrored_index = manager._storage.buffer_registry._buffer_to_mirrored_index
-        self._mirrored_indices = cast(
-            TypedIndexList[LifeCycleId, HomoTuple[MirroredBufGroupId]], [
+        self._tied_grp_indices = cast(
+            TypedIndexList[LifeCycleId, HomoTuple[TiedBufGroupId]], [
                 manager._storage.get_mirrored_buffer_group_indices(lc)
                 for lc in typed_range(manager._life_cycles.size)
             ])
@@ -145,7 +143,7 @@ class _KVCache:
 
     @property
     def manager(self) -> 'KVCacheManager':
-        return unwrap_weakref(self._manager)
+        return self._manager
 
     @property
     def cuda_stream(self) -> CudaStream:
@@ -789,12 +787,17 @@ class _KVCache:
         finally:
             self._finish_event = None
 
-    def _update_page_indices(self, beam_idx: BeamIndex, ordinal: BlockOrdinal,
-                             lc: LifeCycleId,
-                             indices: list[PageIndex]) -> list[PageIndex]:
+    def _update_page_indices(
+            self, beam_idx: BeamIndex, ordinal: BlockOrdinal, lc: LifeCycleId,
+            indices: list[PageIndex]) -> list[PageIndex] | None:
         beam = self._page_indices[beam_idx]
+        if NDEBUG:
+            for i, (buf_group_id, page_idx) in enumerate(
+                    zip(self._tied_grp_indices[lc], indices)):
+                beam[buf_group_id][ordinal] = page_idx
+            return None
         for i, (buf_group_id,
-                page_idx) in enumerate(zip(self._mirrored_indices[lc],
+                page_idx) in enumerate(zip(self._tied_grp_indices[lc],
                                            indices)):
             arr = beam[buf_group_id]
             old = PageIndex(arr[ordinal])
