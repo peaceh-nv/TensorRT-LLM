@@ -764,7 +764,7 @@ class CachedCudaStream(ItemHolderWithGlobalPool[drv.CUstream]):
 class TemporaryCudaStream(CachedCudaStream):
     """
     A cached non-blocking CUDA stream. Mainly used as temporary worker streams.
-    Requires a list of prior events to wait for dependencies, and a finish event must be recorded before closing.
+    Requires a list of prior events to wait for dependencies. A finish event is recorded when exiting normally. Call take_finish_event() to get the finish event.
     """
     __slots__ = ('_finish_event')
     _finish_event: CachedCudaEvent | None
@@ -777,7 +777,8 @@ class TemporaryCudaStream(CachedCudaStream):
 
     def __del__(self):
         if self._finish_event is not None:
-            warnings.warn("[KVCacheManager] finish event not taken")
+            warnings.warn(
+                "[KVCacheManager] finish event recorded but not taken")
         super().__del__()
 
     def take_finish_event(self) -> CachedCudaEvent:
@@ -789,7 +790,8 @@ class TemporaryCudaStream(CachedCudaStream):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self._finish_event = self.record_event()
+        if not exc_type:
+            self._finish_event = self.record_event()
 
 
 def merge_events(

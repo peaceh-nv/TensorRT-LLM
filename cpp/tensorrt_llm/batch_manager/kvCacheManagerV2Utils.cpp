@@ -77,7 +77,7 @@ CUDA_CB void hostFnDiskToHostCopy(void* userData) noexcept
     bool success = true;
     for (auto const& t : data->tasks)
     {
-        success = success && readAll(t.src.fd, t.src.pos, t.dst, data->numBytes);
+        success = success && readAll(t.src.fd, t.src.pos, reinterpret_cast<void*>(t.dst), data->numBytes);
     }
     delete data;
     if (!success)
@@ -93,7 +93,7 @@ CUDA_CB void hostFnHostToDiskCopy(void* userData) noexcept
     bool success = true;
     for (auto const& t : data->tasks)
     {
-        success = success && writeAll(t.dst.fd, t.dst.pos, t.src, data->numBytes);
+        success = success && writeAll(t.dst.fd, t.dst.pos, reinterpret_cast<void const*>(t.src), data->numBytes);
     }
     delete data;
     if (!success)

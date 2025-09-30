@@ -344,7 +344,7 @@ class _KVCache:
     # Users promise to not commit any more tokens. For cases where we shouldn't reuse generated tokens (eg. CoT), this helps us drop (instead of evict) out-of-window blocks for SWA layers.
     # If there is a uncommitted block containing committed tokens, we will commit the block immediately.
     def stop_committing(self):
-        assert self.status == self.Status.ACTIVE
+        assert self.status != self.Status.CLOSED
         if self._commit_state == self.CommitState.USER_STOP:
             return
         assert NDEBUG or self._check_sanity()
@@ -479,7 +479,7 @@ class _KVCache:
 
         assert tree_block.tokens_per_block == tokens_per_block
         if is_new:
-            # Either we are the only writer to padding. Other _KVCache reusing it should make copies.
+            # We are the only writer to padding. Other _KVCache reusing it should make copies.
             uncommitted_pages = self._take_uncommitted_page(ordinal, beam_idx)
             # convert uncommitted pages to committed pages and create a new block in the radix tree.
             for lc, (page, locked) in typed_enumerate(uncommitted_pages):
@@ -605,8 +605,9 @@ class _KVCache:
         holders = self._block(ordinal, beam_idx)
         ret: list[tuple[UncommittedPage, bool]] = []
         for lc, holder in enumerate(holders):
-            assert holder is not None and isinstance(holder.page,
-                                                     UncommittedPage)
+            if holder is None:
+                continue
+            assert isinstance(holder.page, UncommittedPage)
             locked = isinstance(holder, _SharedPageLock)
             ret.append((holder.page, locked))
             holders[LifeCycleId(lc)] = None

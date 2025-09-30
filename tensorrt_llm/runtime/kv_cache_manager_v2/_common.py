@@ -52,10 +52,10 @@ PageIndex = NewType("PageIndex", int)
 BAD_PAGE_INDEX = PageIndex(-1)
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class DiskAddress:
     fd: FileDescriptor
-    offset: int
+    pos: int
 
 
 Address = MemAddress | DiskAddress

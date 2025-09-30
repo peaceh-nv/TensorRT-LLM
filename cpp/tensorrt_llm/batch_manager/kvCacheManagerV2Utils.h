@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cuda.h>
 #include <vector>
 
@@ -28,7 +29,7 @@ struct DiskAddress
     ssize_t pos;
 };
 
-using MemAddress = void*;
+using MemAddress = std::uintptr_t;
 
 template <typename DstAddr, typename SrcAddr>
 struct Task
