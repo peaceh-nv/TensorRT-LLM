@@ -20,9 +20,9 @@ from ._eviction_controller import EvictionPolicy, PageStatus
 from ._exceptions import LogicError
 from ._life_cycle_registry import LifeCycleId
 from ._storage._core import Slot, SlotId
-from ._utils import (CachedCudaEvent, get_uniform_attribute, merge_events,
-                     partition, stream_wait_events, unwrap_optional,
-                     unwrap_weakref)
+from ._utils import (CachedCudaEvent, filled_list, get_uniform_attribute,
+                     merge_events, partition, stream_wait_events,
+                     unwrap_optional, unwrap_weakref)
 
 
 # We will have a huge amount of pages for large storage capacity.
@@ -57,12 +57,12 @@ class Page(Slot):
         if self._holder is not None:
             return unwrap_weakref(self._holder)
         controller = self.manager
-        holder = object.__new__(_PageHolder)
-        holder._setup(self)
-        self._holder = weakref.ref(holder)
         if self.scheduled_for_eviction and not controller.is_evictable(self):
             controller.exclude_from_eviction(self)
             assert not self.scheduled_for_eviction
+        holder = object.__new__(_PageHolder)
+        holder._setup(self)
+        self._holder = weakref.ref(holder)
         return holder
 
     # Prevent eviction. You need to migrate the page to GPU later.
@@ -130,6 +130,7 @@ class UncommittedPage(Page):
         'Moves the slot to a new committed page and add the new page to the block. The uncommitted page becomes invalid.'
         assert not self.scheduled_for_eviction
         assert block.storage[self.life_cycle] is None
+        # If you hit this assertion failure, it's likely because you are using debugpy, which delayed GC. Untick breakpoints for exceptions to avoid this.
         assert self.status == PageStatus.DROPPABLE, "Release holder/lock first"
         committed_page = CommittedPage(self.manager, block, self.life_cycle,
                                        self.cache_level, self, self.priority)
@@ -281,16 +282,16 @@ def _compute_page_indices(slot_id: SlotId, scale: npt.NDArray[np.int32],
 
 @dataclass(slots=True, init=False, weakref_slot=True)
 class _SharedPageLock:
-    _uniq_lock: _UniqPageLock
+    _uniq_lock: _UniqPageLock | None
     _user: LockOwner
 
     @property
     def page(self) -> Page:
-        return self._uniq_lock.page
+        return unwrap_optional(self._uniq_lock).page
 
     @property
     def holder(self) -> _PageHolder:
-        return self._uniq_lock.holder
+        return unwrap_optional(self._uniq_lock).holder
 
     def __hash__(self):
         return hash(id(self))
@@ -313,6 +314,12 @@ class _SharedPageLock:
                              for old_idx in unwrap_optional(old_indices))
 
     def __del__(self):
+        if self._uniq_lock is not None:
+            self.unlock()
+
+    def unlock(self) -> Page:
+        assert self._uniq_lock is not None
+        page = self.page
         self._uniq_lock.finish_events.append(
             unwrap_weakref(self._user.kv_cache).finish_event)
         num_indices = len(
@@ -324,6 +331,8 @@ class _SharedPageLock:
             self._user.beam_index, self._user.ordinal, self._user.life_cycle,
             new_indices)
         assert NDEBUG or old_indices == self._get_page_indices()
+        self._uniq_lock = None
+        return page
 
     def _get_page_indices(self) -> list[PageIndex]:
         storage = unwrap_weakref(self._user.kv_cache).manager._storage
@@ -349,16 +358,32 @@ def batched_lock_to_gpu(
     storage = kv_cache.manager._storage
     assert not tasks or storage is get_uniform_attribute(
         tasks, lambda p: p.page.manager)
-    partitioned = partition(
-        tasks, lambda p:
-        (p.page.cache_level, storage.get_pool_group_index(p.life_cycle)))
-    for (lvl, pg_idx), part in partitioned.items():
-        if lvl == GPU_LEVEL:
+    requirements = filled_list(0, storage.num_pool_groups)
+    scheduled_for_eviction = [t.page.scheduled_for_eviction for t in tasks]
+    for t, e in zip(tasks, scheduled_for_eviction):
+        if e:
+            storage.exclude_from_eviction(t.page)
+        if t.page.cache_level == GPU_LEVEL:
             continue
-        storage.batched_migrate(pg_idx,
-                                GPU_LEVEL,
-                                lvl, [p.page for p in part],
-                                update_src=True)
+        requirements[storage.get_pool_group_index(t.life_cycle)] += 1
+
+    try:
+        storage.prepare_free_slots(GPU_LEVEL, requirements)
+        partitioned = partition(
+            tasks, lambda p:
+            (p.page.cache_level, storage.get_pool_group_index(p.life_cycle)))
+        for (lvl, pg_idx), part in partitioned.items():
+            if lvl == GPU_LEVEL:
+                continue
+            storage._batched_migrate(pg_idx,
+                                     GPU_LEVEL,
+                                     lvl, [p.page for p in part],
+                                     update_src=True)
+    except Exception:
+        for t, e in zip(tasks, scheduled_for_eviction):
+            if e:
+                storage.schedule_for_eviction(t.page)
+        raise
     stream_wait_events(kv_cache.cuda_stream,
                        (p.page.ready_event for p in tasks))
     return [

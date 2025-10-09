@@ -8,17 +8,22 @@ from typing import ClassVar, NamedTuple, Sequence
 
 import cuda.bindings.driver as drv
 
-############# for faster debugging #############
+# avoid importing the whole tensorrt_llm module, which takes time during debugging.
 sys.path.append(os.path.abspath(os.path.join(__file__, "../../..")))
-import bindings.internal.batch_manager.kv_cache_manager_v2_utils as nb_utils
-from bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
-    DiskAddress, DiskToDiskTask, DiskToHostTask, HostToDiskTask)
+import bindings
+
+sys.path.pop()
 
 from ._common import Address, CacheTier, CudaStream, MemAddress
 from ._utils import (CachedCudaEvent, HomoTuple, HostMem, _unwrap, div_up,
                      stream_wait_events)
 
-################################################
+nb_utils = bindings.internal.batch_manager.kv_cache_manager_v2_utils
+DiskAddress = nb_utils.DiskAddress
+DiskToDiskTask = nb_utils.DiskToDiskTask
+DiskToHostTask = nb_utils.DiskToHostTask
+HostToDiskTask = nb_utils.HostToDiskTask
+HostToHostTask = nb_utils.HostToHostTask
 
 
 class CopyTask(NamedTuple):
@@ -35,20 +40,30 @@ def _copy_gpu_to_gpu(tasks: Sequence[CopyTask], num_bytes: int,
 
 def _copy_host_to_host(tasks: Sequence[CopyTask], num_bytes: int,
                        stream: CudaStream):
-    # @TODO: use a host callback to do multiple tasks in one batch
-    for dst, src in tasks:
-        _unwrap(drv.cuMemcpyHtoHAsync(dst, src, num_bytes, stream))
+    _unwrap(
+        drv.CUresult(
+            nb_utils.copy_host_to_host(
+                [HostToHostTask(dst, src) for dst, src in tasks], num_bytes,
+                stream)))
 
 
 def _copy_disk_to_disk(tasks: Sequence[CopyTask], num_bytes: int,
                        stream: CudaStream):
     _unwrap(
         drv.CUresult(
-            nb_utils.copy_disk_to_disk([
-                DiskToDiskTask(DiskAddress(dst.fd, dst.pos),
-                               DiskAddress(src.fd, src.pos))
-                for dst, src in tasks
-            ], num_bytes, stream)))
+            nb_utils.copy_disk_to_disk(
+                [
+                    DiskToDiskTask(
+                        DiskAddress(
+                            dst.fd,  # type: ignore[attr-defined]
+                            dst.pos),  # type: ignore[attr-defined]
+                        DiskAddress(
+                            src.fd,  # type: ignore[attr-defined]
+                            src.pos))  # type: ignore[attr-defined]
+                    for dst, src in tasks
+                ],
+                num_bytes,
+                stream)))
 
 
 def _copy_gpu_to_host(tasks: Sequence[CopyTask], num_bytes: int,
@@ -69,20 +84,28 @@ def _copy_disk_to_host(tasks: Sequence[CopyTask], num_bytes: int,
                        stream: CudaStream):
     _unwrap(
         drv.CUresult(
-            nb_utils.copy_disk_to_host([
-                DiskToHostTask(dst, DiskAddress(src.fd, src.pos))
-                for dst, src in tasks
-            ], num_bytes, stream)))
+            nb_utils.copy_disk_to_host(
+                [
+                    DiskToHostTask(dst, DiskAddress(
+                        src.fd, src.pos))  # type: ignore[attr-defined]
+                    for dst, src in tasks
+                ],
+                num_bytes,
+                stream)))
 
 
 def _copy_host_to_disk(tasks: Sequence[CopyTask], num_bytes: int,
                        stream: CudaStream):
     _unwrap(
         drv.CUresult(
-            nb_utils.copy_host_to_disk([
-                HostToDiskTask(DiskAddress(dst.fd, dst.pos), src)
-                for dst, src in tasks
-            ], num_bytes, stream)))
+            nb_utils.copy_host_to_disk(
+                [
+                    HostToDiskTask(DiskAddress(dst.fd, dst.pos),
+                                   src)  # type: ignore[attr-defined]
+                    for dst, src in tasks
+                ],
+                num_bytes,
+                stream)))
 
 
 Copier = Callable[[Sequence[CopyTask], int, CudaStream], None]

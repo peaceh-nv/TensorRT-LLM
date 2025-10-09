@@ -102,6 +102,22 @@ CUDA_CB void hostFnHostToDiskCopy(void* userData) noexcept
     }
 }
 
+CUDA_CB void hostFnHostToHostCopy(void* userData) noexcept
+{
+    // @TODO: enable multi-threading with a thread pool
+    auto const data = static_cast<UserData<MemAddress, MemAddress>*>(userData);
+    bool success = true;
+    for (auto const& t : data->tasks)
+    {
+        memcpy(reinterpret_cast<void*>(t.dst), reinterpret_cast<void const*>(t.src), data->numBytes);
+    }
+    delete data;
+    if (!success)
+    {
+        TLLM_LOG_ERROR("[kvCacheManagerV2Utils] hostFnHostToHostCopy failed.\n");
+    }
+}
+
 CUresult copyDiskToDisk(
     std::vector<Task<DiskAddress, DiskAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept
 {
@@ -121,6 +137,13 @@ CUresult copyHostToDisk(
 {
     auto const data = new UserData<DiskAddress, MemAddress>{std::move(tasks), numBytes};
     return cuLaunchHostFunc(stream, hostFnHostToDiskCopy, data);
+}
+
+CUresult copyHostToHost(
+    std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept
+{
+    auto const data = new UserData<MemAddress, MemAddress>{std::move(tasks), numBytes};
+    return cuLaunchHostFunc(stream, hostFnHostToHostCopy, data);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

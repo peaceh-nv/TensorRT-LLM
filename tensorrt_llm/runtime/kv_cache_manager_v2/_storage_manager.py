@@ -137,15 +137,9 @@ class StorageManager:
         storage = self._levels[level].storage
         if any(pg_num_slots[pg] > storage.get_num_free_slots(pg)
                for pg in typed_range(self.num_pool_groups)):
-            goals = filled_array2d(self.num_cache_levels, self.num_pool_groups,
-                                   0)
-            for pg in typed_range(self.num_pool_groups):
-                goals[level, pg] = pg_num_slots[pg]
-            fallen_pages = make_typed(lambda: list[Page](),
-                                      self.num_pool_groups)
-            self._prepare_free_slots(goals, level, fallen_pages)
-            assert all(goals[level, pg] <= storage.get_num_free_slots(pg)
-                       for pg in typed_range(self.num_pool_groups))
+            self.prepare_free_slots(level, pg_num_slots)
+        assert all(pg_num_slots[pg] <= storage.get_num_free_slots(pg)
+                   for pg in typed_range(self.num_pool_groups))
         ret = filled_list(HomoTuple[Slot](), self.num_life_cycles)
         try:
             for life_cycle in typed_range(self.num_life_cycles):
@@ -194,6 +188,15 @@ class StorageManager:
         # held pages in last level cache can't be evicted.
         return (status == PageStatus.DROPPABLE and page.is_committed()) or (
             status == PageStatus.HELD and level < self.num_cache_levels - 1)
+
+    def prepare_free_slots(
+            self, level: CacheLevel,
+            requirements: TypedIndexList[PoolGroupIndex, int]) -> None:
+        goals = filled_array2d(self.num_cache_levels, self.num_pool_groups, 0)
+        for pg in typed_range(self.num_pool_groups):
+            goals[level, pg] = requirements[pg]
+        fallen_pages = make_typed(lambda: list[Page](), self.num_pool_groups)
+        self._prepare_free_slots(goals, level, fallen_pages)
 
     def _prepare_free_slots(
             self, goals: Array2D[CacheLevel, PoolGroupIndex,
@@ -276,22 +279,21 @@ class StorageManager:
             accepted_pages[pg_idx].clear()
             for (src_lvl, pg_idx), pages in partitioned.items():
                 dst_lvl = lvl_id
-                self.batched_migrate(pg_idx,
-                                     dst_lvl,
-                                     src_lvl,
-                                     pages,
-                                     update_src=True)
+                self._batched_migrate(pg_idx,
+                                      dst_lvl,
+                                      src_lvl,
+                                      pages,
+                                      update_src=True)
                 for p in pages:
                     self._levels[dst_lvl].controller.schedule_for_eviction(p)
         return
 
-    def batched_migrate(self, pool_group_index: PoolGroupIndex,
-                        dst_level: CacheLevel, src_level: CacheLevel,
-                        src_pages: Sequence[Page],
-                        update_src: bool) -> Sequence[Slot] | None:
+    def _batched_migrate(self, pool_group_index: PoolGroupIndex,
+                         dst_level: CacheLevel, src_level: CacheLevel,
+                         src_pages: Sequence[Page],
+                         update_src: bool) -> Sequence[Slot] | None:
+        'Free slots must be prepared before calling this function.'
         assert dst_level != src_level, "dst_level and src_level must be different"
-        assert not any(p.scheduled_for_eviction for p in src_pages
-                       ), "Source pages must not be scheduled for eviction"
         num_slots = len(src_pages)
         num_pools = self.num_pools(pool_group_index)
         src_pool_group = self._pool_group(src_level, pool_group_index)
@@ -324,9 +326,14 @@ class StorageManager:
                 dst.ready_event = finish_event
                 src.ready_event = finish_event  # compulsory for the next owner getting this slot from the pool.
                 if update_src:
+                    scheduled_for_eviction = src.scheduled_for_eviction
+                    if scheduled_for_eviction:
+                        self.exclude_from_eviction(src)
                     src_pool_group.release(src)
                     src.set_slot(dst)
                     src.cache_level = dst_level
+                    if scheduled_for_eviction:
+                        self.schedule_for_eviction(src)
             return None if update_src else dst_slots
         except Exception:
             for s in dst_slots:

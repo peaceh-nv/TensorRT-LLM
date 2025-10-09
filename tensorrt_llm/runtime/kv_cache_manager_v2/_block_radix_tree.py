@@ -40,10 +40,11 @@ class Hasher:
     def update(self, data: int | bytes | Sequence[int | bytes]) -> 'Hasher':
         data_type = type(data)
         if data_type is int:
-            assert NDEBUG or (data >= 0 and data < (1 << 64)
-                              )  # type: ignore[operator]
-            self._hasher.update(data.to_bytes(
-                8, 'little'))  # type: ignore[attr-defined]
+            assert NDEBUG or (data >= 0 and data <  # type: ignore[operator]
+                              (1 << 64))
+            self._hasher.update(
+                data.to_bytes(  # type: ignore[attr-defined]
+                    8, 'little'))
         elif data_type is bytes:
             self._hasher.update(data)  # type: ignore[attr-defined]
         else:
@@ -71,7 +72,8 @@ def sequence_to_blockchain_keys(
     digest = Hasher(lora_task_id).digest
     yield (), digest
     for token_block in chunked(tokens, tokens_per_block):
-        yield token_block, Hasher(digest).update(token_block).digest
+        digest = Hasher(digest).update(token_block).digest
+        yield token_block, digest
 
 
 Child = TypeVar('Child', bound='Block | RootBlock')
@@ -178,7 +180,7 @@ def _add_or_get_existing(parent: 'RootBlock | Block',
 
 
 class RootBlock:
-    __slots__ = ('_prev', 'key', 'next', '__weakref__')
+    __slots__ = ('_prev', 'key', 'next', 'lora_task_id', '__weakref__')
     key: BlockKey
     lora_task_id: int | None
     _prev: weakref.ref['BlockRadixTree']
@@ -187,6 +189,7 @@ class RootBlock:
     def __init__(self, lora_task_id: int | None, prev: 'BlockRadixTree'):
         self.key = self.make_key(lora_task_id)
         assert self.key not in prev.next, "Root block already exists"
+        self.lora_task_id = lora_task_id
         self._prev = weakref.ref(prev)
         self.next = {}
         prev.next[self.key] = self

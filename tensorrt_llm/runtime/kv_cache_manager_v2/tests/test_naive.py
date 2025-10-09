@@ -11,9 +11,11 @@ from kv_cache_manager_v2 import (AttentionLayerConfig, BufferConfig,
                                  HostCacheTierConfig, KVCacheManager,
                                  KVCacheManagerConfig, LayerId, TokenId,
                                  TokenIdExt, _KVCache)
+from kv_cache_manager_v2._block_radix_tree import traverse_subtree
+from kv_cache_manager_v2._eviction_controller import PageStatus
 from kv_cache_manager_v2._exceptions import OutOfPagesError
 from kv_cache_manager_v2._utils import (TemporaryCudaStream, round_up,
-                                        typed_range)
+                                        typed_range, unwrap_weakref)
 from kv_cache_manager_v2.tests.fake_engine import FakeEngine, Role, Step
 from parameterized import parameterized
 
@@ -31,7 +33,7 @@ class TestNaive(unittest.TestCase):
 
     def next_token(self) -> TokenIdExt:
         token_id = next(self._token_id_gen)
-        if token_id % 100 == 0:
+        if token_id % 100 == 99:
             return randbytes(32)
         else:
             return TokenId(token_id)
@@ -88,8 +90,9 @@ class TestNaive(unittest.TestCase):
         if refcheck:
             self.engine.execute([Step(req_id, kv_cache, input, history)],
                                 stream)
-        kv_cache.commit(input)
-        history.extend(input)
+        if input:
+            kv_cache.commit(input)
+            history.extend(input)
         # decode
         for _ in range(decode_len):
             required_capacity = len(history) + 1
@@ -147,7 +150,7 @@ class TestNaive(unittest.TestCase):
         seq_len = max_seq_len
 
         # create a request and suspend it. It shall not consume any GPU memory after suspend.
-        req0 = self.new_request(0, None, 256, max_seq_len - 256)
+        req0 = self.new_request(0, None, 256, seq_len - 256)
         with TemporaryCudaStream([]) as s:
             stream = s.handle
             success = req0.kv_cache.resume(stream)
@@ -157,7 +160,7 @@ class TestNaive(unittest.TestCase):
         req0.kv_cache.suspend()
 
         # run another request that will take all the GPU memory
-        req1 = self.new_request(0, None, 256, max_seq_len - 256)
+        req1 = self.new_request(0, None, 256, seq_len - 256)
         with TemporaryCudaStream([]) as s:
             stream = s.handle
             success = req1.kv_cache.resume(stream)
@@ -173,18 +176,55 @@ class TestNaive(unittest.TestCase):
         self.assertRaises(OutOfPagesError,
                           lambda: self.run_naive(seq_len + 1, 1, False))
 
+    def test_cache_reuse(self):
+        self.prepare(8 << 20, 8 << 20, 1 << 30, 36, 128, 1)
+        # if we have n blocks, we need 8192*2*18*(1+5+n) bytes of memory. For the (1+5+n), 1 is for sink blocks, 5 is for SWA (window=128), n is for full attention.
+        max_seq_len = 32 * 22  # 23 blocks will require more than 8MB memory
+        seq_len = max_seq_len
+
+        req0 = self.new_request(0, None, 256, seq_len - 256)
+        with TemporaryCudaStream([]) as s:
+            stream = s.handle
+            success = req0.kv_cache.resume(stream)
+            assert success
+            self.run_request(req0, 32, False)
+        s.take_finish_event()
+        req0.kv_cache.close()
+
+        for root_block in self.manager._radix_tree.next.values():
+            for block0 in root_block.next.values():
+                for block in traverse_subtree(block0):
+                    for page in block.storage:
+                        if page is not None:
+                            assert unwrap_weakref(
+                                page).status == PageStatus.DROPPABLE
+
+        prompt1 = req0.kv_cache._committed_tokens[:(seq_len // 2 - 7)]
+        req1 = self.Request(1, self.manager.create_kv_cache(None, prompt1),
+                            prompt1, seq_len - len(prompt1))
+        assert req1.kv_cache.num_committed_tokens == len(prompt1)
+        with TemporaryCudaStream([]) as s:
+            stream = s.handle
+            success = req1.kv_cache.resume(stream)
+            assert success
+            self.run_request(req1, 32, False)
+        s.take_finish_event()
+        req1.kv_cache.close()
+
+        self.manager.clear_reusable_blocks()
+
     def test_naive(self):
         self.prepare(256 << 20, 256 << 20, 1 << 30, 36, 128, 48)
         self.run_naive(512, 1, True)
 
-    @parameterized.expand([(2**i, ) for i in range(12)])
-    # @parameterized.expand([(32, )])
-    def test_naive_perf(self, interval):
+    @parameterized.expand([(2**i, False) for i in range(12)])
+    # @parameterized.expand([(32, True)])
+    def test_naive_perf(self, interval, profile: bool):
         self.skipTest("Skipping perf test")
         self.prepare(256 << 20, 256 << 20, 1 << 30, 36, 128, 48)
         self.run_naive(10240, interval, False)  # warm up for numba jit
         profiler = None
-        if False:
+        if profile:
             import cProfile
             profiler = cProfile.Profile()
             profiler.enable()

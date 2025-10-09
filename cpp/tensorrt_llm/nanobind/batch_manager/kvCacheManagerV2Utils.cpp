@@ -49,6 +49,11 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         .def_rw("dst", &Task<DiskAddress, MemAddress>::dst)
         .def_rw("src", &Task<DiskAddress, MemAddress>::src);
 
+    nb::class_<Task<MemAddress, MemAddress>>(module, "HostToHostTask")
+        .def(nb::init<MemAddress, MemAddress>(), nb::arg("dst"), nb::arg("src"))
+        .def_rw("dst", &Task<MemAddress, MemAddress>::dst)
+        .def_rw("src", &Task<MemAddress, MemAddress>::src);
+
     // Bind copy functions
     module.def(
         "copy_disk_to_disk",
@@ -70,6 +75,13 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         { return copyHostToDisk(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
         nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"),
         "Copy data from host to disk using CUDA host function");
+
+    module.def(
+        "copy_host_to_host",
+        [](std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> int
+        { return copyHostToHost(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
+        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"),
+        "Copy data from host to host using CUDA host function");
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -100,7 +100,7 @@ class _KVCache:
     _page_indices: TypedIndexList[BeamIndex, TypedIndexList[TiedBufGroupId,
                                                             array.array[int]]]
     _committed_tokens: list[TokenIdExt]
-    # Sometimes we can't commit a block because all its tokens are already covered by another block in the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric difference, 2. if our block is a partial block, we can't write to memory of the other blocks. Internally, we stop committing from such a block, but still give user an illusion that the block is committed.
+    # Sometimes we can't commit a block because all its tokens are already covered by another block in the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric difference, 2. if our block is a partial block, we can't write to memory of the other blocks. Internally, we stop committing from such a block, but still give user an illusion that the block is committed. In such cases, _committed_tokens contains what users have fed with commit(), while _num_committed_blocks contains the number of blocks that are actually committed.
     _num_committed_blocks: BlockOrdinal
     # set when switch away from ACTIVE, cleared when switching to ACTIVE.
     _finish_event: CachedCudaEvent | None
@@ -319,6 +319,8 @@ class _KVCache:
                beam_search_indices: Sequence[int] | None = None):
         if self.beam_width != 1:
             raise NotImplementedError("Not implemented yet for beam search")
+        if not accepted_input_tokens:
+            return
         assert beam_search_indices is None
         assert self.status == self.Status.ACTIVE
         if self._commit_state == self.CommitState.USER_STOP:
@@ -604,13 +606,13 @@ class _KVCache:
         'Take ownership of the uncommitted pages, together with bool flag indicating if it was locked. And reset holders to None.'
         holders = self._block(ordinal, beam_idx)
         ret: list[tuple[UncommittedPage, bool]] = []
-        for lc, holder in enumerate(holders):
+        for lc, holder in typed_enumerate(holders):
             if holder is None:
                 continue
             assert isinstance(holder.page, UncommittedPage)
             locked = isinstance(holder, _SharedPageLock)
             ret.append((holder.page, locked))
-            holders[LifeCycleId(lc)] = None
+            holders[lc] = None
         return cast(TypedIndexList, ret)
 
     def _check_sanity(self) -> bool:
@@ -773,6 +775,12 @@ class _KVCache:
                     raise RuntimeError(
                         "We need to copy a block for partial match but we can't find enough pages in any cache level. Did you set up a secondary / third level of cache storage? Do you have too many instances of suspended KV cache? You can also avoid this failure by disallowing partial matching."
                     )
+        self._num_committed_blocks = BlockOrdinal(
+            len(self._committed_tokens) // tokens_per_block)
+        for beam_indices in self._page_indices:
+            for indices in beam_indices:
+                indices.extend([BAD_PAGE_INDEX] *
+                               (len(self._blocks) - len(indices)))
 
     def _clear_blocks(self):
         # drop the last block first

@@ -44,5 +44,7 @@ CUresult copyDiskToHost(
     std::vector<Task<MemAddress, DiskAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
 CUresult copyHostToDisk(
     std::vector<Task<DiskAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
+CUresult copyHostToHost(
+    std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
