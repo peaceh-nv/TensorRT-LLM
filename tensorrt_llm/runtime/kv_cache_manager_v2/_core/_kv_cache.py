@@ -221,7 +221,7 @@ class _KVCache:
     # Decrease of capacity cannot remove historical or committed tokens.
     # History length cannot be decreased.
     # Increase of history length may trigger out-of-window block eviction/dropping for SWA layers.
-    # If we use two separate APIs for capacity and history length, we will need to increase capacity first to maintain capacity >= history_length. But then we may have a middle state (between two APIs) where we use more pages than necessary for SWA layers. So we use a single API to avoid this.
+    # If we use two separate APIs for capacity and history length, sometimes we will need to increase capacity first to maintain capacity >= history_length. But then we may have a middle state (between two APIs) where we use more pages than necessary for SWA layers. So we use a single API to avoid this. Usually this is a concern only for prefill phase where we create many tokens in one step. For other cases, we can just set the capacity and history_length properties instead.
     def resize(self, capacity: int | None, history_length: int | None) -> bool:
         assert self.status == self.Status.ACTIVE
         capacity = value_or(capacity, self._capacity)
@@ -230,10 +230,13 @@ class _KVCache:
             raise ValueError("History length cannot be decreased")
         if capacity < history_length:
             raise ValueError("History length cannot be greater than capacity")
+        if self._shortcut_set_capacity(
+                capacity) and self._shortcut_set_history_length(history_length):
+            return True
+        tokens_per_block = self.tokens_per_block
         backup_holders = self._unlock_stale_blocks(history_length)
-        old_num_blocks = BlockOrdinal(
-            div_up(self._capacity, self.tokens_per_block))
-        new_num_blocks = BlockOrdinal(div_up(capacity, self.tokens_per_block))
+        old_num_blocks = BlockOrdinal(div_up(self._capacity, tokens_per_block))
+        new_num_blocks = BlockOrdinal(div_up(capacity, tokens_per_block))
         beam_width = BeamIndex(self.beam_width)
         num_life_cycles = self._storage.num_life_cycles
         if new_num_blocks < old_num_blocks:
@@ -292,6 +295,8 @@ class _KVCache:
         Use resize() instead if you need to change both capacity and history length. If you use two separate APIs, you may have a middle state (between two APIs) where we use more pages than necessary for SWA layers.
         Expect OutOfPagesError exception if there are not enough pages in GPU memory.
         '''
+        if self._shortcut_set_capacity(capacity):
+            return
         success = self.resize(capacity, None)
         if not success:
             raise OutOfPagesError("Not enough pages in GPU memory")
@@ -304,6 +309,8 @@ class _KVCache:
     @history_length.setter
     def history_length(self, history_length: int):
         'History length cannot be decreased. Increase may trigger out-of-window block eviction/dropping for SWA layers.'
+        if self._shortcut_set_history_length(history_length):
+            return
         success = self.resize(None, history_length)
         assert success
 
@@ -331,10 +338,11 @@ class _KVCache:
         num_committed_blocks = self._num_committed_blocks
         new_num_full_blocks = BlockOrdinal(self.num_committed_tokens //
                                            self.tokens_per_block)
-        with self._record_event():
-            for ordinal in typed_range(num_committed_blocks,
-                                       new_num_full_blocks):
-                self._commit_block(ordinal, False)
+        if new_num_full_blocks > num_committed_blocks:
+            with self._record_event():
+                for ordinal in typed_range(num_committed_blocks,
+                                           new_num_full_blocks):
+                    self._commit_block(ordinal, False)
         if self.history_length < self.num_committed_tokens:
             self.history_length = self.num_committed_tokens
 
@@ -444,7 +452,7 @@ class _KVCache:
 
     def _page(self, block_ordinal: BlockOrdinal, beam_index: BeamIndex,
               life_cycle: LifeCycleId) -> BlockPage:
-        return self._block(block_ordinal, beam_index)[life_cycle]
+        return self._blocks[block_ordinal].pages[beam_index][life_cycle]
 
     def _block(self, block_ordinal: BlockOrdinal,
                beam_index: BeamIndex) -> TypedIndexList[LifeCycleId, BlockPage]:
@@ -612,6 +620,7 @@ class _KVCache:
             assert isinstance(holder.page, UncommittedPage)
             locked = isinstance(holder, _SharedPageLock)
             ret.append((holder.page, locked))
+            # When using debugpy with breakpoints on exceptions enabled, the lock/holder is not GC'ed even after return from this function. That will likely lead to assertion failures later.
             holders[lc] = None
         return cast(TypedIndexList, ret)
 
@@ -651,7 +660,7 @@ class _KVCache:
             self, history_length: int,
             life_cycle: LifeCycle) -> tuple[BlockOrdinal, BlockOrdinal]:
         'Range of the stale blocks. Stale blocks are no longer needed for inference. Stale pages should be held if we may commit them later, or droppable otherwise.'
-        num_blocks = self._to_block_ordinal(history_length)
+        num_blocks = div_up(history_length, self.tokens_per_block)
         start = BlockOrdinal(min(num_blocks, life_cycle.num_sink_blocks))
         window_size = life_cycle.window_size
         if window_size is None:
@@ -829,3 +838,24 @@ class _KVCache:
             lambda h: cast(_PageHolder | _SharedPageLock, h).page)
                  for b in self._blocks)
         return storage.get_page_indices_ref(layer_id, data_role, pages)
+
+    def _shortcut_set_capacity(self, capacity: int) -> bool:
+        'Shortcut for cases without side effects. Just for better performance.'
+        tokens_per_block = self.tokens_per_block
+        if div_up(capacity, tokens_per_block) == div_up(self._capacity,
+                                                        tokens_per_block):
+            self._capacity = capacity
+            return True
+        return False
+
+    def _shortcut_set_history_length(self, history_length: int) -> bool:
+        'Shortcut for cases without side effects. Just for better performance.'
+        no_side_effect = lambda window: window is None or (
+            self._to_block_ordinal(history_length + 1 - window) == self.
+            _to_block_ordinal(self._history_length + 1 - window))
+        if all(
+                no_side_effect(lc.window_size)
+                for lc in self.manager._life_cycles):
+            self._history_length = history_length
+            return True
+        return False

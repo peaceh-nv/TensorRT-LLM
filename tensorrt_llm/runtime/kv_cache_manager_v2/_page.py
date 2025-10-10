@@ -130,7 +130,7 @@ class UncommittedPage(Page):
         'Moves the slot to a new committed page and add the new page to the block. The uncommitted page becomes invalid.'
         assert not self.scheduled_for_eviction
         assert block.storage[self.life_cycle] is None
-        # If you hit this assertion failure, it's likely because you are using debugpy, which delayed GC. Untick breakpoints for exceptions to avoid this.
+        # If you hit this assertion failure, it's likely because you are using debugpy, which delayed GC for _KVCache._take_uncommitted_page(). Disable breakpoints on exceptions to avoid this issue.
         assert self.status == PageStatus.DROPPABLE, "Release holder/lock first"
         committed_page = CommittedPage(self.manager, block, self.life_cycle,
                                        self.cache_level, self, self.priority)

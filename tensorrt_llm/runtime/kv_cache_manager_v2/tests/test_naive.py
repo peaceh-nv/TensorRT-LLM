@@ -222,20 +222,23 @@ class TestNaive(unittest.TestCase):
     @parameterized.expand([(2**i, False) for i in range(12)])
     # @parameterized.expand([(32, True)])
     def test_naive_perf(self, interval, profile: bool):
-        self.skipTest("Skipping perf test")
+        # self.skipTest("Skipping perf test")
         self.prepare(256 << 20, 256 << 20, 1 << 30, 36, 128, 48)
-        self.run_naive(10240, interval, False)  # warm up for numba jit
+        seq_len = 10240
+        self.run_naive(seq_len, interval, False)  # warm up for numba jit
         profiler = None
         if profile:
             import cProfile
             profiler = cProfile.Profile()
             profiler.enable()
         time_taken = [
-            self.run_naive(10240, interval, False)
+            self.run_naive(seq_len, interval, False)
             for _ in range(11 if profiler is None else 1)
         ]
         median_time_taken = median(time_taken)
-        print(f"Median time taken: {median_time_taken}")
+        print(
+            f"Throughput: {round(seq_len / median_time_taken)} tokens/sec for interval {interval}"
+        )
         if profiler is not None:
             profiler.disable()
             profiler.print_stats(sort='cumtime')

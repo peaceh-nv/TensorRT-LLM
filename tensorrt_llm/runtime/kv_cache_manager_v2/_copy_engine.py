@@ -100,9 +100,11 @@ def _copy_host_to_disk(tasks: Sequence[CopyTask], num_bytes: int,
         drv.CUresult(
             nb_utils.copy_host_to_disk(
                 [
-                    HostToDiskTask(DiskAddress(dst.fd, dst.pos),
-                                   src)  # type: ignore[attr-defined]
-                    for dst, src in tasks
+                    HostToDiskTask(
+                        DiskAddress(
+                            dst.fd,  # type: ignore[attr-defined]
+                            dst.pos),  # type: ignore[attr-defined]
+                        src) for dst, src in tasks
                 ],
                 num_bytes,
                 stream)))
