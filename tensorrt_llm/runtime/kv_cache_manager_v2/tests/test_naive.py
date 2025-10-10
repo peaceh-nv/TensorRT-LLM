@@ -187,7 +187,7 @@ class TestNaive(unittest.TestCase):
             stream = s.handle
             success = req0.kv_cache.resume(stream)
             assert success
-            self.run_request(req0, 32, False)
+            self.run_request(req0, 32, True)
         s.take_finish_event()
         req0.kv_cache.close()
 
@@ -200,14 +200,16 @@ class TestNaive(unittest.TestCase):
                                 page).status == PageStatus.DROPPABLE
 
         prompt1 = req0.kv_cache._committed_tokens[:(seq_len // 2 - 7)]
-        req1 = self.Request(1, self.manager.create_kv_cache(None, prompt1),
+        # request id must be same as req0 because we wrote it into the kv cache.
+        req1 = self.Request(req0.id,
+                            self.manager.create_kv_cache(None, prompt1),
                             prompt1, seq_len - len(prompt1))
         assert req1.kv_cache.num_committed_tokens == len(prompt1)
         with TemporaryCudaStream([]) as s:
             stream = s.handle
             success = req1.kv_cache.resume(stream)
             assert success
-            self.run_request(req1, 32, False)
+            self.run_request(req1, 32, True)
         s.take_finish_event()
         req1.kv_cache.close()
 
