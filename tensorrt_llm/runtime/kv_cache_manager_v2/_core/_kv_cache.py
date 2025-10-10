@@ -850,9 +850,10 @@ class _KVCache:
 
     def _shortcut_set_history_length(self, history_length: int) -> bool:
         'Shortcut for cases without side effects. Just for better performance.'
+        tokens_per_block = self.tokens_per_block
         no_side_effect = lambda window: window is None or (
-            self._to_block_ordinal(history_length + 1 - window) == self.
-            _to_block_ordinal(self._history_length + 1 - window))
+            (history_length + 1 - window) // tokens_per_block ==
+            (self._history_length + 1 - window) // tokens_per_block)
         if all(
                 no_side_effect(lc.window_size)
                 for lc in self.manager._life_cycles):
