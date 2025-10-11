@@ -15,7 +15,6 @@ from .kernels import check_values, fill_values
 
 
 class Step(NamedTuple):
-    req_id: int
     kv_cache: _KVCache
     input: Sequence[TokenIdExt]  # when empty, just check history
     history: Sequence[TokenIdExt]
@@ -55,7 +54,7 @@ class FakeEngine:
         assert batch
         manager = get_uniform_attribute(batch,
                                         lambda step: step.kv_cache.manager)
-        for req_id, kv_cache, input, history in batch:
+        for kv_cache, input, history in batch:
             for layer_id, layer_cfg in self.layers.items():
                 for buf_id, buf in enumerate(layer_cfg.buffers):
                     role = buf.role
@@ -63,17 +62,17 @@ class FakeEngine:
                         layer_id, role)
                     for beam in typed_range(kv_cache.beam_width):
                         # check history
-                        self._check_pages(kv_cache, req_id, layer_id, buf_id,
-                                          beam, history, stream)
+                        self._check_pages(kv_cache, layer_id, buf_id, beam,
+                                          history, stream)
                         # write new token
                         if input:
-                            self._write_new_tokens(kv_cache, req_id,
-                                                   len(history), layer_id,
-                                                   buf_id, beam, input, stream)
+                            self._write_new_tokens(kv_cache, len(history),
+                                                   layer_id, buf_id, beam,
+                                                   input, stream)
 
-    def _check_pages(self, kv_cache: _KVCache, req_id: int, layer_id: LayerId,
-                     buf_id: int, beam: BeamIndex,
-                     history: Sequence[TokenIdExt], stream: CudaStream):
+    def _check_pages(self, kv_cache: _KVCache, layer_id: LayerId, buf_id: int,
+                     beam: BeamIndex, history: Sequence[TokenIdExt],
+                     stream: CudaStream):
         manager = kv_cache.manager
         tokens_per_block = self.tokens_per_block
         layer_cfg = self.layers[layer_id]
@@ -104,13 +103,12 @@ class FakeEngine:
             addr = MemAddress(pool + stride * page)
             tokens = history[tokens_per_block * ordinal:tokens_per_block *
                              (ordinal + 1)]
-            check_values(addr, token_bytes, req_id, layer_id, buf_id, beam,
-                         tokens, stream)
+            check_values(addr, token_bytes, layer_id, buf_id, beam, tokens,
+                         stream)
 
-    def _write_new_tokens(self, kv_cache: _KVCache, req_id: int,
-                          history_len: int, layer_id: LayerId, buf_id: int,
-                          beam: BeamIndex, input: Sequence[TokenIdExt],
-                          stream: CudaStream):
+    def _write_new_tokens(self, kv_cache: _KVCache, history_len: int,
+                          layer_id: LayerId, buf_id: int, beam: BeamIndex,
+                          input: Sequence[TokenIdExt], stream: CudaStream):
         manager = kv_cache.manager
         tokens_per_block = self.tokens_per_block
         layer_cfg = self.layers[layer_id]
@@ -139,8 +137,8 @@ class FakeEngine:
                                 for i in overlap(input_range, page_range))
             assert batch_range
             tokens = input[batch_range[0]:batch_range[1]]
-            # print('req_id={}, layer_id={}, buf_id={}, beam={}, i={}, addr={}, tokens={}'.format(req_id, layer_id, buf_id, beam, i, addr, tokens))
-            fill_values(addr, token_bytes, req_id, layer_id, buf_id, beam,
-                        tokens, stream)
+            # print('layer_id={}, buf_id={}, beam={}, i={}, addr={}, tokens={}'.format(layer_id, buf_id, beam, i, addr, tokens))
+            fill_values(addr, token_bytes, layer_id, buf_id, beam, tokens,
+                        stream)
         assert ordinal is None or ordinal + 1 == div_up(input_range[1],
                                                         tokens_per_block)

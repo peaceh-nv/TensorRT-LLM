@@ -88,8 +88,7 @@ class TestNaive(unittest.TestCase):
         history = prompt[:num_reused]
         input = prompt[num_reused:]
         if refcheck:
-            self.engine.execute([Step(req_id, kv_cache, input, history)],
-                                stream)
+            self.engine.execute([Step(kv_cache, input, history)], stream)
         if input:
             kv_cache.commit(input)
             history.extend(input)
@@ -102,13 +101,13 @@ class TestNaive(unittest.TestCase):
                 capacity = kv_cache.capacity
             input_token = self.next_token()
             if refcheck:
-                self.engine.execute(
-                    [Step(req_id, kv_cache, [input_token], history)], stream)
+                self.engine.execute([Step(kv_cache, [input_token], history)],
+                                    stream)
             history.append(input_token)
         kv_cache.commit(history[kv_cache.history_length:])
         # last check
         if refcheck:
-            self.engine.execute([Step(req_id, kv_cache, [], history)], stream)
+            self.engine.execute([Step(kv_cache, [], history)], stream)
         toc = time.perf_counter()
         time_taken = toc - tic
         # print(f"Time taken: {time_taken} seconds")
@@ -183,11 +182,13 @@ class TestNaive(unittest.TestCase):
         max_seq_len = 32 * 22  # 23 blocks will require more than 8MB memory
         seq_len = max_seq_len
 
+        req_id_gen = itertools.count()
         reusable_requests = []
         with TemporaryCudaStream([]) as s:
             stream = s.handle
-            for i in range(num_reusable_requests):
-                req = self.new_request(i, None, 256, seq_len - 256)
+            for _ in range(num_reusable_requests):
+                req = self.new_request(next(req_id_gen), None, 256,
+                                       seq_len - 256)
                 reusable_requests.append(req)
                 success = req.kv_cache.resume(stream)
                 assert success
@@ -206,7 +207,7 @@ class TestNaive(unittest.TestCase):
         req0 = reusable_requests[0]
         prompt1 = req0.kv_cache._committed_tokens[:(seq_len // 2 - 7)]
         # request id must be same as req0 because we wrote it into the kv cache.
-        req1 = self.Request(req0.id,
+        req1 = self.Request(next(req_id_gen),
                             self.manager.create_kv_cache(None, prompt1),
                             prompt1, seq_len - len(prompt1))
         assert req1.kv_cache.num_committed_tokens == len(prompt1)

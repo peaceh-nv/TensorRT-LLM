@@ -35,13 +35,12 @@ using uint16_t = unsigned short;
 
 struct alignas(16) Value {
     uint32_t token;
-    uint32_t req_id;
     uint32_t layer;
-    uint16_t role;
-    uint16_t beam;
+    uint32_t role;
+    uint32_t beam;
 
     __device__ inline bool operator==(Value const& other) const {
-        return token == other.token && req_id == other.req_id && layer == other.layer && role == other.role && beam == other.beam;
+        return token == other.token && layer == other.layer && role == other.role && beam == other.beam;
     }
     __device__ inline bool operator!=(Value const& other) const {
         return !(*this == other);
@@ -54,7 +53,7 @@ struct Tokens {
     uint32_t tokens[kMAX_TOKENS];
 };
 
-extern "C" __global__ void fillValues(Value* data, uint32_t valuesPerToken, uint32_t req_id, uint32_t layer, uint32_t buf_id, uint32_t beam, __grid_constant__ const Tokens tokens) {
+extern "C" __global__ void fillValues(Value* data, uint32_t valuesPerToken, uint32_t layer, uint32_t buf_id, uint32_t beam, __grid_constant__ const Tokens tokens) {
     auto const tidx = (static_cast<uint32_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
     auto const stride = static_cast<uint32_t>(blockDim.x) * gridDim.x;
     auto const numTokens = gridDim.y;
@@ -62,7 +61,7 @@ extern "C" __global__ void fillValues(Value* data, uint32_t valuesPerToken, uint
     check(numTokens <= kMAX_TOKENS);
     auto const base = data + idxToken * valuesPerToken;
     auto const token = tokens.tokens[idxToken];
-    auto const value = Value{token, req_id, layer, static_cast<uint16_t>(buf_id), static_cast<uint16_t>(beam)};
+    auto const value = Value{token, layer, buf_id, beam};
     for (auto idx = tidx; idx < valuesPerToken; idx += stride) {
         base[idx] = value;
     }
@@ -71,15 +70,15 @@ extern "C" __global__ void fillValues(Value* data, uint32_t valuesPerToken, uint
 __device__ inline void assertEq(Value const& a, Value const& b) {
 #ifndef NDEBUG
     if (a != b) {
-        printf("(%d, %d, %d, %hd, %hd) != (%d, %d, %d, %hd, %hd)\n",
-                a.token, a.req_id, a.layer, a.role, a.beam,
-                b.token, b.req_id, b.layer, b.role, b.beam);
+        printf("(%d, %d, %d, %d) != (%d, %d, %d, %d)\n",
+                a.token, a.layer, a.role, a.beam,
+                b.token, b.layer, b.role, b.beam);
     }
 #endif
     check(a == b);
 }
 
-extern "C" __global__ void checkValues(Value const* data, uint32_t valuesPerToken, uint32_t req_id, uint32_t layer, uint32_t buf_id, uint32_t beam, __grid_constant__ const Tokens tokens) {
+extern "C" __global__ void checkValues(Value const* data, uint32_t valuesPerToken, uint32_t layer, uint32_t buf_id, uint32_t beam, __grid_constant__ const Tokens tokens) {
     auto const tidx = (static_cast<uint32_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
     auto const stride = static_cast<uint32_t>(blockDim.x) * gridDim.x;
     auto const numTokens = gridDim.y;
@@ -87,7 +86,7 @@ extern "C" __global__ void checkValues(Value const* data, uint32_t valuesPerToke
     check(numTokens <= kMAX_TOKENS);
     auto const base = data + idxToken * valuesPerToken;
     auto const token = tokens.tokens[idxToken];
-    auto const ref = Value{token, req_id, layer, static_cast<uint16_t>(buf_id), static_cast<uint16_t>(beam)};
+    auto const ref = Value{token, layer, buf_id, beam};
     for (auto idx = tidx; idx < valuesPerToken; idx += stride) {
         assertEq(base[idx], ref);
     }
@@ -116,19 +115,18 @@ def get_kernel(name: str) -> Kernel:
 class Value(ctypes.Structure):
     _fields_ = [
         ("token", ctypes.c_uint32),
-        ("req_id", ctypes.c_uint32),
         ("layer", ctypes.c_uint32),
-        ("buf_id", ctypes.c_uint16),
-        ("beam", ctypes.c_uint16),
+        ("buf_id", ctypes.c_uint32),
+        ("beam", ctypes.c_uint32),
     ]
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Value):
             return NotImplemented
-        return self.token == other.token and self.req_id == other.req_id and self.layer == other.layer and self.buf_id == other.buf_id and self.beam == other.beam
+        return self.token == other.token and self.layer == other.layer and self.buf_id == other.buf_id and self.beam == other.beam
 
     def __str__(self) -> str:
-        return f"Value(token={self.token}, req_id={self.req_id}, layer={self.layer}, buf_id={self.buf_id}, beam={self.beam})"
+        return f"Value(token={self.token}, layer={self.layer}, buf_id={self.buf_id}, beam={self.beam})"
 
 
 class Tokens(ctypes.Structure):
@@ -146,32 +144,32 @@ def _make_tokens(tokens: Sequence[TokenIdExt]) -> Tokens:
     ]))
 
 
-def fill_values(address: MemAddress, bytes_per_token: int, req_id: int,
-                layer: LayerId, buf_id: int, beam: int,
-                tokens: Sequence[TokenIdExt], stream: CudaStream):
+def fill_values(address: MemAddress, bytes_per_token: int, layer: LayerId,
+                buf_id: int, beam: int, tokens: Sequence[TokenIdExt],
+                stream: CudaStream):
     values_per_token = exact_div(bytes_per_token, ctypes.sizeof(Value))
     kernel = get_kernel("fillValues")
     for chunk in chunked(tokens, MAX_TOKENS):
-        args = (address, values_per_token, req_id, layer, buf_id, beam,
+        args = (address, values_per_token, layer, buf_id, beam,
                 _make_tokens(chunk))
         arg_types = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
-                     ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, None)
+                     ctypes.c_uint32, ctypes.c_uint32, None)
         _unwrap(
             drv.cuLaunchKernel(kernel._handle, div_up(values_per_token, 1024),
                                len(chunk), 1, 256, 1, 1, 0, stream,
                                (args, arg_types), 0))
 
 
-def check_values(address: MemAddress, bytes_per_token: int, req_id: int,
-                 layer: LayerId, buf_id: int, beam: int,
-                 tokens: Sequence[TokenIdExt], stream: CudaStream):
+def check_values(address: MemAddress, bytes_per_token: int, layer: LayerId,
+                 buf_id: int, beam: int, tokens: Sequence[TokenIdExt],
+                 stream: CudaStream):
     values_per_token = exact_div(bytes_per_token, ctypes.sizeof(Value))
     kernel = get_kernel("checkValues")
     for chunk in chunked(tokens, MAX_TOKENS):
-        args = (address, values_per_token, req_id, layer, buf_id, beam,
+        args = (address, values_per_token, layer, buf_id, beam,
                 _make_tokens(chunk))
         arg_types = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
-                     ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, None)
+                     ctypes.c_uint32, ctypes.c_uint32, None)
         _unwrap(
             drv.cuLaunchKernel(kernel._handle, div_up(values_per_token, 1024),
                                len(chunk), 1, 256, 1, 1, 0, stream,
