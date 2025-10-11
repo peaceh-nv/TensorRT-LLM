@@ -7,7 +7,8 @@ from .._eviction_controller import PageStatus
 from .._exceptions import OutOfPagesError
 from .._life_cycle_registry import LifeCycleId
 from .._storage._core import PoolGroupIndex
-from .._utils import TypedIndexList, make_typed, noexcept, unwrap_optional
+from .._utils import (TypedIndexList, assert_critical, make_typed, noexcept,
+                      unwrap_optional)
 
 
 @runtime_checkable
@@ -162,8 +163,9 @@ class PerLevelEvictionController:  # for one cache level
             [PrioritizedLRUEvictionPolicy() for _ in range(num_pool_groups)])
 
     def __del__(self):
-        assert all(len(p) == 0
-                   for p in self._policies), "Eviction controller is not empty"
+        if not NDEBUG:
+            assert_critical(all(len(p) == 0 for p in self._policies),
+                            "Eviction controller is not empty")
 
     def _get_policy(self, life_cycle: LifeCycleId) -> EvictionPolicy:
         pg_idx = self._life_cycle_grouping[life_cycle]

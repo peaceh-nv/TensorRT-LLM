@@ -8,6 +8,7 @@ import itertools
 import operator
 import os
 import platform
+import traceback
 import warnings
 import weakref
 from abc import ABC, abstractmethod
@@ -22,8 +23,7 @@ from typing import (Any, Callable, ClassVar, Generic, Iterable, Iterator,
 import cuda.bindings.driver as drv
 
 from ._common import NDEBUG, CudaStream
-from ._exceptions import (CuError, CuOOMError, DiskOOMError, HostOOMError,
-                          LogicError)
+from ._exceptions import CuError, CuOOMError, DiskOOMError, HostOOMError
 
 
 def _unwrap(ret: drv.CUresult
@@ -133,6 +133,14 @@ def get_uniform_attribute(iterable: Iterable[T],
     ret = attribute_func(next(iter(iterable)))
     assert NDEBUG or all(attribute_func(item) == ret for item in iterable)
     return ret
+
+
+def assert_critical(condition: bool, message: str | None = None):
+    'Similar to assert, but instead of raising an exception, it terminates the process, even if inside __del__().'
+    if not condition:
+        warnings.warn(value_or(message, "Critical assertion failed"))
+        traceback.print_stack()
+        os._exit(1)
 
 
 def noexcept(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -828,8 +836,7 @@ class MultiStreamExecutor:
         self._finish_event = merge_events(events)
 
     def __del__(self):
-        if self._finish_event is not None:
-            raise LogicError("finish event not taken")
+        assert_critical(self._finish_event is None, "finish event not taken")
 
     def new_stream(self) -> TemporaryCudaStream:
         stream = TemporaryCudaStream((self._prior_event, ))

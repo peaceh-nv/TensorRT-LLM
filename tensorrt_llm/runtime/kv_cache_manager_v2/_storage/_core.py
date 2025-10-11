@@ -12,8 +12,9 @@ from .._common import (BAD_FILE_DESCRIPTOR, NDEBUG, Address, CacheTier,
 from .._cuda_virt_mem import PhysMem, PooledPhysMemAllocator, VirtMem
 from .._exceptions import LogicError, OutOfPagesError, ResourceBusyError
 from .._utils import (CachedCudaEvent, DynamicBitset, HomoTuple, HostMem,
-                      div_up, query_total_gpu_memory, remove_if, resize_file,
-                      round_down, round_up, unwrap_optional)
+                      assert_critical, div_up, query_total_gpu_memory,
+                      remove_if, resize_file, round_down, round_up,
+                      unwrap_optional)
 
 PoolGroupIndex = NewType("PoolGroupIndex", int)
 PoolIndex = NewType("PoolIndex", int)
@@ -245,11 +246,14 @@ class SlotAllocator:
         self._num_ready_overflow_slots = 0
 
     def __del__(self):
-        assert (self._target_capacity == self._capacity
-                and not self._overflow_slots), "resize is in progress"
-        assert self._occupied_mask.num_set_bits == 0, "some slots are still in use"
-        assert (len(self._recycled_slots) == self._num_active_slots
-                ), "some slots are not free"
+        assert_critical(
+            self._target_capacity == self._capacity
+            and not self._overflow_slots, "resize is in progress")
+        assert_critical(self._occupied_mask.num_set_bits == 0,
+                        "some slots are still in use")
+        assert_critical(
+            len(self._recycled_slots) == self._num_active_slots,
+            "some slots are not free")
 
     @property
     def num_free_slots(self) -> int:

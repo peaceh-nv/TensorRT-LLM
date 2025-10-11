@@ -267,7 +267,6 @@ class Block:
                 if page.status == PageStatus.DROPPABLE:
                     if page.scheduled_for_eviction:
                         page.manager.exclude_from_eviction(page)
-                    assert not page.scheduled_for_eviction
                 else:
                     warnings.warn(
                         "[KVCacheManager] Block is being deleted, but its pages are still in use!"

@@ -20,9 +20,9 @@ from ._eviction_controller import EvictionPolicy, PageStatus
 from ._exceptions import LogicError
 from ._life_cycle_registry import LifeCycleId
 from ._storage._core import Slot, SlotId
-from ._utils import (CachedCudaEvent, filled_list, get_uniform_attribute,
-                     merge_events, partition, stream_wait_events,
-                     unwrap_optional, unwrap_weakref)
+from ._utils import (CachedCudaEvent, assert_critical, filled_list,
+                     get_uniform_attribute, merge_events, partition,
+                     stream_wait_events, unwrap_optional, unwrap_weakref)
 
 
 # We will have a huge amount of pages for large storage capacity.
@@ -38,11 +38,11 @@ class Page(Slot):
     node_ref: EvictionPolicy.NodeRef | None
 
     def __del__(self):
-        assert self.status == PageStatus.DROPPABLE
-        assert not self.scheduled_for_eviction
+        if not NDEBUG:
+            assert_critical(self.status == PageStatus.DROPPABLE
+                            and not self.scheduled_for_eviction)
         if self.has_valid_slot:
             self.manager.release_slot(self.life_cycle, self.cache_level, self)
-            assert not self.has_valid_slot
 
     @property
     def manager(self) -> 'StorageManager':
@@ -142,10 +142,12 @@ class UncommittedPage(Page):
 
     def __del__(self):
         check_page = lambda p: p is None or isinstance(p.page, CommittedPage)
-        assert len(unwrap_weakref(
-            self.kv_cache)._blocks) <= self.ordinal or check_page(
-                unwrap_weakref(self.kv_cache)._blocks[self.ordinal].pages[
-                    self.beam_index][self.life_cycle])
+        if not NDEBUG:
+            assert_critical(
+                len(unwrap_weakref(self.kv_cache)._blocks) <= self.ordinal
+                or check_page(
+                    unwrap_weakref(self.kv_cache)._blocks[self.ordinal].pages[
+                        self.beam_index][self.life_cycle]))
         Page.__del__(self)
 
 
@@ -192,7 +194,8 @@ class _PageHolder:
         self._lock = None
 
     def __del__(self):
-        assert self._lock is None
+        if not NDEBUG:
+            assert_critical(self._lock is None)
         self.page._holder = None
         # If a held page was in last level cache, it was not scheduled for eviction.
         if self.page.is_committed():
@@ -257,8 +260,9 @@ class _UniqPageLock:
 
     def __del__(self):
         page = self.page
-        assert page.cache_level == CacheLevel(
-            0) and not page.scheduled_for_eviction
+        if not NDEBUG:
+            assert_critical(page.cache_level == CacheLevel(0)
+                            and not page.scheduled_for_eviction)
         page.ready_event = merge_events(self.finish_events)
         self.holder._lock = None
         # delete holder first, so if nobody holds the page elsewhere, it becomes droppable immediately, before we hand it over to eviction controller.
