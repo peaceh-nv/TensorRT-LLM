@@ -139,7 +139,7 @@ def get_copier(dst: CacheTier, src: CacheTier) -> Copier | HomoTuple[Copier]:
 
 class StagingBufferManager:
     __slots__ = ('mutex', 'buffer', 'grains', 'next')
-    GRANULARITY: ClassVar[int] = 1 << 30
+    GRANULARITY: ClassVar[int] = 1 << 20
 
     @dataclass(slots=True)
     class GrainMetadata:

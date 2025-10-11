@@ -176,20 +176,24 @@ class TestNaive(unittest.TestCase):
         self.assertRaises(OutOfPagesError,
                           lambda: self.run_naive(seq_len + 1, 1, False))
 
-    def test_cache_reuse(self):
+    @parameterized.expand([(1, ), (2, ), (4, )])
+    def test_cache_reuse(self, num_reusable_requests: int):
         self.prepare(8 << 20, 8 << 20, 1 << 30, 36, 128, 1)
         # if we have n blocks, we need 8192*2*18*(1+5+n) bytes of memory. For the (1+5+n), 1 is for sink blocks, 5 is for SWA (window=128), n is for full attention.
         max_seq_len = 32 * 22  # 23 blocks will require more than 8MB memory
         seq_len = max_seq_len
 
-        req0 = self.new_request(0, None, 256, seq_len - 256)
+        reusable_requests = []
         with TemporaryCudaStream([]) as s:
             stream = s.handle
-            success = req0.kv_cache.resume(stream)
-            assert success
-            self.run_request(req0, 32, True)
+            for i in range(num_reusable_requests):
+                req = self.new_request(i, None, 256, seq_len - 256)
+                reusable_requests.append(req)
+                success = req.kv_cache.resume(stream)
+                assert success
+                self.run_request(req, 32, True)
+                req.kv_cache.close()
         s.take_finish_event()
-        req0.kv_cache.close()
 
         for root_block in self.manager._radix_tree.next.values():
             for block0 in root_block.next.values():
@@ -199,6 +203,7 @@ class TestNaive(unittest.TestCase):
                             assert unwrap_weakref(
                                 page).status == PageStatus.DROPPABLE
 
+        req0 = reusable_requests[0]
         prompt1 = req0.kv_cache._committed_tokens[:(seq_len // 2 - 7)]
         # request id must be same as req0 because we wrote it into the kv cache.
         req1 = self.Request(req0.id,
@@ -220,9 +225,9 @@ class TestNaive(unittest.TestCase):
         self.run_naive(512, 1, True)
 
     @parameterized.expand([(2**i, False) for i in range(12)])
-    # @parameterized.expand([(32, True)])
+    # @parameterized.expand([(1, True)])
     def test_naive_perf(self, interval, profile: bool):
-        # self.skipTest("Skipping perf test")
+        self.skipTest("Skipping perf test")
         self.prepare(256 << 20, 256 << 20, 1 << 30, 36, 128, 48)
         seq_len = 10240
         self.run_naive(seq_len, interval, False)  # warm up for numba jit
