@@ -8,7 +8,7 @@ from .._eviction_controller import PageStatus
 from .._life_cycle_registry import LifeCycle, LifeCycleRegistry
 from .._storage._config import create_storage_config
 from .._storage_manager import StorageManager
-from .._utils import HomoTuple, unwrap_weakref
+from .._utils import HomoTuple, init_cuda_once, unwrap_weakref
 from ._kv_cache import _KVCache
 
 
@@ -19,6 +19,7 @@ class KVCacheManager:
     _storage: StorageManager
 
     def __init__(self, config: KVCacheManagerConfig):
+        init_cuda_once()
         self._life_cycles = LifeCycleRegistry(config)
         self._radix_tree = BlockRadixTree(self._life_cycles,
                                           config.tokens_per_block)

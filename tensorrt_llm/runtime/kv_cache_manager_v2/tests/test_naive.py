@@ -5,7 +5,6 @@ from random import randbytes
 from statistics import median
 from typing import Iterator, NamedTuple
 
-import cuda.bindings.runtime as cudart
 from kv_cache_manager_v2 import (AttentionLayerConfig, BufferConfig,
                                  DiskCacheTierConfig, GpuCacheTierConfig,
                                  HostCacheTierConfig, KVCacheManager,
@@ -14,21 +13,20 @@ from kv_cache_manager_v2 import (AttentionLayerConfig, BufferConfig,
 from kv_cache_manager_v2._block_radix_tree import traverse_subtree
 from kv_cache_manager_v2._eviction_controller import PageStatus
 from kv_cache_manager_v2._exceptions import OutOfPagesError
-from kv_cache_manager_v2._utils import (TemporaryCudaStream, round_up,
-                                        typed_range, unwrap_weakref)
+from kv_cache_manager_v2._utils import (TemporaryCudaStream, init_cuda_once,
+                                        round_up, typed_range, unwrap_weakref)
 from kv_cache_manager_v2.tests.fake_engine import FakeEngine, Role, Step
 from parameterized import parameterized
 
 
-class TestNaive(unittest.TestCase):
+class TestKVCacheManagerV2(unittest.TestCase):
     engine: FakeEngine
     cfg: KVCacheManagerConfig
     manager: KVCacheManager
     _token_id_gen: Iterator[int]
 
     def setUp(self):
-        err, = cudart.cudaFree(0)
-        assert int(err) == int(cudart.cudaError_t.cudaSuccess)
+        init_cuda_once()
         self._token_id_gen = itertools.count()
 
     def next_token(self) -> TokenIdExt:
@@ -45,8 +43,26 @@ class TestNaive(unittest.TestCase):
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
 
-    def _init_cfg(self, gpu_quota: int, host_quota: int, disk_quota: int,
-                  num_layers: int, window_size: int, sink_tokens: int):
+    def _init_cfg(self,
+                  gpu_quota: int,
+                  host_quota: int,
+                  disk_quota: int,
+                  num_layers: int,
+                  window_size: int,
+                  sink_tokens: int,
+                  kv_buf_size: int = 8192,
+                  block_quant_buf_size: int | None = None):
+        layer_buffers = [
+            BufferConfig(role=Role.KEY, size=kv_buf_size),
+            BufferConfig(role=Role.VALUE, size=kv_buf_size),
+        ]
+        if block_quant_buf_size is not None:
+            layer_buffers.extend([
+                BufferConfig(role=Role.KEY_BLOCK_QUANT,
+                             size=block_quant_buf_size),
+                BufferConfig(role=Role.VALUE_BLOCK_QUANT,
+                             size=block_quant_buf_size)
+            ])
         self.cfg = KVCacheManagerConfig(
             tokens_per_block=32,
             vocab_size=4096,
@@ -58,12 +74,7 @@ class TestNaive(unittest.TestCase):
             layers=[
                 AttentionLayerConfig(
                     layer_id=layer_id,
-                    buffers=[
-                        BufferConfig(role=Role.KEY, size=8192),
-                        BufferConfig(role=Role.VALUE, size=8192),
-                        # BufferConfig(role=Role.KEY_BLOCK_QUANT, size=512),
-                        # BufferConfig(role=Role.VALUE_BLOCK_QUANT, size=512),
-                    ],
+                    buffers=layer_buffers,
                     sliding_window_size=window_size if layer_id %
                     2 == 0 else None,
                     num_sink_tokens=sink_tokens if layer_id % 2 == 0 else None)
@@ -76,7 +87,18 @@ class TestNaive(unittest.TestCase):
         prompt: list[TokenIdExt]
         decode_len: int
 
-    def run_request(self, req: Request, interval: int, refcheck: bool) -> float:
+    def new_request(self, req_id: int, lora_task_id: int | None,
+                    prompt_len: int, decode_len: int) -> Request:
+        prompt = [self.next_token() for _ in range(prompt_len)]
+        return self.Request(req_id,
+                            self.manager.create_kv_cache(lora_task_id, prompt),
+                            prompt, decode_len)
+
+
+class TestNoBatching(TestKVCacheManagerV2):
+
+    def run_request(self, req: TestKVCacheManagerV2.Request, interval: int,
+                    refcheck: bool) -> float:
         req_id, kv_cache, prompt, decode_len = req
         assert kv_cache.status == _KVCache.Status.ACTIVE
         stream = kv_cache.cuda_stream
@@ -112,13 +134,6 @@ class TestNaive(unittest.TestCase):
         time_taken = toc - tic
         # print(f"Time taken: {time_taken} seconds")
         return time_taken
-
-    def new_request(self, req_id: int, lora_task_id: int | None,
-                    prompt_len: int, decode_len: int) -> Request:
-        prompt = [self.next_token() for _ in range(prompt_len)]
-        return self.Request(req_id,
-                            self.manager.create_kv_cache(lora_task_id, prompt),
-                            prompt, decode_len)
 
     def run_naive(self,
                   seq_len: int,
@@ -249,6 +264,12 @@ class TestNaive(unittest.TestCase):
             profiler.disable()
             profiler.print_stats(sort='cumtime')
             profiler.dump_stats('profiler.prof')
+
+
+class TestBatching(TestKVCacheManagerV2):
+
+    def test_inflight_batching(self):
+        self.prepare(2 << 20, 2 << 30, 64 << 30, 36, 128, 48)
 
 
 if __name__ == "__main__":

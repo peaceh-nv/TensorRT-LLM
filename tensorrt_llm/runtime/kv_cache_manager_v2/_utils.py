@@ -21,6 +21,7 @@ from typing import (Any, Callable, ClassVar, Generic, Iterable, Iterator,
                     TypeVar, cast)
 
 import cuda.bindings.driver as drv
+import cuda.bindings.runtime as cudart
 
 from ._common import NDEBUG, CudaStream
 from ._exceptions import CuError, CuOOMError, DiskOOMError, HostOOMError
@@ -529,6 +530,12 @@ class DynamicBitset:
                 return True
         return any(self._bits[i] != 0
                    for i in range(start // 64 + 1, end // 64))
+
+
+@functools.cache
+def init_cuda_once():
+    err, = cudart.cudaFree(0)
+    assert int(err) == int(cudart.cudaError_t.cudaSuccess)
 
 
 class SimplePool(Generic[T]):
