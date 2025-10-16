@@ -2,7 +2,7 @@
 # As the ratio between KV data size and KV block scale size is fixed, we can simply use a pool with smaller block size and the same number of blocks for block scale.
 import abc
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NewType
 
 from ._common import CacheTier, LayerId
@@ -110,7 +110,11 @@ class KVCacheManagerConfig:
     # AttentionLayerConfig.layer_id should not duplicate
     layers: list[AttentionLayerConfig]
 
-    helix_config: HelixConfig | None = None
+    # When memory utilization is above this threshold, KV cache resuming will fail. This helps reserving some memory for KVCache growth and avoids frequent suspend/resume for dynamic batch size.
+    max_util_for_resume: float = field(default=0.9)
+
+    # unsupported yet
+    helix_config: HelixConfig | None = field(default=None)
 
     def __post_init__(self):
         assert self.cache_tiers and self.cache_tiers[0].tier == CacheTier.GPU_MEM

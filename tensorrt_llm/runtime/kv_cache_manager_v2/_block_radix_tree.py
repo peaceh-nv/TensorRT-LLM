@@ -252,13 +252,16 @@ class Block:
         self.next = {}
         self.storage = filled_list(None, prev.num_life_cycles)
         # If there are sibling blocks fully covered by this block, remove them.
+        to_remove = []
         for k, b in prev.next.items():
             if len(b.tokens) < len(
                     tokens) and tokens[:len(b.tokens)] == b.tokens:
                 assert NDEBUG or (not b.is_full and b is not self and b.key == k
                                   and not b.next)
-                prev.next.pop(k)
-                assert b.is_orphan  # _KVCache may still hold it.
+                to_remove.append(k)
+        for k in to_remove:
+            b = prev.next.pop(k)
+            assert b.is_orphan  # _KVCache may still hold it.
 
     def __del__(self):
         for ref in self.storage:
@@ -276,11 +279,10 @@ class Block:
         """
         Returns the number of leading tokens that match between the given tokens and this block's tokens.
         """
-        assert len(tokens) <= len(self.tokens), "too many tokens"
         for i, (a, b) in enumerate(zip(tokens, self.tokens)):
             if a != b:
                 return i
-        return len(tokens)
+        return min(len(tokens), len(self.tokens))
 
     @property
     def num_life_cycles(self) -> LifeCycleId:

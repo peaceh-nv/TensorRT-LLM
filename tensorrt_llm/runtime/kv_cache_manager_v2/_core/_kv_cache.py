@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import TYPE_CHECKING, Callable, Iterable, Iterator, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, cast
 
 from .._block_radix_tree import Block, UselessBlockError
 from .._common import (BAD_PAGE_INDEX, GPU_LEVEL, NDEBUG, BeamIndex,
@@ -66,9 +66,9 @@ class SeqBlock:
 # num_committed_tokens <= history_length <= capacity always holds. A newly created KV cache has all three lengths equal to the number of reused tokens.
 # @TODO: in __del__, we should check if committed pages are usable for SWA cases. e.g. all pages are dropped except the last one. The last one is not usable.
 class _KVCache:
-    __slots__ = ('_manager', '_lora_task_id', '_get_priority', '_cuda_stream',
-                 '_status', '_beam_width', '_capacity', '_history_length',
-                 '_commit_state', '_blocks', '_page_indices',
+    __slots__ = ('id', '_manager', '_lora_task_id', '_get_priority',
+                 '_cuda_stream', '_status', '_beam_width', '_capacity',
+                 '_history_length', '_commit_state', '_blocks', '_page_indices',
                  '_committed_tokens', '_num_committed_blocks', '_finish_event',
                  '_buffer_to_mirrored_index', '_tied_grp_indices',
                  '__weakref__')
@@ -85,6 +85,7 @@ class _KVCache:
         # user called stop_committing() or close()
         USER_STOP = enum.auto()
 
+    id: Any
     _manager: 'KVCacheManager'
     _lora_task_id: int | None
     _get_priority: Callable[[BlockOrdinal, LifeCycle], Priority]
@@ -154,8 +155,6 @@ class _KVCache:
         if self._cuda_stream is not None:
             if self.is_active:
                 CachedCudaEvent(self._cuda_stream).wait_in_stream(cuda_stream)
-            else:
-                self.finish_event.wait_in_stream(cuda_stream)
         else:
             assert self.status == self.Status.SUSPENDED and self._finish_event is None
         self._cuda_stream = cuda_stream
@@ -248,9 +247,6 @@ class _KVCache:
                     del indices[new_num_blocks:]
         elif new_num_blocks > old_num_blocks:
             num_new_blocks = new_num_blocks - old_num_blocks
-            for beam_indices in self._page_indices:
-                for indices in beam_indices:
-                    indices.extend([BAD_PAGE_INDEX] * num_new_blocks)
             num_new_slots = filled_list(num_new_blocks * beam_width,
                                         num_life_cycles)
             try:
@@ -258,6 +254,9 @@ class _KVCache:
             except OutOfPagesError:
                 self._lock_held_blocks(backup_holders)
                 return False
+            for beam_indices in self._page_indices:
+                for indices in beam_indices:
+                    indices.extend([BAD_PAGE_INDEX] * num_new_blocks)
             stream_wait_events(self.cuda_stream,
                                (s.ready_event for s in sum(slots, ())))
             for ordinal in typed_range(old_num_blocks, new_num_blocks):
@@ -392,6 +391,8 @@ class _KVCache:
     # Resume, migrate buffers to GPU memory.
     def resume(self, cuda_stream: CudaStream | None = None) -> bool:
         assert self.status == self.Status.SUSPENDED
+        if self._storage.overall_utilization > self.manager._init_config.max_util_for_resume:
+            return False
         if cuda_stream is not None:
             self.cuda_stream = cuda_stream
         assert self._cuda_stream is not None, "cuda_stream is never set"

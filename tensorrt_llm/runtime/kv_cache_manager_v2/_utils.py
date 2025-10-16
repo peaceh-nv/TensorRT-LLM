@@ -456,7 +456,7 @@ class HostMem:
             ) and self._size > (2 << 30) and platform.system(
             ) == "Linux" and platform.release()[:4] in ["6.11", "6.12", '6.13']:
                 warnings.warn(
-                    "There is a known bug in Linux kernel 6.11/6.12/6.13 preventing pinning more than 2GB of host memory. You can fix it by upgrading (>=6.14) or downgrading your kernel (<=6.10). See https://lore.kernel.org/all/20241030030116.670307-1-jhubbard@nvidia.com/"
+                    "There is a known bug in Linux kernel 6.11/6.12/6.13 preventing pinning more than 2GB of host memory. You can fix it by upgrading (>=6.14) or downgrading your kernel (<=6.10). Some linux distributions have backported the fix to 6.12.y LTS. See https://lore.kernel.org/all/20241030030116.670307-1-jhubbard@nvidia.com/"
                 )
             raise
 

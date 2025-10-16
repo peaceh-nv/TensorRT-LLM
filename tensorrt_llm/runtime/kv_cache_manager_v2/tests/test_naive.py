@@ -1,9 +1,11 @@
 import itertools
+import random
 import time
 import unittest
 from random import randbytes
 from statistics import median
 from typing import Iterator, NamedTuple
+from weakref import WeakKeyDictionary
 
 from kv_cache_manager_v2 import (AttentionLayerConfig, BufferConfig,
                                  DiskCacheTierConfig, GpuCacheTierConfig,
@@ -11,12 +13,17 @@ from kv_cache_manager_v2 import (AttentionLayerConfig, BufferConfig,
                                  KVCacheManagerConfig, LayerId, TokenId,
                                  TokenIdExt, _KVCache)
 from kv_cache_manager_v2._block_radix_tree import traverse_subtree
+from kv_cache_manager_v2._common import CudaStream
 from kv_cache_manager_v2._eviction_controller import PageStatus
 from kv_cache_manager_v2._exceptions import OutOfPagesError
 from kv_cache_manager_v2._utils import (TemporaryCudaStream, init_cuda_once,
-                                        round_up, typed_range, unwrap_weakref)
+                                        remove_if, round_up, typed_range,
+                                        unwrap_weakref)
 from kv_cache_manager_v2.tests.fake_engine import FakeEngine, Role, Step
 from parameterized import parameterized
+
+random.seed(0)
+DBG_PRINT = False
 
 
 class TestKVCacheManagerV2(unittest.TestCase):
@@ -81,6 +88,9 @@ class TestKVCacheManagerV2(unittest.TestCase):
                 for layer_id in typed_range(LayerId(num_layers))
             ])
 
+
+class TestNoBatching(TestKVCacheManagerV2):
+
     class Request(NamedTuple):
         id: int
         kv_cache: _KVCache
@@ -94,11 +104,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
                             self.manager.create_kv_cache(lora_task_id, prompt),
                             prompt, decode_len)
 
-
-class TestNoBatching(TestKVCacheManagerV2):
-
-    def run_request(self, req: TestKVCacheManagerV2.Request, interval: int,
-                    refcheck: bool) -> float:
+    def run_request(self, req: Request, interval: int, refcheck: bool) -> float:
         req_id, kv_cache, prompt, decode_len = req
         assert kv_cache.status == _KVCache.Status.ACTIVE
         stream = kv_cache.cuda_stream
@@ -267,9 +273,113 @@ class TestNoBatching(TestKVCacheManagerV2):
 
 
 class TestBatching(TestKVCacheManagerV2):
+    num_requests: int
+    past_sequences: list[list[TokenIdExt]]
+    seq_len_dict: WeakKeyDictionary[_KVCache, int]
+    batch: list[Step]
+    suspended: list[Step]
+    num_created: int
+    num_finished: int
+    req_id_gen: Iterator[int]
+
+    def setUp(self):
+        super().setUp()
+        self.prepare(128 << 20, 1 << 30, 4 << 30, 36, 128, 0)
+        self.num_requests = 100
+        self.past_sequences = list[list[TokenIdExt]]()
+        self.seq_len_dict = WeakKeyDictionary()
+        self.batch = list[Step]()
+        self.suspended = list[Step]()
+        self.num_finished = 0
+        self.num_created = 0
+        self.req_id_gen = itertools.count()
+
+    def gen_request(self) -> Step:
+        if self.num_created >= self.num_requests:
+            raise ValueError("Too many requests created")
+        gen_length = lambda: random.randint(20, 200)
+        prompt = (random.choice(self.past_sequences)
+                  if self.past_sequences and random.random() < 0.3 else
+                  []) + [self.next_token() for _ in range(gen_length())]
+        decode_len = gen_length()
+        lora_task_id = None
+        kv_cache = self.manager.create_kv_cache(lora_task_id, prompt[:-1])
+        kv_cache.id = next(self.req_id_gen)
+        DBG_PRINT and print(
+            f"created {kv_cache.id} with {kv_cache.num_committed_tokens} tokens reused"
+        )
+        history = prompt[:kv_cache.num_committed_tokens]
+        input = prompt[kv_cache.num_committed_tokens:]
+        seq_len = len(prompt) + decode_len
+        self.seq_len_dict[kv_cache] = seq_len
+        self.num_created += 1
+        assert input
+        return Step(kv_cache, input, history)
+
+    def update_batch(self, stream: CudaStream) -> None:
+        for s in self.batch:
+            assert s.input
+            s.kv_cache.commit(s.input)
+            s.history.extend(s.input)
+            s.input.clear()
+        # remove finished requests first
+        removed = remove_if(
+            self.batch, lambda step: step.kv_cache.num_committed_tokens >= self.
+            seq_len_dict[step.kv_cache])
+        for kv_cache, _, _ in removed:
+            seq_len = self.seq_len_dict[kv_cache]
+            self.past_sequences.append(kv_cache._committed_tokens[:seq_len])
+            kv_cache.close()
+            self.num_finished += 1
+        # fill input for remaining requests and increase capacity for them
+        for s in self.batch:
+            assert not s.input
+            s.input.append(self.next_token())
+        for i in itertools.count():
+            if i >= len(self.batch):
+                break
+            s = self.batch[i]
+            while i < len(self.batch) and not s.kv_cache.resize(
+                    len(s.history) + len(s.input), None):
+                last = self.batch.pop()
+                DBG_PRINT and print(f"suspending {last.kv_cache.id}")
+                last.kv_cache.suspend()
+                self.suspended.append(last)
+
+        # try to add new requests
+        suspended = self.suspended
+        while suspended or self.num_created < self.num_requests:
+            if not suspended:
+                assert self.num_created < self.num_requests
+                suspended.append(self.gen_request())
+            if suspended:
+                step = suspended[-1]
+                kv_cache = step.kv_cache
+                ok = kv_cache.resume(stream)
+                ok = ok and kv_cache.resize(
+                    len(step.history) + len(step.input), None)
+                if ok:
+                    DBG_PRINT and print(f"activating {step.kv_cache.id}")
+                    self.batch.append(suspended.pop())
+                else:
+                    if kv_cache.status == _KVCache.Status.ACTIVE:
+                        kv_cache.suspend()
+                    break
+
+        DBG_PRINT and print(
+            f"update_batch: found {len(removed)} finished requests, now with {len(self.batch)} requests"
+        )
 
     def test_inflight_batching(self):
-        self.prepare(2 << 20, 2 << 30, 64 << 30, 36, 128, 48)
+        with TemporaryCudaStream([]) as stream:
+            i = itertools.count()
+            self.update_batch(stream.handle)
+            while self.num_finished < self.num_requests:
+                DBG_PRINT and print(
+                    f"Executing batch {next(i)} with size {len(self.batch)}")
+                self.engine.execute(self.batch, stream.handle)
+                self.update_batch(stream.handle)
+        stream.take_finish_event().synchronize()
 
 
 if __name__ == "__main__":

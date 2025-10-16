@@ -1,6 +1,7 @@
 import os
 import warnings
 import weakref
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Iterator, Sequence, cast
 
@@ -422,3 +423,47 @@ class StorageManager:
                                    life_cycle: LifeCycleId) -> TiedBufGroupId:
         return typed_len(
             self._slot_to_page_indices[life_cycle].tied_buffer_groups)
+
+    @dataclass(slots=True, frozen=True)
+    class Statistics:
+        'All in number of slots, for one pool group'
+        slot_size: HomoTuple[int]
+        total: int
+        free: int
+        evictable: int
+
+        @property
+        def available(self) -> int:
+            return self.free + self.evictable
+
+        @property
+        def unavailable(self) -> int:
+            return self.total - self.available
+
+    def get_statistics(
+        self,
+        level: CacheLevel = GPU_LEVEL
+    ) -> TypedIndexList[PoolGroupIndex, Statistics]:
+        ret = make_typed(lambda: self.Statistics((), 0, 0, 0),
+                         self.num_pool_groups)
+        for pg_idx in typed_range(self.num_pool_groups):
+            pg = self._pool_group(level, pg_idx)
+            evictable_cnt = self._levels[level].controller.num_evictable_pages(
+                pg_idx)
+            ret[pg_idx] = self.Statistics(pg.slot_size, pg.num_slots,
+                                          pg.num_free_slots, evictable_cnt)
+        return ret
+
+    @property
+    def utilization(self) -> TypedIndexList[PoolGroupIndex, float]:
+        ret = make_typed(lambda: 0.0, self.num_pool_groups)
+        stats = self.get_statistics()
+        for pg_idx in typed_range(self.num_pool_groups):
+            ret[pg_idx] = stats[pg_idx].unavailable / stats[pg_idx].total
+        return ret
+
+    @property
+    def overall_utilization(self) -> float:
+        stats = self.get_statistics()
+        return sum(sum(s.slot_size) * s.unavailable for s in stats) / sum(
+            sum(s.slot_size) * s.total for s in stats)

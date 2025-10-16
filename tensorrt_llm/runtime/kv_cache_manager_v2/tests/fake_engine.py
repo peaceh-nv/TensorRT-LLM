@@ -16,8 +16,8 @@ from .kernels import check_values, fill_values
 
 class Step(NamedTuple):
     kv_cache: _KVCache
-    input: Sequence[TokenIdExt]  # when empty, just check history
-    history: Sequence[TokenIdExt]
+    input: list[TokenIdExt]  # when empty, just check history
+    history: list[TokenIdExt]
 
 
 class Role:
@@ -129,14 +129,14 @@ class FakeEngine:
         for i, page in enumerate(pages):
             ordinal = ordinal_beg + i
             assert page != BAD_PAGE_INDEX
-            addr = MemAddress(pool + stride * page + token_bytes *
-                              (history_len % tokens_per_block))
             page_range = (tokens_per_block * ordinal,
                           tokens_per_block * (ordinal + 1))
-            batch_range = tuple(i - history_len
-                                for i in overlap(input_range, page_range))
+            batch_range = tuple(i for i in overlap(input_range, page_range))
             assert batch_range
-            tokens = input[batch_range[0]:batch_range[1]]
+            tokens = input[(batch_range[0] - history_len):(batch_range[1] -
+                                                           history_len)]
+            addr = MemAddress(pool + stride * page + token_bytes *
+                              (batch_range[0] % tokens_per_block))
             # print('layer_id={}, buf_id={}, beam={}, i={}, addr={}, tokens={}'.format(layer_id, buf_id, beam, i, addr, tokens))
             fill_values(addr, token_bytes, layer_id, buf_id, beam, tokens,
                         stream)

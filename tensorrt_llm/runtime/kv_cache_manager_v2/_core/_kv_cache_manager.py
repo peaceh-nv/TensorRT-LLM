@@ -13,13 +13,16 @@ from ._kv_cache import _KVCache
 
 
 class KVCacheManager:
-    __slots__ = ('_life_cycles', '_radix_tree', '_storage', '__weakref__')
+    __slots__ = ('_init_config', '_life_cycles', '_radix_tree', '_storage',
+                 '__weakref__')
+    _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
     _radix_tree: BlockRadixTree
     _storage: StorageManager
 
     def __init__(self, config: KVCacheManagerConfig):
         init_cuda_once()
+        self._init_config = config
         self._life_cycles = LifeCycleRegistry(config)
         self._radix_tree = BlockRadixTree(self._life_cycles,
                                           config.tokens_per_block)
