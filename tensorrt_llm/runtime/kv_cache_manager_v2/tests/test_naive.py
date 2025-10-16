@@ -20,6 +20,7 @@ from kv_cache_manager_v2._utils import (TemporaryCudaStream, init_cuda_once,
                                         remove_if, round_up, typed_range,
                                         unwrap_weakref)
 from kv_cache_manager_v2.tests.fake_engine import FakeEngine, Role, Step
+from kv_cache_manager_v2.tests.kernels import enable_kernel_delay
 from parameterized import parameterized
 
 random.seed(0)
@@ -305,7 +306,7 @@ class TestBatching(TestKVCacheManagerV2):
         lora_task_id = None
         kv_cache = self.manager.create_kv_cache(lora_task_id, prompt[:-1])
         kv_cache.id = next(self.req_id_gen)
-        DBG_PRINT and print(
+        DBG_PRINT and print(  # type: ignore[arg-type]
             f"created {kv_cache.id} with {kv_cache.num_committed_tokens} tokens reused"
         )
         history = prompt[:kv_cache.num_committed_tokens]
@@ -342,7 +343,8 @@ class TestBatching(TestKVCacheManagerV2):
             while i < len(self.batch) and not s.kv_cache.resize(
                     len(s.history) + len(s.input), None):
                 last = self.batch.pop()
-                DBG_PRINT and print(f"suspending {last.kv_cache.id}")
+                DBG_PRINT and print(
+                    f"suspending {last.kv_cache.id}")  # type: ignore[arg-type]
                 last.kv_cache.suspend()
                 self.suspended.append(last)
 
@@ -359,26 +361,32 @@ class TestBatching(TestKVCacheManagerV2):
                 ok = ok and kv_cache.resize(
                     len(step.history) + len(step.input), None)
                 if ok:
-                    DBG_PRINT and print(f"activating {step.kv_cache.id}")
+                    DBG_PRINT and print(f"activating {step.kv_cache.id}"
+                                        )  # type: ignore[arg-type]
                     self.batch.append(suspended.pop())
                 else:
                     if kv_cache.status == _KVCache.Status.ACTIVE:
                         kv_cache.suspend()
                     break
 
-        DBG_PRINT and print(
+        DBG_PRINT and print(  # type: ignore[arg-type]
             f"update_batch: found {len(removed)} finished requests, now with {len(self.batch)} requests"
         )
 
     def test_inflight_batching(self):
-        with TemporaryCudaStream([]) as stream:
+        tic = time.perf_counter()
+        with TemporaryCudaStream([]) as stream, enable_kernel_delay():
             i = itertools.count()
             self.update_batch(stream.handle)
             while self.num_finished < self.num_requests:
-                DBG_PRINT and print(
+                DBG_PRINT and print(  # type: ignore[arg-type]
                     f"Executing batch {next(i)} with size {len(self.batch)}")
                 self.engine.execute(self.batch, stream.handle)
                 self.update_batch(stream.handle)
+        toc = time.perf_counter()
+        time_taken = toc - tic
+        DBG_PRINT and print(
+            f"Time taken: {time_taken} seconds")  # type: ignore[arg-type]
         stream.take_finish_event().synchronize()
 
 

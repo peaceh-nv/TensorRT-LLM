@@ -1,3 +1,4 @@
+import contextlib
 import ctypes
 from collections.abc import Sequence
 from functools import lru_cache
@@ -9,11 +10,21 @@ from kv_cache_manager_v2._common import (CudaStream, LayerId, MemAddress,
                                          TokenIdExt)
 from kv_cache_manager_v2._utils import _unwrap, div_up, exact_div
 
-MAX_TOKENS = 32
+_SLEEP_TIME_NS = 0
+
+
+@contextlib.contextmanager
+def enable_kernel_delay() -> Iterator[None]:
+    global _SLEEP_TIME_NS
+    _SLEEP_TIME_NS = 30_000
+    yield
+    _SLEEP_TIME_NS = 0
 
 
 @lru_cache(maxsize=None)
-def get_program(debug: bool = False):
+def get_program(debug: bool, max_tokens: int, sleep_time: int):
+    assert max_tokens > 0 and (
+        max_tokens & (max_tokens - 1)) == 0, "max_tokens must be a power of 2"
     code = r"""
 #if !defined(__CUDACC_RTC__)
 #include <cassert>
@@ -33,6 +44,8 @@ __device__ inline void check(bool condition) {
 using uint32_t = unsigned int;
 using uint16_t = unsigned short;
 
+constexpr uint32_t sleepTime = SLEEP_TIME_NS;
+
 struct alignas(16) Value {
     uint32_t token;
     uint32_t layer;
@@ -47,13 +60,16 @@ struct alignas(16) Value {
     }
 };
 
-constexpr uint32_t kMAX_TOKENS = _MAX_TOKENS_;
+constexpr uint32_t kMAX_TOKENS = MAX_TOKENS;
 
 struct Tokens {
     uint32_t tokens[kMAX_TOKENS];
 };
 
 extern "C" __global__ void fillValues(Value* data, uint32_t valuesPerToken, uint32_t layer, uint32_t buf_id, uint32_t beam, __grid_constant__ const Tokens tokens, uint32_t numTokens) {
+    if (sleepTime > 0) {
+        __nanosleep(sleepTime);
+    }
     check(numTokens <= kMAX_TOKENS);
     auto const tid = (static_cast<uint32_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
     auto const idxToken = tid / valuesPerToken;
@@ -77,6 +93,9 @@ __device__ inline void assertEq(Value const& a, Value const& b) {
 }
 
 extern "C" __global__ void checkValues(Value const* data, uint32_t valuesPerToken, uint32_t layer, uint32_t buf_id, uint32_t beam, __grid_constant__ const Tokens tokens, uint32_t numTokens) {
+    if (sleepTime > 0) {
+        __nanosleep(sleepTime);
+    }
     check(numTokens <= kMAX_TOKENS);
     auto const tid = (static_cast<uint32_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
     auto const idxToken = tid / valuesPerToken;
@@ -88,11 +107,11 @@ extern "C" __global__ void checkValues(Value const* data, uint32_t valuesPerToke
     assertEq(data[tid], value);
 }
     """
-    program_options = ProgramOptions(std="c++17",
-                                     lineinfo=True,
-                                     debug=debug,
-                                     define_macro=[("_MAX_TOKENS_",
-                                                    str(MAX_TOKENS))])
+    macros = [("MAX_TOKENS", str(max_tokens)),
+              ("SLEEP_TIME_NS", str(sleep_time))]
+    program_options = ProgramOptions(
+        std="c++17", lineinfo=True, debug=debug,
+        define_macro=macros)  # type: ignore[arg-type]
     if not debug:
         program_options.use_fast_math = True
     prog = Program(code, code_type="c++", options=program_options)
@@ -100,12 +119,23 @@ extern "C" __global__ void checkValues(Value const* data, uint32_t valuesPerToke
     return mod
 
 
-@lru_cache(maxsize=None)
-def get_kernel(name: str) -> Kernel:
-    assert name in ("fillValues", "checkValues")
-    debug = False
-    # debug = not NDEBUG
-    return get_program(debug).get_kernel(name)
+def get_kernel(name: str, num_tokens: int,
+               sleep_time: int) -> tuple[Kernel, int]:
+    assert num_tokens > 0
+
+    @lru_cache(maxsize=None)
+    def impl(name: str, max_tokens: int, sleep_time: int) -> Kernel:
+        assert name in ("fillValues", "checkValues")
+        assert max_tokens != 0 and (
+            max_tokens &
+            (max_tokens - 1)) == 0, "max_tokens must be a power of 2"
+        debug = False
+        # debug = not NDEBUG
+        return get_program(debug, max_tokens, sleep_time).get_kernel(name)
+
+    # Round up to the next power of two
+    max_tokens = 2**((num_tokens - 1).bit_length())
+    return impl(name, max_tokens, sleep_time), max_tokens
 
 
 class Value(ctypes.Structure):
@@ -125,16 +155,24 @@ class Value(ctypes.Structure):
         return f"Value(token={self.token}, layer={self.layer}, buf_id={self.buf_id}, beam={self.beam})"
 
 
-class Tokens(ctypes.Structure):
-    _fields_ = [
-        ("tokens", ctypes.c_uint32 * MAX_TOKENS),
-    ]
+@lru_cache(maxsize=None)
+def _get_ctypes_struct(max_tokens: int) -> type[ctypes.Structure]:
+
+    class Tokens(ctypes.Structure):
+        _fields_ = [
+            ("tokens", ctypes.c_uint32 * max_tokens),
+        ]
+
+    Tokens.__name__ = f"Tokens_{max_tokens}"
+    return Tokens
 
 
-def _make_tokens(tokens: Sequence[TokenIdExt]) -> Tokens:
-    assert len(tokens) <= MAX_TOKENS
-    padded = list(tokens) + [0] * (MAX_TOKENS - len(tokens))
-    return Tokens(tokens=(ctypes.c_uint32 * MAX_TOKENS)(*[
+def _make_tokens(tokens: Sequence[TokenIdExt],
+                 max_tokens: int) -> ctypes.Structure:
+    assert len(tokens) <= max_tokens
+    padded = list(tokens) + [0] * (max_tokens - len(tokens))
+    Tokens = _get_ctypes_struct(max_tokens)
+    return Tokens(tokens=(ctypes.c_uint32 * max_tokens)(*[
         t if isinstance(t, int) else int.
         from_bytes(t[:4], 'little', signed=False) for t in padded
     ]))
@@ -147,10 +185,9 @@ def fill_values(address: MemAddress, bytes_per_token: int, layer: LayerId,
     num_tokens = len(tokens)
     if num_tokens == 0:
         return
-    kernel = get_kernel("fillValues")
-    assert num_tokens <= MAX_TOKENS
+    kernel, max_tokens = get_kernel("fillValues", len(tokens), _SLEEP_TIME_NS)
     args = (address, values_per_token, layer, buf_id, beam,
-            _make_tokens(tokens), num_tokens)
+            _make_tokens(tokens, max_tokens), num_tokens)
     arg_types = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
                  ctypes.c_uint32, ctypes.c_uint32, None, ctypes.c_uint32)
     num_threads = values_per_token * num_tokens
@@ -167,10 +204,9 @@ def check_values(address: MemAddress, bytes_per_token: int, layer: LayerId,
     num_tokens = len(tokens)
     if num_tokens == 0:
         return
-    kernel = get_kernel("checkValues")
-    assert num_tokens <= MAX_TOKENS
+    kernel, max_tokens = get_kernel("checkValues", len(tokens), _SLEEP_TIME_NS)
     args = (address, values_per_token, layer, buf_id, beam,
-            _make_tokens(tokens), num_tokens)
+            _make_tokens(tokens, max_tokens), num_tokens)
     arg_types = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
                  ctypes.c_uint32, ctypes.c_uint32, None, ctypes.c_uint32)
     num_threads = values_per_token * num_tokens
