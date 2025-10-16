@@ -7,7 +7,7 @@ import cuda.bindings.driver as drv
 from cuda.core.experimental import Kernel, Program, ProgramOptions
 from kv_cache_manager_v2._common import (CudaStream, LayerId, MemAddress,
                                          TokenIdExt)
-from kv_cache_manager_v2._utils import _unwrap, chunked, div_up, exact_div
+from kv_cache_manager_v2._utils import _unwrap, div_up, exact_div
 
 MAX_TOKENS = 32
 
@@ -53,18 +53,16 @@ struct Tokens {
     uint32_t tokens[kMAX_TOKENS];
 };
 
-extern "C" __global__ void fillValues(Value* data, uint32_t valuesPerToken, uint32_t layer, uint32_t buf_id, uint32_t beam, __grid_constant__ const Tokens tokens) {
-    auto const tidx = (static_cast<uint32_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
-    auto const stride = static_cast<uint32_t>(blockDim.x) * gridDim.x;
-    auto const numTokens = gridDim.y;
-    auto const idxToken = blockIdx.y;
+extern "C" __global__ void fillValues(Value* data, uint32_t valuesPerToken, uint32_t layer, uint32_t buf_id, uint32_t beam, __grid_constant__ const Tokens tokens, uint32_t numTokens) {
     check(numTokens <= kMAX_TOKENS);
-    auto const base = data + idxToken * valuesPerToken;
+    auto const tid = (static_cast<uint32_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+    auto const idxToken = tid / valuesPerToken;
+    if (idxToken >= numTokens) {
+        return;
+    }
     auto const token = tokens.tokens[idxToken];
     auto const value = Value{token, layer, buf_id, beam};
-    for (auto idx = tidx; idx < valuesPerToken; idx += stride) {
-        base[idx] = value;
-    }
+    data[tid] = value;
 }
 
 __device__ inline void assertEq(Value const& a, Value const& b) {
@@ -78,18 +76,16 @@ __device__ inline void assertEq(Value const& a, Value const& b) {
     check(a == b);
 }
 
-extern "C" __global__ void checkValues(Value const* data, uint32_t valuesPerToken, uint32_t layer, uint32_t buf_id, uint32_t beam, __grid_constant__ const Tokens tokens) {
-    auto const tidx = (static_cast<uint32_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
-    auto const stride = static_cast<uint32_t>(blockDim.x) * gridDim.x;
-    auto const numTokens = gridDim.y;
-    auto const idxToken = blockIdx.y;
+extern "C" __global__ void checkValues(Value const* data, uint32_t valuesPerToken, uint32_t layer, uint32_t buf_id, uint32_t beam, __grid_constant__ const Tokens tokens, uint32_t numTokens) {
     check(numTokens <= kMAX_TOKENS);
-    auto const base = data + idxToken * valuesPerToken;
-    auto const token = tokens.tokens[idxToken];
-    auto const ref = Value{token, layer, buf_id, beam};
-    for (auto idx = tidx; idx < valuesPerToken; idx += stride) {
-        assertEq(base[idx], ref);
+    auto const tid = (static_cast<uint32_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+    auto const idxToken = tid / valuesPerToken;
+    if (idxToken >= numTokens) {
+        return;
     }
+    auto const token = tokens.tokens[idxToken];
+    auto const value = Value{token, layer, buf_id, beam};
+    assertEq(data[tid], value);
 }
     """
     program_options = ProgramOptions(std="c++17",
@@ -148,32 +144,40 @@ def fill_values(address: MemAddress, bytes_per_token: int, layer: LayerId,
                 buf_id: int, beam: int, tokens: Sequence[TokenIdExt],
                 stream: CudaStream):
     values_per_token = exact_div(bytes_per_token, ctypes.sizeof(Value))
+    num_tokens = len(tokens)
+    if num_tokens == 0:
+        return
     kernel = get_kernel("fillValues")
-    for chunk in chunked(tokens, MAX_TOKENS):
-        args = (address, values_per_token, layer, buf_id, beam,
-                _make_tokens(chunk))
-        arg_types = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
-                     ctypes.c_uint32, ctypes.c_uint32, None)
-        _unwrap(
-            drv.cuLaunchKernel(kernel._handle, div_up(values_per_token, 1024),
-                               len(chunk), 1, 256, 1, 1, 0, stream,
-                               (args, arg_types), 0))
+    assert num_tokens <= MAX_TOKENS
+    args = (address, values_per_token, layer, buf_id, beam,
+            _make_tokens(tokens), num_tokens)
+    arg_types = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                 ctypes.c_uint32, ctypes.c_uint32, None, ctypes.c_uint32)
+    num_threads = values_per_token * num_tokens
+    cta_size = 256
+    _unwrap(
+        drv.cuLaunchKernel(kernel._handle, div_up(num_threads, cta_size), 1, 1,
+                           cta_size, 1, 1, 0, stream, (args, arg_types), 0))
 
 
 def check_values(address: MemAddress, bytes_per_token: int, layer: LayerId,
                  buf_id: int, beam: int, tokens: Sequence[TokenIdExt],
                  stream: CudaStream):
     values_per_token = exact_div(bytes_per_token, ctypes.sizeof(Value))
+    num_tokens = len(tokens)
+    if num_tokens == 0:
+        return
     kernel = get_kernel("checkValues")
-    for chunk in chunked(tokens, MAX_TOKENS):
-        args = (address, values_per_token, layer, buf_id, beam,
-                _make_tokens(chunk))
-        arg_types = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
-                     ctypes.c_uint32, ctypes.c_uint32, None)
-        _unwrap(
-            drv.cuLaunchKernel(kernel._handle, div_up(values_per_token, 1024),
-                               len(chunk), 1, 256, 1, 1, 0, stream,
-                               (args, arg_types), 0))
+    assert num_tokens <= MAX_TOKENS
+    args = (address, values_per_token, layer, buf_id, beam,
+            _make_tokens(tokens), num_tokens)
+    arg_types = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                 ctypes.c_uint32, ctypes.c_uint32, None, ctypes.c_uint32)
+    num_threads = values_per_token * num_tokens
+    cta_size = 256
+    _unwrap(
+        drv.cuLaunchKernel(kernel._handle, div_up(num_threads, cta_size), 1, 1,
+                           cta_size, 1, 1, 0, stream, (args, arg_types), 0))
 
 
 def debug_dump_tokens(addr: MemAddress, token_bytes: int, num_tokens: int,
