@@ -1,4 +1,5 @@
 from collections.abc import Callable, Sequence
+from typing import Any
 
 from .._block_radix_tree import BlockRadixTree
 from .._common import (BlockOrdinal, CacheLevel, CacheTier, LayerId, MemAddress,
@@ -60,11 +61,12 @@ class KVCacheManager:
         self,
         lora_task_id: int | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
+        id: Any = None,
         custom_priority_callback: Callable[
             [BlockOrdinal, LifeCycle],
             Priority] = lambda _, __: Priority.DEFAULT
     ) -> _KVCache:
-        return _KVCache(self, lora_task_id, input_tokens,
+        return _KVCache(self, lora_task_id, input_tokens, id,
                         custom_priority_callback)
 
     # If best_efforts is True, we will try to resize the quota to the largest possible value that is still <= quota, and returns False only when we cannot resize the quota at all.

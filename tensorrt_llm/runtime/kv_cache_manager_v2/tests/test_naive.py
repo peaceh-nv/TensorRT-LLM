@@ -286,7 +286,6 @@ class TestBatching(TestKVCacheManagerV2):
     def setUp(self):
         super().setUp()
         self.prepare(128 << 20, 1 << 30, 4 << 30, 36, 128, 0)
-        self.num_requests = 100
         self.past_sequences = list[list[TokenIdExt]]()
         self.seq_len_dict = WeakKeyDictionary()
         self.batch = list[Step]()
@@ -300,12 +299,13 @@ class TestBatching(TestKVCacheManagerV2):
             raise ValueError("Too many requests created")
         gen_length = lambda: random.randint(20, 200)
         prompt = (random.choice(self.past_sequences)
-                  if self.past_sequences and random.random() < 0.3 else
+                  if self.past_sequences and random.random() < 0.7 else
                   []) + [self.next_token() for _ in range(gen_length())]
         decode_len = gen_length()
         lora_task_id = None
-        kv_cache = self.manager.create_kv_cache(lora_task_id, prompt[:-1])
-        kv_cache.id = next(self.req_id_gen)
+        kv_cache = self.manager.create_kv_cache(lora_task_id,
+                                                prompt[:-1],
+                                                id=next(self.req_id_gen))
         DBG_PRINT and print(  # type: ignore[arg-type]
             f"created {kv_cache.id} with {kv_cache.num_committed_tokens} tokens reused"
         )
@@ -373,7 +373,15 @@ class TestBatching(TestKVCacheManagerV2):
             f"update_batch: found {len(removed)} finished requests, now with {len(self.batch)} requests"
         )
 
-    def test_inflight_batching(self):
+    @parameterized.expand([(10000, True), (100, False)])
+    def test_inflight_batching(self, num_requests: int, skip_execution: bool):
+        self.num_requests = num_requests
+        profile = False
+        profiler = None
+        if profile:
+            import cProfile
+            profiler = cProfile.Profile()
+            profiler.enable()
         tic = time.perf_counter()
         with TemporaryCudaStream([]) as stream, enable_kernel_delay():
             i = itertools.count()
@@ -381,12 +389,16 @@ class TestBatching(TestKVCacheManagerV2):
             while self.num_finished < self.num_requests:
                 DBG_PRINT and print(  # type: ignore[arg-type]
                     f"Executing batch {next(i)} with size {len(self.batch)}")
-                self.engine.execute(self.batch, stream.handle)
+                if not skip_execution:
+                    self.engine.execute(self.batch, stream.handle)
                 self.update_batch(stream.handle)
         toc = time.perf_counter()
-        time_taken = toc - tic
-        DBG_PRINT and print(
-            f"Time taken: {time_taken} seconds")  # type: ignore[arg-type]
+        if profiler is not None:
+            profiler.disable()
+            profiler.print_stats(sort='cumtime')
+            profiler.dump_stats('profiler.prof')
+        toc - tic
+        # print(f"Time taken: {time_taken} seconds")
         stream.take_finish_event().synchronize()
 
 

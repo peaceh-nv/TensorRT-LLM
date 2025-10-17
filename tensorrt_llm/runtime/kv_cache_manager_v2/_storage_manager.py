@@ -2,7 +2,6 @@ import os
 import warnings
 import weakref
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import TYPE_CHECKING, Iterator, Sequence, cast
 
 from ._buffer_registry import BufferRegistry, TiedBufGroupId
@@ -366,7 +365,6 @@ class StorageManager:
         assert page.node_ref is not None
         self._levels[page.cache_level].controller.remove(page.node_ref)
 
-    @lru_cache(maxsize=None)
     def get_mem_pool_base_address(self, layer_id: LayerId,
                                   data_role: DataRole) -> MemAddress:
         storage = self._levels[GPU_LEVEL].storage
@@ -410,7 +408,6 @@ class StorageManager:
         return (converter.scale * slot_id + converter.bias).tolist()
         # return converter(slot_id).tolist()
 
-    @lru_cache(maxsize=None)
     def get_mirrored_buffer_group_indices(
             self, life_cycle: LifeCycleId) -> HomoTuple[TiedBufGroupId]:
         converter = self._slot_to_page_indices[life_cycle]

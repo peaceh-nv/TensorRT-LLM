@@ -247,6 +247,10 @@ class SlotAllocator:
 
     def __del__(self):
         assert_critical(
+            self._num_ready_recycled_slots == len(self._recycled_slots)
+            and self._num_ready_overflow_slots == len(self._overflow_slots),
+            "did you call synchronize()?")
+        assert_critical(
             self._target_capacity == self._capacity
             and not self._overflow_slots, "resize is in progress")
         assert_critical(self._occupied_mask.num_set_bits == 0,
@@ -425,6 +429,12 @@ class SlotAllocator:
                 break
         return num_ready
 
+    def _synchronize(self) -> None:
+        'synchronize the events of all unused slots'
+        while (self._num_ready_recycled_slots != len(self._recycled_slots)
+               or self._num_ready_overflow_slots != len(self._overflow_slots)):
+            self._scrub_events()
+
 
 class PoolGroupBase:
     __slots__ = ('_slot_allocator', '_pools')
@@ -441,6 +451,7 @@ class PoolGroupBase:
     def destroy(self):
         if self._slot_allocator._capacity == 0:
             return
+        self._slot_allocator._synchronize()
         for pool in self._pools:
             pool.destroy()
         self._slot_allocator.resize(0)

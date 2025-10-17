@@ -112,9 +112,10 @@ class _KVCache:
     _tied_grp_indices: TypedIndexList[LifeCycleId, HomoTuple[TiedBufGroupId]]
 
     def __init__(self, manager: 'KVCacheManager', lora_task_id: int | None,
-                 input_tokens: Sequence[TokenIdExt] | None,
+                 input_tokens: Sequence[TokenIdExt] | None, id: Any,
                  custom_priority_callback: Callable[[BlockOrdinal, LifeCycle],
                                                     Priority]):
+        self.id = id
         self._manager = manager
         self._lora_task_id = lora_task_id
         self._get_priority = custom_priority_callback
@@ -223,6 +224,8 @@ class _KVCache:
     # If we use two separate APIs for capacity and history length, sometimes we will need to increase capacity first to maintain capacity >= history_length. But then we may have a middle state (between two APIs) where we use more pages than necessary for SWA layers. So we use a single API to avoid this. Usually this is a concern only for prefill phase where we create many tokens in one step. For other cases, we can just set the capacity and history_length properties instead.
     def resize(self, capacity: int | None, history_length: int | None) -> bool:
         assert self.status == self.Status.ACTIVE
+        tokens_per_block = self.tokens_per_block
+        assert div_up(self._capacity, tokens_per_block) == len(self._blocks)
         capacity = value_or(capacity, self._capacity)
         history_length = value_or(history_length, self._history_length)
         if history_length < self._history_length:
@@ -232,7 +235,6 @@ class _KVCache:
         if self._shortcut_set_capacity(
                 capacity) and self._shortcut_set_history_length(history_length):
             return True
-        tokens_per_block = self.tokens_per_block
         backup_holders = self._unlock_stale_blocks(history_length)
         old_num_blocks = BlockOrdinal(div_up(self._capacity, tokens_per_block))
         new_num_blocks = BlockOrdinal(div_up(capacity, tokens_per_block))
@@ -256,6 +258,7 @@ class _KVCache:
                 return False
             for beam_indices in self._page_indices:
                 for indices in beam_indices:
+                    assert len(indices) == old_num_blocks
                     indices.extend([BAD_PAGE_INDEX] * num_new_blocks)
             stream_wait_events(self.cuda_stream,
                                (s.ready_event for s in sum(slots, ())))
@@ -506,22 +509,25 @@ class _KVCache:
         elif tree_block.is_full and self.manager.allow_seq_rebasing:
             # try to replace our pages with pages from the existing block.
             reuse_list = list[tuple[LifeCycleId, CommittedPage]]()
-            for lc, holder in typed_enumerate(beam_block):
+            for lc in typed_range(typed_len(beam_block)):
                 existing_page = map_optional(tree_block.storage[lc],
                                              lambda p: p())
-                assert holder is not None
-                locked = isinstance(holder, _SharedPageLock)
+                assert beam_block[lc] is not None
+                locked = isinstance(beam_block[lc], _SharedPageLock)
                 if existing_page is None:
                     # The reusable page is gone. We put our own page into the tree block.
-                    p = cast(UncommittedPage,
-                             holder.page).convert_to_committed(tree_block)
+                    page = cast(UncommittedPage,
+                                cast(_SharedPageLock, beam_block[lc]).page)
+                    beam_block[lc] = None
+                    p = page.convert_to_committed(tree_block)
                     # The page comes from uncommitted page of self, so safe to skip wait.
                     beam_block[lc] = p.lock(
                         self, beam_idx, ordinal, lc,
                         skip_wait=True) if locked else p.hold()
                 else:
                     if locked:
-                        beam_block[lc] = cast(_SharedPageLock, holder).holder
+                        beam_block[lc] = cast(_SharedPageLock,
+                                              beam_block[lc]).holder
                     reuse_list.append((lc, existing_page))
             locks = batched_lock_to_gpu(self, [
                 BatchedLockTarget(p, beam_idx, ordinal, lc)
@@ -682,13 +688,15 @@ class _KVCache:
             matched) - 1) + matched[-1][1] if matched else 0
         life_cycles = manager._life_cycles
 
-        def has_pages(block: Block, lc_list: Iterator[LifeCycleId]) -> bool:
+        def has_pages(block: Block, lc_list: Iterable[LifeCycleId]) -> bool:
             return all(block.storage[lc] is not None for lc in lc_list)
 
         # check for full attention layers
         if any(lc.window_size is None for lc in life_cycles):
-            lc_list = (lc_idx for lc_idx, lc in life_cycles.items()
-                       if lc.window_size is None)
+            lc_list = [
+                lc_idx for lc_idx, lc in life_cycles.items()
+                if lc.window_size is None
+            ]
             n = find_index(matched, lambda b: not has_pages(b[0], lc_list))
             matched = matched[:n]
 
@@ -708,16 +716,22 @@ class _KVCache:
         while matched:
             num_tokens = get_num_matched_tokens(matched)
             for lc_idx, lc in swa_life_cycles:
+                if lc.window_size is None:
+                    continue
+                n = find_index(reversed(matched),
+                               lambda b: has_page(b[0], lc_idx))
+                if n != 0:
+                    matched = matched[:-n]
+                    break
                 _, stale_end = self._get_stale_range(num_tokens, lc)
                 n = find_index(reversed(matched[stale_end:]),
                                lambda b: not has_page(b[0], lc_idx))
                 if len(matched) - n > stale_end:
-                    matched = matched[:-n]
-                    while matched and not has_page(matched[-1][0], lc_idx):
-                        matched.pop()
+                    matched = matched[:len(matched) - n]
                     break
             else:
                 break
+        num_tokens = get_num_matched_tokens(matched)
         self._committed_tokens = list(input_tokens[:num_tokens])
         self._history_length = num_tokens
         self._capacity = num_tokens

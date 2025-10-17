@@ -23,6 +23,7 @@ bool loopedReadWrite(Func&& func, ssize_t size) noexcept
             {
                 continue; // Retry on interrupt
             }
+            TLLM_LOG_ERROR("Disk read/write failed: %s\n", strerror(errno));
             return false;
         }
         count += bytes;
@@ -98,7 +99,7 @@ CUDA_CB void hostFnHostToDiskCopy(void* userData) noexcept
     delete data;
     if (!success)
     {
-        TLLM_LOG_ERROR("[kvCacheManagerV2Utils] hostFnDiskToHostCopy failed.\n");
+        TLLM_LOG_ERROR("[kvCacheManagerV2Utils] hostFnHostToDiskCopy failed.\n");
     }
 }
 
@@ -106,16 +107,11 @@ CUDA_CB void hostFnHostToHostCopy(void* userData) noexcept
 {
     // @TODO: enable multi-threading with a thread pool
     auto const data = static_cast<UserData<MemAddress, MemAddress>*>(userData);
-    bool success = true;
     for (auto const& t : data->tasks)
     {
         memcpy(reinterpret_cast<void*>(t.dst), reinterpret_cast<void const*>(t.src), data->numBytes);
     }
     delete data;
-    if (!success)
-    {
-        TLLM_LOG_ERROR("[kvCacheManagerV2Utils] hostFnHostToHostCopy failed.\n");
-    }
 }
 
 CUresult copyDiskToDisk(

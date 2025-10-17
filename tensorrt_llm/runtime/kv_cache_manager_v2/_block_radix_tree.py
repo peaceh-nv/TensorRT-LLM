@@ -237,13 +237,6 @@ class Block:
     def __init__(self, tokens: Sequence[TokenIdExt], prev: 'Block | RootBlock'):
         assert prev.tokens_per_block == prev.prev.tokens_per_block, 'prev must be a full block'
         self.key = self.make_key(prev.key, tokens)
-        # a Block is useless if all its tokens are covered by a sibling block. Raise UselessBlockError if so.
-        if self.key in prev.next:
-            raise UselessBlockError(prev.next[self.key])
-        # @TODO: when we have the database for find_best_partial_match_in_next_nodes, we may use that for faster check.
-        for b in prev.next.values():
-            if b.tokens[:len(tokens)] == tokens:
-                raise UselessBlockError(b)
         self.tokens = tokens
         self.ordinal = BlockOrdinal(prev.ordinal + 1)
         self._prev = weakref.ref(prev)
@@ -251,6 +244,14 @@ class Block:
         prev.next[self.key] = self
         self.next = {}
         self.storage = filled_list(None, prev.num_life_cycles)
+        # a Block is useless if all its tokens are covered by a sibling block. Raise UselessBlockError if so.
+        if self.key in prev.next:
+            raise UselessBlockError(prev.next[self.key])
+        if len(tokens) < self.tokens_per_block:
+            # @TODO: when we have the database for find_best_partial_match_in_next_nodes, we may use that for faster check.
+            for b in prev.next.values():
+                if b.tokens[:len(tokens)] == tokens:
+                    raise UselessBlockError(b)
         # If there are sibling blocks fully covered by this block, remove them.
         to_remove = []
         for k, b in prev.next.items():
