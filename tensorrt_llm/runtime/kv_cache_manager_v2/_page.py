@@ -56,13 +56,13 @@ class Page(Slot):
     def hold(self) -> '_PageHolder':
         if self._holder is not None:
             return unwrap_weakref(self._holder)
+        holder = object.__new__(_PageHolder)
+        holder._setup(self)
+        self._holder = weakref.ref(holder)
         controller = self.manager
         if self.scheduled_for_eviction and not controller.is_evictable(self):
             controller.exclude_from_eviction(self)
             assert not self.scheduled_for_eviction
-        holder = object.__new__(_PageHolder)
-        holder._setup(self)
-        self._holder = weakref.ref(holder)
         return holder
 
     # Prevent eviction. You need to migrate the page to GPU later.
@@ -169,14 +169,16 @@ class CommittedPage(Page):
         self.set_slot(slot)
 
     def __del__(self):
-        block = unwrap_weakref(self.block)
-        block.storage[self.life_cycle] = None
-        # if this makes the block unusable, remove it from the radix tree.
-        warnings.warn(
-            "[KVCacheManager] Implement a better way to detect and remove ununsable blocks, which should consider SWA layers."
-        )
-        # For now, we use a very simple approach to avoid accumulation of radix tree nodes.
-        block.remove_if_unusable()
+        block = self.block()
+        # block may be None when rebase happens, i.e. another block with the same key is committed, replacing it, but the page is still used by a _KVCache.
+        if block is not None:
+            block.storage[self.life_cycle] = None
+            # if this makes the block unusable, remove it from the radix tree.
+            warnings.warn(
+                "[KVCacheManager] Implement a better way to detect and remove ununsable blocks, which should consider SWA layers."
+            )
+            # For now, we use a very simple approach to avoid accumulation of radix tree nodes.
+            block.remove_if_unusable()
         Page.__del__(self)
 
 

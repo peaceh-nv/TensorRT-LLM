@@ -314,7 +314,8 @@ class Block:
 
     @property
     def is_orphan(self) -> bool:
-        return self.key not in self.prev.next
+        return self.key not in self.prev.next or self.prev.next[
+            self.key] is not self
 
 
 class BlockRadixTree:

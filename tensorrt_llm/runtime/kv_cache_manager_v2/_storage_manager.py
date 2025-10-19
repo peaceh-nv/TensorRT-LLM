@@ -233,15 +233,22 @@ class StorageManager:
                 )
         evicted = ctrl.evict(num_to_evict)
         accepted_pages = make_typed(lambda: list[Page](), self.num_pool_groups)
-        if self.is_last_level(lvl_id):
+        is_last_level = self.is_last_level(lvl_id)
+        if is_last_level:
             for pg_idx in typed_range(self.num_pool_groups):
                 old_free_cnt = storage.get_num_free_slots(pg_idx)
                 num_evicted = len(evicted[pg_idx])
                 assert NDEBUG or all(p.status == PageStatus.DROPPABLE
                                      for p in evicted[pg_idx])
+                if not NDEBUG:
+                    dbg_weakrefs = [weakref.ref(p) for p in evicted[pg_idx]]
                 evicted[pg_idx].clear()
+                if not NDEBUG:
+                    assert all(p() is None
+                               for p in dbg_weakrefs)  # type: ignore[arg-type]
                 new_free_cnt = storage.get_num_free_slots(pg_idx)
-                assert num_evicted + old_free_cnt == new_free_cnt
+                # GC of some pages may trigger removal of radix tree blocks and some other pages.
+                assert new_free_cnt >= num_evicted + old_free_cnt
                 assert len(held_pages[pg_idx]) <= new_free_cnt
                 fallen_pages[pg_idx].extend(held_pages[pg_idx])
                 held_pages[pg_idx].clear()
@@ -285,6 +292,8 @@ class StorageManager:
                                       pages,
                                       update_src=True)
                 for p in pages:
+                    if is_last_level and p.status == PageStatus.HELD:
+                        continue
                     self._levels[dst_lvl].controller.schedule_for_eviction(p)
         return
 
@@ -359,7 +368,9 @@ class StorageManager:
         self._levels[cache_level].storage.release(pg_idx, slot)
 
     def schedule_for_eviction(self, page: EvictablePage) -> None:
-        self._levels[page.cache_level].controller.schedule_for_eviction(page)
+        if self.is_evictable(page):
+            self._levels[page.cache_level].controller.schedule_for_eviction(
+                page)
 
     def exclude_from_eviction(self, page: EvictablePage) -> None:
         assert page.node_ref is not None

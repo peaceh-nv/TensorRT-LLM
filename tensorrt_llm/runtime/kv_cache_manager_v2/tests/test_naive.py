@@ -374,6 +374,7 @@ class TestBatching(TestKVCacheManagerV2):
         )
 
     @parameterized.expand([(10000, True), (100, False)])
+    # @parameterized.expand([(10000, True)])
     def test_inflight_batching(self, num_requests: int, skip_execution: bool):
         self.num_requests = num_requests
         profile = False
@@ -397,8 +398,8 @@ class TestBatching(TestKVCacheManagerV2):
             profiler.disable()
             profiler.print_stats(sort='cumtime')
             profiler.dump_stats('profiler.prof')
-        toc - tic
-        # print(f"Time taken: {time_taken} seconds")
+        if DBG_PRINT:
+            print(f"Time taken: {toc-tic} seconds")
         stream.take_finish_event().synchronize()
 
 

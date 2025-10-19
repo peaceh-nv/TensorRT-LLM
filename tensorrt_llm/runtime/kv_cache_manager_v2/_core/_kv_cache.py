@@ -786,7 +786,7 @@ class _KVCache:
                                                        slot.slot_id, p)
                             src = storage.slot_address(page.cache_level, pg_idx,
                                                        page.slot_id, p)
-                            batched_copy(dst_tier, src_tier, slot_size[i],
+                            batched_copy(dst_tier, src_tier, slot_size[p],
                                          [CopyTask(dst, src)], stream.get())
                     ready_event = stream.take_finish_event()
                     page.ready_event = ready_event
