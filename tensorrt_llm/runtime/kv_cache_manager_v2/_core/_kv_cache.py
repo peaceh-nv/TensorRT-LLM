@@ -1,6 +1,5 @@
 import array
 import enum
-import warnings
 import weakref
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -52,8 +51,8 @@ class SeqBlock:
         return ret
 
     def __del__(self):
-        self.pages.clear()  # clear holders first.
         self.tree_block = None
+        self.pages.clear()
 
 
 # The _KVCache holds unique/shared ownership of memory blocks. On deletion, the ownership if destroys and KVCacheManager takes control of them. A KV cache maintains three lengths:
@@ -371,9 +370,7 @@ class _KVCache:
         else:
             self._commit_state = self.CommitState.USER_STOP
             self._on_stop_committing()
-        warnings.warn(
-            "[KVCacheManager] Not Implemented: check if the last committed pages are usable, in case some prior pages are already dropped. For SWA, this can be done only when we stop committing."
-        )
+        # TODO: check if the last committed pages are usable, in case some prior pages are already dropped. For SWA, this can be done only when we stop committing. (TRTLLM-8802)
         assert self._commit_state == self.CommitState.USER_STOP
 
     # Suspend, allow the KV cache manager to evict buffers from GPU, but don't drop them.
@@ -441,18 +438,6 @@ class _KVCache:
     @property
     def tokens_per_block(self) -> int:
         return self.manager.tokens_per_block
-
-    # Wait until the whole helix group arrives at the same phase.
-    # When calling this, all ranks must have the same KV cache lengths (capacity, history_length, num_committed_tokens), committed tokens, beam_width, and status. Otherwise the behavior is undefined.
-    # This is for helix parallelism. Returns immediately if not using helix parallelism.
-    @not_implemented
-    def helix_sync(self):
-        ...
-
-    # From which rank the sequence starts. This API is required only if we support helix sequence starting from arbitrary rank.
-    @not_implemented
-    def helix_seq_start_rank(self) -> int:
-        ...
 
     def _page(self, block_ordinal: BlockOrdinal, beam_index: BeamIndex,
               life_cycle: LifeCycleId) -> BlockPage:

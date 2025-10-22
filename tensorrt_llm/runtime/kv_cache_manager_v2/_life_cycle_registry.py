@@ -12,6 +12,7 @@ class LifeCycle(NamedTuple):
     @staticmethod
     def make(window_size: SlidingWindowSize, num_sink_tokens: int | None,
              tokens_per_block: int) -> 'LifeCycle':
+        assert num_sink_tokens in (None, 0) or window_size is not None
         num_sink_blocks = div_up(num_sink_tokens or 0, tokens_per_block)
         return LifeCycle(window_size, num_sink_blocks)
 
@@ -60,3 +61,6 @@ class LifeCycleRegistry:
 
     def get(self) -> TypedIndexList[LifeCycleId, LifeCycle]:
         return self._life_cycle_list
+
+    def __contains__(self, lc: LifeCycle):
+        return lc in self._life_cycle_id_dict

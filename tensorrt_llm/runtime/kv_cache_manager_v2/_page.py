@@ -1,4 +1,3 @@
-import warnings
 import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -153,7 +152,6 @@ class UncommittedPage(Page):
 
 @dataclass(slots=True, weakref_slot=True)
 class CommittedPage(Page):
-    #@TODO: consider move this to _PageHolder
     block: weakref.ref['Block']
 
     @staticmethod
@@ -172,13 +170,10 @@ class CommittedPage(Page):
         block = self.block()
         # block may be None when rebase happens, i.e. another block with the same key is committed, replacing it, but the page is still used by a _KVCache.
         if block is not None:
-            block.storage[self.life_cycle] = None
-            # if this makes the block unusable, remove it from the radix tree.
-            warnings.warn(
-                "[KVCacheManager] Implement a better way to detect and remove ununsable blocks, which should consider SWA layers."
-            )
-            # For now, we use a very simple approach to avoid accumulation of radix tree nodes.
-            block.remove_if_unusable()
+            block.unset_page(
+                self.life_cycle,
+                self.manager.kv_cache_manager._life_cycles.get_life_cycle(
+                    self.life_cycle))
         Page.__del__(self)
 
 

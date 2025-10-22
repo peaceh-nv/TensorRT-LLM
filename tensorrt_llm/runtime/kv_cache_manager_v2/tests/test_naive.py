@@ -1,4 +1,5 @@
 import itertools
+import os
 import random
 import time
 import unittest
@@ -12,7 +13,7 @@ from kv_cache_manager_v2 import (AttentionLayerConfig, BufferConfig,
                                  HostCacheTierConfig, KVCacheManager,
                                  KVCacheManagerConfig, LayerId, TokenId,
                                  TokenIdExt, _KVCache)
-from kv_cache_manager_v2._block_radix_tree import traverse_subtree
+from kv_cache_manager_v2._block_radix_tree import traverse_post_order
 from kv_cache_manager_v2._common import CudaStream
 from kv_cache_manager_v2._eviction_controller import PageStatus
 from kv_cache_manager_v2._exceptions import OutOfPagesError
@@ -23,7 +24,9 @@ from kv_cache_manager_v2.tests.fake_engine import FakeEngine, Role, Step
 from kv_cache_manager_v2.tests.kernels import enable_kernel_delay
 from parameterized import parameterized
 
-random.seed(0)
+seed = int.from_bytes(os.urandom(8), 'little')
+print(f"seed: {seed}")
+random.seed(seed)
 DBG_PRINT = False
 
 
@@ -220,7 +223,7 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         for root_block in self.manager._radix_tree.next.values():
             for block0 in root_block.next.values():
-                for block in traverse_subtree(block0):
+                for block in traverse_post_order(block0):
                     for page in block.storage:
                         if page is not None:
                             assert unwrap_weakref(
@@ -248,7 +251,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.run_naive(512, 1, True)
 
     @parameterized.expand([(2**i, False) for i in range(12)])
-    # @parameterized.expand([(1, True)])
+    # @parameterized.expand([(32, True)])
     def test_naive_perf(self, interval, profile: bool):
         self.skipTest("Skipping perf test")
         self.prepare(256 << 20, 256 << 20, 1 << 30, 36, 128, 48)
@@ -275,6 +278,7 @@ class TestNoBatching(TestKVCacheManagerV2):
 
 class TestBatching(TestKVCacheManagerV2):
     num_requests: int
+    avg_length: int
     past_sequences: list[list[TokenIdExt]]
     seq_len_dict: WeakKeyDictionary[_KVCache, int]
     batch: list[Step]
@@ -282,10 +286,11 @@ class TestBatching(TestKVCacheManagerV2):
     num_created: int
     num_finished: int
     req_id_gen: Iterator[int]
+    acc_num_prompt_tokens: int
+    acc_num_decode_tokens: int
 
     def setUp(self):
         super().setUp()
-        self.prepare(128 << 20, 1 << 30, 4 << 30, 36, 128, 0)
         self.past_sequences = list[list[TokenIdExt]]()
         self.seq_len_dict = WeakKeyDictionary()
         self.batch = list[Step]()
@@ -293,14 +298,31 @@ class TestBatching(TestKVCacheManagerV2):
         self.num_finished = 0
         self.num_created = 0
         self.req_id_gen = itertools.count()
+        self.acc_num_prompt_tokens = 0
+        self.acc_num_decode_tokens = 0
 
     def gen_request(self) -> Step:
         if self.num_created >= self.num_requests:
             raise ValueError("Too many requests created")
-        gen_length = lambda: random.randint(20, 200)
-        prompt = (random.choice(self.past_sequences)
-                  if self.past_sequences and random.random() < 0.7 else
-                  []) + [self.next_token() for _ in range(gen_length())]
+        gen_length = lambda: random.randint(int(self.avg_length * 0.6),
+                                            int(self.avg_length * 1.4))
+        if len(self.past_sequences) >= 32 and random.random() < 0.2:
+            # continued multi-round dialog
+            prompt = random.choice(self.past_sequences) + [
+                self.next_token() for _ in range(gen_length())
+            ]
+        else:
+            # new dialog
+            if len(self.past_sequences) < 32 or random.random() < 0.5:
+                # completely new prompt
+                prompt = [self.next_token() for _ in range(gen_length())]
+            else:
+                # with reused tokens
+                reused = random.choice(self.past_sequences)
+                prompt = reused[:random.randint(0, min(gen_length(
+                ), len(reused)))] + [
+                    self.next_token() for _ in range(gen_length())
+                ]
         decode_len = gen_length()
         lora_task_id = None
         kv_cache = self.manager.create_kv_cache(lora_task_id,
@@ -315,6 +337,8 @@ class TestBatching(TestKVCacheManagerV2):
         self.seq_len_dict[kv_cache] = seq_len
         self.num_created += 1
         assert input
+        self.acc_num_prompt_tokens += len(prompt)
+        self.acc_num_decode_tokens += decode_len
         return Step(kv_cache, input, history)
 
     def update_batch(self, stream: CudaStream) -> None:
@@ -329,7 +353,8 @@ class TestBatching(TestKVCacheManagerV2):
             seq_len_dict[step.kv_cache])
         for kv_cache, _, _ in removed:
             seq_len = self.seq_len_dict[kv_cache]
-            self.past_sequences.append(kv_cache._committed_tokens[:seq_len])
+            if seq_len < self.avg_length * 3:
+                self.past_sequences.append(kv_cache._committed_tokens[:seq_len])
             kv_cache.close()
             self.num_finished += 1
         # fill input for remaining requests and increase capacity for them
@@ -373,10 +398,13 @@ class TestBatching(TestKVCacheManagerV2):
             f"update_batch: found {len(removed)} finished requests, now with {len(self.batch)} requests"
         )
 
-    @parameterized.expand([(10000, True), (100, False)])
-    # @parameterized.expand([(10000, True)])
-    def test_inflight_batching(self, num_requests: int, skip_execution: bool):
+    @parameterized.expand([(1000, 1000, 1024, True), (100, 100, 128, False)])
+    # @parameterized.expand([(1000, True)])
+    def test_inflight_batching(self, num_requests: int, avg_length: int,
+                               gpu_quota_mb: int, skip_execution: bool):
+        self.prepare(gpu_quota_mb << 20, 1 << 30, 4 << 30, 36, 128, 0)
         self.num_requests = num_requests
+        self.avg_length = avg_length
         profile = False
         profiler = None
         if profile:
@@ -399,7 +427,9 @@ class TestBatching(TestKVCacheManagerV2):
             profiler.print_stats(sort='cumtime')
             profiler.dump_stats('profiler.prof')
         if DBG_PRINT:
-            print(f"Time taken: {toc-tic} seconds")
+            print(
+                f"Time taken: {toc-tic} seconds (num_prompt_tokens: {self.acc_num_prompt_tokens}, num_decode_tokens: {self.acc_num_decode_tokens})"
+            )
         stream.take_finish_event().synchronize()
 
 

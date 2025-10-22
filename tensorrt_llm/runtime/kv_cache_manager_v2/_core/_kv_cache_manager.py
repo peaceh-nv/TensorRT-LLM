@@ -9,7 +9,7 @@ from .._eviction_controller import PageStatus
 from .._life_cycle_registry import LifeCycle, LifeCycleRegistry
 from .._storage._config import create_storage_config
 from .._storage_manager import StorageManager
-from .._utils import HomoTuple, init_cuda_once, unwrap_weakref
+from .._utils import HomoTuple, init_cuda_once, typed_range, unwrap_weakref
 from ._kv_cache import _KVCache
 
 
@@ -34,9 +34,12 @@ class KVCacheManager:
         self.clear_reusable_blocks()
 
     def clear_reusable_blocks(self):
-        for ref in self._radix_tree.clear(yield_pages=True):
+        for ref in self._radix_tree.clear():
             assert unwrap_weakref(ref).status == PageStatus.DROPPABLE
             self._storage.exclude_from_eviction(unwrap_weakref(ref))
+        for l in self._storage._levels:
+            for pg_idx in typed_range(l.storage.num_pool_groups):
+                assert l.controller.num_evictable_pages(pg_idx) == 0
 
     # Get the base address of the memory pool holding pages for the given layer and data role.
     def get_mem_pool_base_address(self, layer_id: LayerId,

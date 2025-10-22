@@ -1,11 +1,10 @@
 import hashlib
-import warnings
 import weakref
 from typing import TYPE_CHECKING, Iterable, Iterator, Sequence, TypeVar, cast
 
 from ._common import NDEBUG, BlockOrdinal, TokenId, TokenIdExt
 from ._eviction_controller import PageStatus
-from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry
+from ._life_cycle_registry import LifeCycle, LifeCycleId, LifeCycleRegistry
 from ._utils import (HomoTuple, TypedIndexList, chunked, filled_list,
                      unwrap_weakref)
 
@@ -88,30 +87,36 @@ def get_tree(block: 'RootBlock | Block') -> 'BlockRadixTree':
 
 
 def remove_subtree(
-        root: 'RootBlock | Block',
-        yield_pages: bool = False) -> Iterator[weakref.ref['CommittedPage']]:
+        root: 'RootBlock | Block') -> list[weakref.ref['CommittedPage']]:
     # taking O(1) space
     # remove leaf blocks one by one, in post-order
+    ret: list[weakref.ref['CommittedPage']] = []
     block: 'RootBlock | Block' = root
     while True:
         if block.next:
             block = next(iter(block.next.values()))
         else:
-            if yield_pages and isinstance(block, Block):
-                yield from (page for page in block.storage if page is not None)
+            if isinstance(block, Block):
+                ret.extend(p for p in block.storage if p is not None)
                 block.storage = filled_list(None, block.num_life_cycles)
             assert (isinstance(block, RootBlock) or all(
                 page is None
                 for page in block.storage)), "Storage is not cleared, yet"
+            if block._prev() is None:
+                assert block is root
+                break
             prev_block: Block | RootBlock | BlockRadixTree = block.prev
-            prev_block.next.pop(block.key)
+            # Because Block.__del__() may remove RootBlock from BlockRadixTree, we need to check here. It may not be in prev_block.next when block is RootBlock.
+            if block.key in prev_block.next:
+                prev_block.next.pop(block.key)
             if block is root:
                 break
             assert not isinstance(prev_block, BlockRadixTree)
             block = prev_block
+    return ret
 
 
-def traverse_subtree(root: 'Block') -> Iterator['Block']:
+def traverse_post_order(root: 'Block') -> Iterator['Block']:
     'post-order traversal of the subtree rooted at root'
     stack: list[Iterator[Block]] = []
     block = root
@@ -138,9 +143,9 @@ def find_best_partial_match_in_next_nodes(
     If no child matches any tokens, returns (None, 0).
     """
     if len(block.next) >= 32:
-        warnings.warn(
-            "[KVCacheManager] Not Implemented: build a database to accelerate partial matching."
-        )
+        # TODO: build a database to accelerate partial matching. （TRTLLM-7784）
+        # For now, it might be too slow to iterate over all children, so let's just skip.
+        return None, 0
     best_block = None
     best_match_len = 0
     for b in block.next.values():
@@ -271,10 +276,9 @@ class Block:
                 if page.status == PageStatus.DROPPABLE:
                     if page.scheduled_for_eviction:
                         page.manager.exclude_from_eviction(page)
-                else:
-                    warnings.warn(
-                        "[KVCacheManager] Block is being deleted, but its pages are still in use!"
-                    )
+        if self._prev() is not None and isinstance(
+                self.prev, RootBlock) and not self.prev.next:
+            self.prev.prev.next.pop(self.prev.key)
 
     def _partial_match_this_node(self, tokens: TokenBlock) -> int:
         """
@@ -293,13 +297,27 @@ class Block:
     def prev(self) -> 'Block | RootBlock':
         return unwrap_weakref(self._prev)
 
-    def remove_if_unusable(self) -> None:
-        warnings.warn(
-            "[KVCacheManager] Not Implemented: Block.remove_if_unusable() is currently just a naive implementation."
-        )
-        has_empty_storage = lambda b: all(page is None for page in b.storage)
-        if all(has_empty_storage(b) for b in traverse_subtree(self)):
-            remove_subtree(self)
+    def unset_page(self, lc_idx: LifeCycleId, lc: LifeCycle):
+        if self.storage[lc_idx] is None:
+            return
+        ordinal = self.ordinal
+        self.storage[lc_idx] = None
+        if (lc.window_size is None or ordinal < lc.num_sink_blocks):
+            pages = remove_subtree(self)
+            for r in pages:
+                if r() is not None:
+                    page = unwrap_weakref(r)
+                    assert page.status == PageStatus.DROPPABLE
+                    if page.scheduled_for_eviction:
+                        page.manager.exclude_from_eviction(page)
+        # It's possible to implement more sophisticated logic to remove useless blocks for SWA, e.g. check if consecutive available blocks is sufficient for window_size. (TRTLLM-8802)
+        # But for simplicity, we leave it for now.
+        curr = self
+        while ((isinstance(curr, Block) and curr.storage[lc_idx] is None)
+               and not curr.next and curr._prev() is not None):
+            if curr.key in curr.prev.next:
+                curr.prev.next.pop(curr.key)
+            curr = curr.prev
 
     @property
     def tokens_per_block(self) -> int:
@@ -347,16 +365,15 @@ class BlockRadixTree:
     def num_life_cycles(self) -> LifeCycleId:
         return self.life_cycles.size
 
-    def clear(
-            self,
-            yield_pages: bool = False
-    ) -> Iterator[weakref.ref['CommittedPage']]:
+    def clear(self) -> list[weakref.ref['CommittedPage']]:
         # taking O(1) space
         # remove leaf blocks one by one, in post-order
+        ret: list[weakref.ref['CommittedPage']] = []
         while self.next:
             block = next(iter(self.next.values()))
-            yield from remove_subtree(block, yield_pages)
+            ret.extend(remove_subtree(block))
         assert not self.next
+        return ret
 
     # yields tuples of (block, num_matched_tokens). num_matched_tokens should be equal to tokens_per_block except the last one.
     def match(
