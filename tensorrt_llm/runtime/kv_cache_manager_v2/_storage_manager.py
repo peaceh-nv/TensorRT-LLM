@@ -125,12 +125,12 @@ class StorageManager:
 
     def new_gpu_slots(
         self, num_slots: TypedIndexList[LifeCycleId, int]
-    ) -> TypedIndexList[LifeCycleId, HomoTuple[Slot]]:
+    ) -> TypedIndexList[LifeCycleId, list[Slot]]:
         return self.new_slots(GPU_LEVEL, num_slots)
 
     def new_slots(
         self, level: CacheLevel, num_slots: TypedIndexList[LifeCycleId, int]
-    ) -> TypedIndexList[LifeCycleId, HomoTuple[Slot]]:
+    ) -> TypedIndexList[LifeCycleId, list[Slot]]:
         pg_num_slots = filled_list(0, self.num_pool_groups)
         for lc in typed_range(self.num_life_cycles):
             pg_num_slots[self.get_pool_group_index(lc)] += num_slots[lc]
@@ -140,7 +140,7 @@ class StorageManager:
             self.prepare_free_slots(level, pg_num_slots)
         assert all(pg_num_slots[pg] <= storage.get_num_free_slots(pg)
                    for pg in typed_range(self.num_pool_groups))
-        ret = filled_list(HomoTuple[Slot](), self.num_life_cycles)
+        ret = filled_list(list[Slot](), self.num_life_cycles)
         try:
             for life_cycle in typed_range(self.num_life_cycles):
                 pg_idx = self.get_pool_group_index(life_cycle)

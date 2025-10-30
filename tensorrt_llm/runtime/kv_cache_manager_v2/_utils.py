@@ -66,19 +66,19 @@ def exact_div(x: int, y: int) -> int:
     return x // y
 
 
-def overlap(a: tuple[int, int], b: tuple[int,
-                                         int]) -> tuple[int, int] | tuple[()]:
-    'Returns the overlap of two ranges, or an empty tuple if they do not overlap.'
-    return (max(a[0], b[0]),
-            min(a[1], b[1])) if a[0] < b[1] and b[0] < a[1] else ()
-
-
 T = TypeVar('T')
 U = TypeVar('U')
 Index = TypeVar('Index', bound=int, contravariant=True)
 IndexO = TypeVar('IndexO', bound=int, covariant=True)
 Row = TypeVar('Row', bound=int)
 Col = TypeVar('Col', bound=int)
+
+
+def overlap(a: tuple[Index, Index],
+            b: tuple[Index, Index]) -> tuple[Index, Index] | tuple[()]:
+    'Returns the overlap of two ranges, or an empty tuple if they do not overlap.'
+    return (max(a[0], b[0]),
+            min(a[1], b[1])) if a[0] < b[1] and b[0] < a[1] else ()
 
 
 def value_or(opt: T | None, default: T) -> T:

@@ -245,8 +245,6 @@ class Block:
         self.tokens = tokens
         self.ordinal = BlockOrdinal(prev.ordinal + 1)
         self._prev = weakref.ref(prev)
-        # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
-        prev.next[self.key] = self
         self.next = {}
         self.storage = filled_list(None, prev.num_life_cycles)
         # a Block is useless if all its tokens are covered by a sibling block. Raise UselessBlockError if so.
@@ -268,6 +266,8 @@ class Block:
         for k in to_remove:
             b = prev.next.pop(k)
             assert b.is_orphan  # _KVCache may still hold it.
+        # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
+        prev.next[self.key] = self
 
     def __del__(self):
         for ref in self.storage:

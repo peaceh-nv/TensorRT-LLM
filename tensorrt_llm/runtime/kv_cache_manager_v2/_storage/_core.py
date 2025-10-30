@@ -289,10 +289,10 @@ class SlotAllocator:
         return slot
 
     # The reason why we don't use allocate() multiple times is that if what user need is all or none, and when we don't have enough free slots, we will free these newly allocated slots by appending them to the back of the recycled slot queue, which may impact perf.
-    def allocate_multiple(self, num_slots: int) -> HomoTuple[Slot]:
+    def allocate_multiple(self, num_slots: int) -> list[Slot]:
         if self.num_free_slots < num_slots:
             raise OutOfPagesError("Not enough free slots")
-        return tuple(self.allocate() for _ in range(num_slots))
+        return [self.allocate() for _ in range(num_slots)]
 
     def release(self, slot: Slot):
         assert slot.has_valid_slot
@@ -497,7 +497,7 @@ class PoolGroupBase:
     def allocate(self) -> Slot:
         return self._slot_allocator.allocate()
 
-    def allocate_multiple(self, num_slots: int) -> HomoTuple[Slot]:
+    def allocate_multiple(self, num_slots: int) -> list[Slot]:
         return self._slot_allocator.allocate_multiple(num_slots)
 
     def release(self, slot: Slot):
@@ -598,7 +598,7 @@ class CacheLevelStorage:
         return self._pool_groups[pool_group_index].allocate()
 
     def allocate_multiple(self, pool_group_index: PoolGroupIndex,
-                          num_slots: int) -> HomoTuple[Slot]:
+                          num_slots: int) -> list[Slot]:
         return self._pool_groups[pool_group_index].allocate_multiple(num_slots)
 
     def release(self, pool_group_index: PoolGroupIndex, slot: Slot):

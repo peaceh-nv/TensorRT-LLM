@@ -12,6 +12,9 @@ class LifeCycle(NamedTuple):
     @staticmethod
     def make(window_size: SlidingWindowSize, num_sink_tokens: int | None,
              tokens_per_block: int) -> 'LifeCycle':
+        assert tokens_per_block > 0
+        assert window_size is None or window_size > 0
+        assert num_sink_tokens is None or num_sink_tokens >= 0
         assert num_sink_tokens in (None, 0) or window_size is not None
         num_sink_blocks = div_up(num_sink_tokens or 0, tokens_per_block)
         return LifeCycle(window_size, num_sink_blocks)

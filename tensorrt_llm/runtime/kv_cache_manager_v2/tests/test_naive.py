@@ -14,7 +14,7 @@ from kv_cache_manager_v2 import (AttentionLayerConfig, BufferConfig,
                                  KVCacheManagerConfig, LayerId, TokenId,
                                  TokenIdExt, _KVCache)
 from kv_cache_manager_v2._block_radix_tree import traverse_post_order
-from kv_cache_manager_v2._common import CudaStream
+from kv_cache_manager_v2._common import CudaStream, SlidingWindowSize
 from kv_cache_manager_v2._eviction_controller import PageStatus
 from kv_cache_manager_v2._exceptions import OutOfPagesError
 from kv_cache_manager_v2._utils import (TemporaryCudaStream, init_cuda_once,
@@ -48,7 +48,8 @@ class TestKVCacheManagerV2(unittest.TestCase):
             return TokenId(token_id)
 
     def prepare(self, gpu_quota: int, host_quota: int, disk_quota: int,
-                num_layers: int, window_size: int, sink_tokens: int):
+                num_layers: int, window_size: SlidingWindowSize,
+                sink_tokens: int):
         self._init_cfg(gpu_quota, host_quota, disk_quota, num_layers,
                        window_size, sink_tokens)
         self.engine = FakeEngine(self.cfg)
@@ -59,7 +60,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
                   host_quota: int,
                   disk_quota: int,
                   num_layers: int,
-                  window_size: int,
+                  window_size: SlidingWindowSize,
                   sink_tokens: int,
                   kv_buf_size: int = 8192,
                   block_quant_buf_size: int | None = None):
@@ -399,7 +400,7 @@ class TestBatching(TestKVCacheManagerV2):
         )
 
     @parameterized.expand([(1000, 1000, 1024, True), (100, 100, 128, False)])
-    # @parameterized.expand([(1000, True)])
+    # @parameterized.expand([(1000, 1000, 1024, True)])
     def test_inflight_batching(self, num_requests: int, avg_length: int,
                                gpu_quota_mb: int, skip_execution: bool):
         self.prepare(gpu_quota_mb << 20, 1 << 30, 4 << 30, 36, 128, 0)
@@ -430,6 +431,27 @@ class TestBatching(TestKVCacheManagerV2):
             print(
                 f"Time taken: {toc-tic} seconds (num_prompt_tokens: {self.acc_num_prompt_tokens}, num_decode_tokens: {self.acc_num_decode_tokens})"
             )
+        stream.take_finish_event().synchronize()
+
+
+class TestDisagg(TestKVCacheManagerV2):
+
+    @parameterized.expand([512])
+    def test_disagg(self, prompt_len: int):
+        self.prepare(128 << 20, 128 << 20, 1 << 30, 36, 128, 0)
+        lora_task_id = None
+        prompt = [self.next_token() for _ in range(prompt_len)]
+        kv_cache = self.manager.create_kv_cache(lora_task_id, prompt)
+        assert kv_cache.num_committed_tokens == 0
+        with TemporaryCudaStream([]) as stream:
+            success = kv_cache.resume(stream.handle)
+            assert success
+            success = kv_cache.resize(prompt_len, prompt_len)
+            assert success
+            transfer = lambda: None
+            transfer()
+            kv_cache.commit(prompt)
+        kv_cache.close()
         stream.take_finish_event().synchronize()
 
 

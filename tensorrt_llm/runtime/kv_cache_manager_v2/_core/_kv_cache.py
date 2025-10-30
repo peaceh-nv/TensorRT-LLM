@@ -247,9 +247,21 @@ class _KVCache:
                                for i in indices[new_num_blocks:])
                     del indices[new_num_blocks:]
         elif new_num_blocks > old_num_blocks:
-            num_new_blocks = new_num_blocks - old_num_blocks
-            num_new_slots = filled_list(num_new_blocks * beam_width,
-                                        num_life_cycles)
+            num_new_slots = filled_list(0, num_life_cycles)
+            stale_ranges = [
+                self._get_stale_range(history_length, lc)
+                for _, lc in self.manager._life_cycles.items()
+            ]
+            for lc in typed_range(num_life_cycles):
+                stale_beg, stale_end = stale_ranges[lc]
+                if old_num_blocks < stale_beg:
+                    assert new_num_blocks >= stale_end
+                    num_new_blocks = (stale_beg - old_num_blocks) + (
+                        new_num_blocks - stale_end)
+                else:
+                    num_new_blocks = new_num_blocks - max(
+                        stale_end, old_num_blocks)
+                num_new_slots[lc] = num_new_blocks * beam_width
             try:
                 slots = self._storage.new_gpu_slots(num_new_slots)
             except OutOfPagesError:
@@ -258,18 +270,20 @@ class _KVCache:
             for beam_indices in self._page_indices:
                 for indices in beam_indices:
                     assert len(indices) == old_num_blocks
-                    indices.extend([BAD_PAGE_INDEX] * num_new_blocks)
+                    indices.extend([BAD_PAGE_INDEX] *
+                                   (new_num_blocks - old_num_blocks))
             stream_wait_events(self.cuda_stream,
-                               (s.ready_event for s in sum(slots, ())))
+                               (s.ready_event for s in sum(slots, [])))
             for ordinal in typed_range(old_num_blocks, new_num_blocks):
-                idx_new_block = ordinal - old_num_blocks
                 block = make_typed(
                     lambda: filled_list(cast(BlockPage, None), num_life_cycles),
                     beam_width)
                 for beam_index in typed_range(beam_width):
                     for lc in typed_range(num_life_cycles):
-                        idx_slot = beam_width * idx_new_block + beam_index
-                        slot = slots[lc][idx_slot]
+                        stale_beg, stale_end = stale_ranges[lc]
+                        if stale_beg <= ordinal < stale_end:
+                            continue
+                        slot = slots[lc].pop()
                         # We have already waited for ready_event of the slots.
                         block[beam_index][lc] = UncommittedPage(
                             self, ordinal, lc, GPU_LEVEL, slot,
@@ -279,6 +293,8 @@ class _KVCache:
                                              lc,
                                              skip_wait=True)
                 self._blocks.append(SeqBlock(block, None))
+            assert all(
+                len(slots[lc]) == 0 for lc in typed_range(num_life_cycles))
         self._capacity = capacity
         self._history_length = history_length
         assert NDEBUG or self._check_sanity()
@@ -482,6 +498,8 @@ class _KVCache:
             uncommitted_pages = self._take_uncommitted_page(ordinal, beam_idx)
             # convert uncommitted pages to committed pages and create a new block in the radix tree.
             for lc, (page, locked) in typed_enumerate(uncommitted_pages):
+                if page is None:
+                    continue
                 p = page.convert_to_committed(tree_block)
                 tree_block.storage[lc] = weakref.ref(p)
                 # The page comes from uncommitted page of self, so safe to skip wait.
@@ -495,9 +513,10 @@ class _KVCache:
             # try to replace our pages with pages from the existing block.
             reuse_list = list[tuple[LifeCycleId, CommittedPage]]()
             for lc in typed_range(typed_len(beam_block)):
+                if beam_block[lc] is None:
+                    continue
                 existing_page = map_optional(tree_block.storage[lc],
                                              lambda p: p())
-                assert beam_block[lc] is not None
                 locked = isinstance(beam_block[lc], _SharedPageLock)
                 if existing_page is None:
                     # The reusable page is gone. We put our own page into the tree block.
@@ -557,7 +576,9 @@ class _KVCache:
                     continue
                 _, old_end = self._get_stale_range(self.history_length, lc)
                 new_beg, new_end = self._get_stale_range(new_history_length, lc)
-                for ordinal in typed_range(max(old_end, new_beg), new_end):
+                for ordinal in typed_range(
+                        max(old_end, new_beg),
+                        min(typed_len(self._blocks), new_end)):
                     block = self._blocks[ordinal]
                     is_committed = block.is_committed
                     hold_for_commit = not is_committed and self._commit_state == self.CommitState.ALLOWED
@@ -602,19 +623,22 @@ class _KVCache:
 
     def _take_uncommitted_page(
         self, ordinal: BlockOrdinal, beam_idx: BeamIndex
-    ) -> TypedIndexList[LifeCycleId, tuple[UncommittedPage, bool]]:
+    ) -> TypedIndexList[LifeCycleId, tuple[UncommittedPage | None, bool]]:
         'Take ownership of the uncommitted pages, together with bool flag indicating if it was locked. And reset holders to None.'
         holders = self._block(ordinal, beam_idx)
-        ret: list[tuple[UncommittedPage, bool]] = []
+        num_life_cycles = self.manager._storage.num_life_cycles
+        ret: TypedIndexList[LifeCycleId,
+                            tuple[UncommittedPage | None, bool]] = filled_list(
+                                (None, False), num_life_cycles)
         for lc, holder in typed_enumerate(holders):
             if holder is None:
                 continue
             assert isinstance(holder.page, UncommittedPage)
             locked = isinstance(holder, _SharedPageLock)
-            ret.append((holder.page, locked))
+            ret[lc] = (holder.page, locked)
             # When using debugpy with breakpoints on exceptions enabled, the lock/holder is not GC'ed even after return from this function. That will likely lead to assertion failures later.
             holders[lc] = None
-        return cast(TypedIndexList, ret)
+        return ret
 
     def _check_sanity(self) -> bool:
         is_closed = self.status == self.Status.CLOSED
