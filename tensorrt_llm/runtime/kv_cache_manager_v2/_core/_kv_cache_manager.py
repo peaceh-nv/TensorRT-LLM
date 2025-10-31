@@ -2,8 +2,8 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from .._block_radix_tree import BlockRadixTree
-from .._common import (BlockOrdinal, CacheLevel, CacheTier, LayerId, MemAddress,
-                       Priority, TokenIdExt)
+from .._common import (GPU_LEVEL, BlockOrdinal, CacheLevel, CacheTier, LayerId,
+                       MemAddress, Priority, TokenIdExt)
 from .._config import DataRole, KVCacheManagerConfig
 from .._eviction_controller import PageStatus
 from .._life_cycle_registry import LifeCycle, LifeCycleRegistry
@@ -50,6 +50,14 @@ class KVCacheManager:
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int:
         attr = self._storage.get_buffer_attr(layer_id, data_role)
         return attr.size
+
+    def get_page_index_upper_bound(self, layer_id: LayerId,
+                                   data_role: DataRole) -> int:
+        'The upper bound of page indices for the given layer and data role. Note that this is not the same as the max number of pages available for this layer and data role. As Internally, multiple buffers may share one memory pool. The purpose of tis API is just in case users want to wrap the memory pool as a tensor with known shape.'
+        attr = self._storage.get_buffer_attr(layer_id, data_role)
+        pg_idx = self._storage.get_pool_group_index(attr.life_cycle_id)
+        return self._storage._levels[GPU_LEVEL].storage._pool_groups[
+            pg_idx].num_slots
 
     # lora_task_id: match lora_task_id before matching any tokens.
     # stream: blocks are allocated and made ready in this stream. Later grow() also makes blocks ready in this stream, and later commit() calls also assume data are written in this stream.
