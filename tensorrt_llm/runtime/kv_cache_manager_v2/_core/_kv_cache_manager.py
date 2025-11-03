@@ -53,7 +53,7 @@ class KVCacheManager:
 
     def get_page_index_upper_bound(self, layer_id: LayerId,
                                    data_role: DataRole) -> int:
-        'The upper bound of page indices for the given layer and data role. Note that this is not the same as the max number of pages available for this layer and data role. As Internally, multiple buffers may share one memory pool. The purpose of tis API is just in case users want to wrap the memory pool as a tensor with known shape.'
+        'The upper bound of page indices for the given layer and data role. Note that this is not the same as the max number of pages available for this layer and data role. Internally, multiple buffers may share one memory pool. The purpose of this API is just in case users want to wrap the memory pool as a tensor with known shape.'
         attr = self._storage.get_buffer_attr(layer_id, data_role)
         pg_idx = self._storage.get_pool_group_index(attr.life_cycle_id)
         return self._storage._levels[GPU_LEVEL].storage._pool_groups[

@@ -59,28 +59,28 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         "copy_disk_to_disk",
         [](std::vector<Task<DiskAddress, DiskAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> int
         { return copyDiskToDisk(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
-        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"),
+        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
         "Copy data from disk to disk using CUDA host function");
 
     module.def(
         "copy_disk_to_host",
         [](std::vector<Task<MemAddress, DiskAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> int
         { return copyDiskToHost(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
-        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"),
+        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
         "Copy data from disk to host using CUDA host function");
 
     module.def(
         "copy_host_to_disk",
         [](std::vector<Task<DiskAddress, MemAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> int
         { return copyHostToDisk(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
-        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"),
+        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
         "Copy data from host to disk using CUDA host function");
 
     module.def(
         "copy_host_to_host",
         [](std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> int
         { return copyHostToHost(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
-        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"),
+        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
         "Copy data from host to host using CUDA host function");
 }
 
