@@ -8,9 +8,12 @@ from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  TorchCompileConfig)
 
 example_prompts = [
-    "Hello, my name is",
+    "Hello, my name is John and I am a software engineer. I have experience in developing web applications using JavaScript and React. I am also familiar with Python and Django. I am a quick learner and enjoy working in a team environment.",
+    "Hello, my name is John and I am a software engineer. I have experience in developing web applications using JavaScript and React. I am also familiar with Python and Django. I am a quick learner and enjoy working in a team environment.",
     "The capital of France is",
     "The future of AI is",
+    "Hi, how are you?",
+    "What is the capital of the United States?",
 ]
 
 

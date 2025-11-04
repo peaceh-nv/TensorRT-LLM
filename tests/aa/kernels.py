@@ -6,9 +6,13 @@ from typing import Iterator
 
 import cuda.bindings.driver as drv
 from cuda.core.experimental import Kernel, Program, ProgramOptions
-from kv_cache_manager_v2._common import (CudaStream, LayerId, MemAddress,
-                                         TokenIdExt)
-from kv_cache_manager_v2._utils import _unwrap, div_up, exact_div
+
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import (CudaStream,
+                                                              LayerId,
+                                                              MemAddress,
+                                                              TokenIdExt)
+from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (_unwrap, div_up,
+                                                             exact_div)
 
 _SLEEP_TIME_NS = 0
 

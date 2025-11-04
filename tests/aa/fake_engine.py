@@ -3,15 +3,19 @@ from collections.abc import Sequence
 from functools import cached_property
 from typing import NamedTuple
 
-from kv_cache_manager_v2 import (BeamIndex, CudaStream, KVCacheManagerConfig,
-                                 LayerId, TokenIdExt, _KVCache)
-from kv_cache_manager_v2._common import BAD_PAGE_INDEX, NDEBUG, MemAddress
-from kv_cache_manager_v2._config import AttentionLayerConfig, DataRole
-from kv_cache_manager_v2._utils import (div_up, exact_div,
-                                        get_uniform_attribute, overlap,
-                                        typed_range, value_or)
+from kernels import check_values, fill_values
 
-from .kernels import check_values, fill_values
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (BeamIndex, CudaStream,
+                                                      KVCacheManagerConfig,
+                                                      LayerId, TokenIdExt,
+                                                      _KVCache)
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
+                                                              NDEBUG,
+                                                              MemAddress)
+from tensorrt_llm.runtime.kv_cache_manager_v2._config import (
+    AttentionLayerConfig, DataRole)
+from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
+    div_up, exact_div, get_uniform_attribute, overlap, typed_range, value_or)
 
 
 class Step(NamedTuple):
@@ -80,6 +84,7 @@ class FakeEngine:
         role = buf.role
         token_bytes = exact_div(buf.size, tokens_per_block)
         pool = manager.get_mem_pool_base_address(layer_id, role)
+        print(f"pool: {pool}, layer_id: {layer_id}, role: {role}")
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
         pages = kv_cache.get_page_indices(lc_id, beam)

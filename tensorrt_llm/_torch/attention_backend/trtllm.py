@@ -902,11 +902,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         assert self.request_ids is not None
         if self.kv_cache_manager is not None:
             # Copy blocks for all context requests
-            self.kv_cache_manager.impl.copy_batch_block_offsets(
+            self.kv_cache_manager.copy_batch_block_offsets(
                 self.host_kv_cache_block_offsets,
                 self.request_ids[:self.num_contexts], 1, 0)
             # Copy blocks for all generation requests
-            self.kv_cache_manager.impl.copy_batch_block_offsets(
+            self.kv_cache_manager.copy_batch_block_offsets(
                 self.host_kv_cache_block_offsets,
                 self.request_ids[self.num_contexts:], self.beam_width,
                 self.num_contexts)

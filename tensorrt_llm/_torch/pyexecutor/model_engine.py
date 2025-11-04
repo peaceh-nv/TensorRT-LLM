@@ -592,8 +592,10 @@ class PyTorchModelEngine(ModelEngine):
             self.kv_cache_manager_key)
         curr_max_num_tokens = min(
             kv_cache_manager.get_num_available_tokens(
-                self.original_max_draft_len), self.max_num_tokens,
-            self.batch_size * (self.max_seq_len - 1))
+                batch_size=self.batch_size,
+                max_seq_len=self.max_seq_len,
+                max_num_draft_tokens=self.original_max_draft_len),
+            self.max_num_tokens, self.batch_size * (self.max_seq_len - 1))
 
         warmup_requests_configs = {
             (1, 1),  # Specialize for 1 token.
@@ -630,8 +632,10 @@ class PyTorchModelEngine(ModelEngine):
             self.kv_cache_manager_key)
         curr_max_num_tokens = min(
             kv_cache_manager.get_num_available_tokens(
-                self.original_max_draft_len), self.max_num_tokens,
-            self.batch_size * (self.max_seq_len - 1))
+                batch_size=self.batch_size,
+                max_seq_len=self.max_seq_len,
+                max_num_draft_tokens=self.original_max_draft_len),
+            self.max_num_tokens, self.batch_size * (self.max_seq_len - 1))
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
         with self.no_cuda_graph(), autotune(cache_path=cache_path,
@@ -803,7 +807,9 @@ class PyTorchModelEngine(ModelEngine):
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
 
         available_tokens = kv_cache_manager.get_num_available_tokens(
-            self.runtime_draft_len)
+            batch_size=self.batch_size,
+            max_seq_len=self.max_seq_len,
+            max_num_draft_tokens=self.runtime_draft_len)
         available_blocks = kv_cache_manager.get_num_free_blocks()
         if num_tokens > self.max_num_tokens or num_tokens > available_tokens:
             return None
@@ -898,7 +904,10 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps)
 
-        available_tokens = kv_cache_manager.get_num_available_tokens(draft_len)
+        available_tokens = kv_cache_manager.get_num_available_tokens(
+            batch_size=self.batch_size,
+            max_seq_len=self.max_seq_len,
+            max_num_draft_tokens=draft_len)
 
         # Add one dummy request with the maximum possible sequence length.
         token_num = max(1, min(available_tokens, self.max_seq_len - 1))

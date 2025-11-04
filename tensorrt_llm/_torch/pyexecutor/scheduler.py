@@ -150,7 +150,7 @@ class GuaranteedNoEvictScheduler(CapacityScheduler):
         assert len(scheduled_requests) > 0, (
             "no pending request can get enough resource to complete, "
             "please increase KV cache pool size.")
-        return scheduled_requests, []
+        return scheduled_requests, [], []
 
 
 class MicroBatchScheduler(ABC):

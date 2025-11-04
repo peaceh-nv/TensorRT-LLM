@@ -393,6 +393,9 @@ class _KVCache:
     def resume(self, cuda_stream: CudaStream | None = None) -> bool:
         assert self.status == self.Status.SUSPENDED
         if self._storage.overall_utilization > self.manager._init_config.max_util_for_resume:
+            print(
+                f"overall_utilization: {self._storage.overall_utilization} > max_util_for_resume: {self.manager._init_config.max_util_for_resume}"
+            )
             return False
         if cuda_stream is not None:
             self.cuda_stream = cuda_stream
@@ -406,6 +409,7 @@ class _KVCache:
         try:
             locks = batched_lock_to_gpu(self, tasks)
         except OutOfPagesError:
+            print(f"OutOfPagesError")
             return False
         for (ordinal, beam_idx, lc_idx), lock in zip(self._active_pages(),
                                                      locks):

@@ -208,6 +208,12 @@ def binding_to_str_dtype(binding_dtype) -> str:
     return ret
 
 
+def binding_to_torch_dtype(binding_dtype) -> str:
+    ret = _binding_to_str_dtype.get(binding_dtype)
+    assert ret is not None, f'Unsupported binding dtype: {binding_dtype}'
+    return str_dtype_to_torch(ret)
+
+
 def binding_dtype_size(dtype: DataType):
     return _binding_dtype_size[dtype]
 
@@ -968,7 +974,7 @@ class TensorWrapper:
     def __init__(
         self,
         data_ptr: int,
-        dtype: Union[torch.dtype, str, np.dtype, trt.DataType],
+        dtype: Union[torch.dtype, str, np.dtype, trt.DataType, DataType],
         shape: Sequence[int],
         strides: Optional[Sequence[int]] = None,
     ):
@@ -990,7 +996,8 @@ class TensorWrapper:
         return getattr(self, "_shape", None)
 
     @dtype.setter
-    def dtype(self, dtype: Union[torch.dtype, str, np.dtype, trt.DataType]):
+    def dtype(self, dtype: Union[torch.dtype, str, np.dtype, trt.DataType,
+                                 DataType]):
         if isinstance(dtype, torch.dtype):
             self._dtype = dtype
         elif isinstance(dtype, str):
@@ -999,6 +1006,8 @@ class TensorWrapper:
             self._dtype = np_dtype_to_torch(dtype)
         elif isinstance(dtype, trt.DataType):
             self._dtype = trt_dtype_to_torch(dtype)
+        elif isinstance(dtype, DataType):
+            self._dtype = binding_to_torch_dtype(dtype)
         else:
             raise TypeError(f"Unsupported dtype: {dtype}")
 

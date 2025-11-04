@@ -8,21 +8,25 @@ from statistics import median
 from typing import Iterator, NamedTuple
 from weakref import WeakKeyDictionary
 
-from kv_cache_manager_v2 import (AttentionLayerConfig, BufferConfig,
-                                 DiskCacheTierConfig, GpuCacheTierConfig,
-                                 HostCacheTierConfig, KVCacheManager,
-                                 KVCacheManagerConfig, LayerId, TokenId,
-                                 TokenIdExt, _KVCache)
-from kv_cache_manager_v2._block_radix_tree import traverse_post_order
-from kv_cache_manager_v2._common import CudaStream, SlidingWindowSize
-from kv_cache_manager_v2._eviction_controller import PageStatus
-from kv_cache_manager_v2._exceptions import OutOfPagesError
-from kv_cache_manager_v2._utils import (TemporaryCudaStream, init_cuda_once,
-                                        remove_if, round_up, typed_range,
-                                        unwrap_weakref)
-from kv_cache_manager_v2.tests.fake_engine import FakeEngine, Role, Step
-from kv_cache_manager_v2.tests.kernels import enable_kernel_delay
+from fake_engine import FakeEngine, Role, Step
+from kernels import enable_kernel_delay
 from parameterized import parameterized
+
+from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
+    traverse_post_order
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import (CudaStream,
+                                                              SlidingWindowSize)
+from tensorrt_llm.runtime.kv_cache_manager_v2._eviction_controller import \
+    PageStatus
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
+from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
+    TemporaryCudaStream, init_cuda_once, remove_if, round_up, typed_range,
+    unwrap_weakref)
+
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (  # isort: skip
+    AttentionLayerConfig, BufferConfig, DiskCacheTierConfig, GpuCacheTierConfig,
+    HostCacheTierConfig, KVCacheManager, KVCacheManagerConfig, LayerId, TokenId,
+    TokenIdExt, _KVCache)
 
 seed = int.from_bytes(os.urandom(8), 'little')
 print(f"seed: {seed}")
@@ -480,4 +484,5 @@ class TestDisagg(TestKVCacheManagerV2):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    a = TestNoBatching()
+    a.test_sol_mem_utilization()
