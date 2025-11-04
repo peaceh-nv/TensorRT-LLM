@@ -70,7 +70,7 @@ class _KVCache:
                  '_history_length', '_commit_state', '_blocks', '_page_indices',
                  '_committed_tokens', '_num_committed_blocks', '_finish_event',
                  '_buffer_to_mirrored_index', '_tied_grp_indices',
-                 '__weakref__')
+                 '_tokens_per_block', '__weakref__')
 
     class Status(enum.Enum):
         ACTIVE = enum.auto()
@@ -109,6 +109,7 @@ class _KVCache:
     _buffer_to_mirrored_index: dict[BufferId, TiedBufGroupId]
     # available with self.manager._storage.get_mirrored_buffer_group_indices(). Cached here to accelerate the get_page_indices() API.
     _tied_grp_indices: TypedIndexList[LifeCycleId, HomoTuple[TiedBufGroupId]]
+    _tokens_per_block: int
 
     def __init__(self, manager: 'KVCacheManager', lora_task_id: int | None,
                  input_tokens: Sequence[TokenIdExt] | None, id: Any,
@@ -138,6 +139,7 @@ class _KVCache:
                 manager._storage.get_mirrored_buffer_group_indices(lc)
                 for lc in typed_range(manager._life_cycles.size)
             ])
+        self._tokens_per_block = manager.tokens_per_block
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
         assert NDEBUG or self._check_sanity()
@@ -453,7 +455,7 @@ class _KVCache:
 
     @property
     def tokens_per_block(self) -> int:
-        return self.manager.tokens_per_block
+        return self._tokens_per_block
 
     def _page(self, block_ordinal: BlockOrdinal, beam_index: BeamIndex,
               life_cycle: LifeCycleId) -> BlockPage:
@@ -471,7 +473,7 @@ class _KVCache:
         assert typed_len(seq_block.pages) == 1, 'Must have 1 beam only'
         beam_idx = BeamIndex(0)
         beam_block = seq_block.pages[beam_idx]
-        tokens_per_block = self.manager.tokens_per_block
+        tokens_per_block = self.tokens_per_block
         start = ordinal * tokens_per_block
         tokens = self._committed_tokens[start:start + tokens_per_block]
         num_tokens = len(tokens)

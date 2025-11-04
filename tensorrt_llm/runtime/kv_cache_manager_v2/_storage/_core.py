@@ -13,8 +13,7 @@ from .._cuda_virt_mem import PhysMem, PooledPhysMemAllocator, VirtMem
 from .._exceptions import LogicError, OutOfPagesError, ResourceBusyError
 from .._utils import (CachedCudaEvent, DynamicBitset, HomoTuple, HostMem,
                       assert_critical, div_up, query_total_gpu_memory,
-                      remove_if, resize_file, round_down, round_up,
-                      unwrap_optional)
+                      remove_if, resize_file, round_down, round_up)
 
 PoolGroupIndex = NewType("PoolGroupIndex", int)
 PoolIndex = NewType("PoolIndex", int)
@@ -187,10 +186,14 @@ class Slot:
 
     @property
     def slot_id(self) -> SlotId:
-        return unwrap_optional(self._slot_id)
+        assert self._slot_id is not None
+        return self._slot_id
 
     def query_ready(self) -> bool:
-        ret = self.ready_event.query_complete()
+        ev = self.ready_event
+        if ev is CachedCudaEvent.NULL:
+            return True
+        ret = ev.query_complete()
         if ret:
             self.ready_event = CachedCudaEvent.NULL
         return ret

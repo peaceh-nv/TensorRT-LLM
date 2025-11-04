@@ -47,15 +47,21 @@ class TestKVCacheManagerV2(unittest.TestCase):
         else:
             return TokenId(token_id)
 
-    def prepare(self, gpu_quota: int, host_quota: int, disk_quota: int,
-                num_layers: int, window_size: SlidingWindowSize,
-                sink_tokens: int):
-        self._init_cfg(gpu_quota, host_quota, disk_quota, num_layers,
-                       window_size, sink_tokens)
+    def prepare(self,
+                gpu_quota: int,
+                host_quota: int,
+                disk_quota: int,
+                num_layers: int,
+                window_size: SlidingWindowSize,
+                sink_tokens: int,
+                tokens_per_block: int = 32):
+        self._init_cfg(tokens_per_block, gpu_quota, host_quota, disk_quota,
+                       num_layers, window_size, sink_tokens)
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
 
     def _init_cfg(self,
+                  tokens_per_block: int,
                   gpu_quota: int,
                   host_quota: int,
                   disk_quota: int,
@@ -76,7 +82,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
                              size=block_quant_buf_size)
             ])
         self.cfg = KVCacheManagerConfig(
-            tokens_per_block=32,
+            tokens_per_block=tokens_per_block,
             vocab_size=4096,
             cache_tiers=[
                 GpuCacheTierConfig(quota=gpu_quota),
@@ -289,6 +295,7 @@ class TestBatching(TestKVCacheManagerV2):
     req_id_gen: Iterator[int]
     acc_num_prompt_tokens: int
     acc_num_decode_tokens: int
+    interval: int
 
     def setUp(self):
         super().setUp()
@@ -361,7 +368,9 @@ class TestBatching(TestKVCacheManagerV2):
         # fill input for remaining requests and increase capacity for them
         for s in self.batch:
             assert not s.input
-            s.input.append(self.next_token())
+            length = min(self.interval,
+                         self.seq_len_dict[s.kv_cache] - len(s.history))
+            s.input.extend(self.next_token() for _ in range(length))
         for i in itertools.count():
             if i >= len(self.batch):
                 break
@@ -399,13 +408,22 @@ class TestBatching(TestKVCacheManagerV2):
             f"update_batch: found {len(removed)} finished requests, now with {len(self.batch)} requests"
         )
 
-    @parameterized.expand([(1000, 1000, 1024, True), (100, 100, 128, False)])
-    # @parameterized.expand([(1000, 1000, 1024, True)])
+    @parameterized.expand([(1000, 1000, 1024, True, 1, 32),
+                           (100, 100, 128, False, 4, 64)])
+    # @parameterized.expand([(1000, 1000, 1024, True, 32, 32)])
     def test_inflight_batching(self, num_requests: int, avg_length: int,
-                               gpu_quota_mb: int, skip_execution: bool):
-        self.prepare(gpu_quota_mb << 20, 1 << 30, 4 << 30, 36, 128, 0)
+                               gpu_quota_mb: int, skip_execution: bool,
+                               interval: int, tokens_per_block: int):
+        self.prepare(gpu_quota_mb << 20,
+                     1 << 30,
+                     4 << 30,
+                     36,
+                     128,
+                     0,
+                     tokens_per_block=tokens_per_block)
         self.num_requests = num_requests
         self.avg_length = avg_length
+        self.interval = interval
         profile = False
         profiler = None
         if profile:

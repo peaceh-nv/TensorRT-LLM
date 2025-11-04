@@ -621,7 +621,10 @@ class GlobalPoolProvider(Generic[T]):
             cls._pool.clear()
 
     def pool(self) -> SimplePool[T]:
-        return unwrap_optional(self._pool)
+        # Manually inlined for better performance.
+        pool = self._pool
+        assert pool is not None
+        return pool
 
 
 class ItemHolderBase(Generic[T], ABC):
@@ -632,8 +635,10 @@ class ItemHolderBase(Generic[T], ABC):
         self._item = self.pool().get()
 
     def close(self):
-        if not self.is_closed():
-            self.pool().put(cast(T, self._item))
+        # Manually inlined for better performance.
+        item = self._item
+        if item is not None:
+            self.pool().put(item)
             self._item = None
 
     def __del__(self):
@@ -643,11 +648,17 @@ class ItemHolderBase(Generic[T], ABC):
         return self._item is None
 
     def get(self) -> T:
-        return unwrap_optional(self._item)
+        # Manually inlined for better performance.
+        item = self._item
+        assert item is not None
+        return item
 
     @property
     def handle(self) -> T:
-        return self.get()
+        # Manually inlined for better performance.
+        item = self._item
+        assert item is not None
+        return item
 
     @abstractmethod
     def pool(self) -> SimplePool[T]:
@@ -686,9 +697,11 @@ class CachedCudaEvent(ItemHolderWithGlobalPool[drv.CUevent]):
         """
         Query the event. If complete, also close the event. Closed events are always considered complete.
         """
-        if self.is_closed():
+        # Manually inlined for better performance.
+        ev = self._item
+        if ev is None:
             return True
-        err, = drv.cuEventQuery(self.get())
+        err, = drv.cuEventQuery(ev)
         if int(err) == int(drv.CUresult.CUDA_SUCCESS):
             self.close()
             return True
@@ -698,21 +711,28 @@ class CachedCudaEvent(ItemHolderWithGlobalPool[drv.CUevent]):
             raise CuError(err)
 
     def synchronize(self):
-        if self.is_closed():
+        # Manually inlined for better performance.
+        ev = self._item
+        if ev is None:
             return
-        _unwrap(drv.cuEventSynchronize(self.get()))
+        _unwrap(drv.cuEventSynchronize(ev))
         self.close()
 
     def wait_in_stream(self, stream: drv.CUstream):
-        if self.is_closed():
+        # Manually inlined for better performance.
+        ev = self._item
+        if ev is None:
             return
-        _unwrap(drv.cuStreamWaitEvent(stream, self.get(), 0))
+        _unwrap(drv.cuStreamWaitEvent(stream, ev, 0))
 
     def _record(self, stream: drv.CUstream):
         """
         Prefer new event instead of recording an existing event.
         """
-        _unwrap(drv.cuEventRecord(self.get(), stream))
+        # Manually inlined for better performance.
+        ev = self._item
+        assert ev is not None
+        _unwrap(drv.cuEventRecord(ev, stream))
 
 
 class _NullCudaEvent(CachedCudaEvent):
