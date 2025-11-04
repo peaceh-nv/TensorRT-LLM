@@ -521,6 +521,9 @@ class KVCacheManager(BaseResourceManager):
                     req.py_multimodal_data["mrope_config"][
                         "mrope_position_deltas"] = dummy_mrope_position_deltas
             requests.append(req)
+        print(
+            f"get_batch_cache_indices in dummy requests: {self.get_batch_cache_indices(request_ids)}"
+        )
         return requests
 
     def update_resources(self,

@@ -1,5 +1,3 @@
-import os
-import sys
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -8,10 +6,7 @@ from typing import ClassVar, NamedTuple, Sequence
 import cuda.bindings.driver as drv
 
 # avoid importing the whole tensorrt_llm module, which takes time during debugging.
-sys.path.append(os.path.abspath(os.path.join(__file__, "../../..")))
-import bindings
-
-sys.path.pop()
+import tensorrt_llm.bindings as bindings
 
 from ._common import Address, CacheTier, CudaStream, MemAddress
 from ._utils import (CachedCudaEvent, HomoTuple, HostMem, _unwrap, div_up,
