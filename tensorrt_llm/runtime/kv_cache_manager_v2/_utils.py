@@ -86,13 +86,16 @@ def value_or(opt: T | None, default: T) -> T:
 
 
 def unwrap_optional(value: T | None) -> T:
-    if value is None:
-        raise ValueError("Expected non-None value")
-    return value
+    if value is not None:
+        return value
+    raise ValueError("Expected non-None value")
 
 
-def unwrap_weakref(value: weakref.ref[T]) -> T:
-    return unwrap_optional(value())
+def unwrap_weakref(ref: weakref.ref[T]) -> T:
+    obj = ref()
+    if obj is not None:
+        return obj
+    raise ValueError("Dereferencing a dangling weakref")
 
 
 def map_optional(value: T | None, func: Callable[[T], U]) -> U | None:

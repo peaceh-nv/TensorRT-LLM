@@ -41,9 +41,9 @@ class KVCacheManager:
             for pg_idx in typed_range(l.storage.num_pool_groups):
                 assert l.controller.num_evictable_pages(pg_idx) == 0
 
-    # Get the base address of the memory pool holding pages for the given layer and data role.
     def get_mem_pool_base_address(self, layer_id: LayerId,
                                   data_role: DataRole) -> MemAddress:
+        "Get the base address of the memory pool holding pages for the given layer and data role. It's guaranteed that for one layer, multiple buffers of the same size have the same base address."
         return self._storage.get_mem_pool_base_address(layer_id, data_role)
 
     # Currently always equals to page size. In the future, that will change when kernels support page stride.
