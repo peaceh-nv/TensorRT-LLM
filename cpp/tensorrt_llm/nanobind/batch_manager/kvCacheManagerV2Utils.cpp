@@ -49,7 +49,7 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         .def_rw("dst", &Task<DiskAddress, MemAddress>::dst)
         .def_rw("src", &Task<DiskAddress, MemAddress>::src);
 
-    nb::class_<Task<MemAddress, MemAddress>>(module, "HostToHostTask")
+    nb::class_<Task<MemAddress, MemAddress>>(module, "MemToMemTask")
         .def(nb::init<MemAddress, MemAddress>(), nb::arg("dst"), nb::arg("src"))
         .def_rw("dst", &Task<MemAddress, MemAddress>::dst)
         .def_rw("src", &Task<MemAddress, MemAddress>::src);
@@ -82,6 +82,27 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         { return copyHostToHost(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
         nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
         "Copy data from host to host using CUDA host function");
+
+    module.def(
+        "copy_host_to_device",
+        [](std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> int
+        { return copyHostToDevice(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
+        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+        "Copy data from host to device using CUDA kernels");
+
+    module.def(
+        "copy_device_to_host",
+        [](std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> int
+        { return copyDeviceToHost(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
+        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+        "Copy data from device to host using CUDA kernels");
+
+    module.def(
+        "copy_device_to_device",
+        [](std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> int
+        { return copyDeviceToDevice(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
+        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+        "Copy data from device to device using CUDA kernels");
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

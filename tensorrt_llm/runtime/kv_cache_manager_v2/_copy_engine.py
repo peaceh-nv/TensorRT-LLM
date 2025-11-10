@@ -3,7 +3,6 @@ import sys
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from functools import cached_property
 from typing import ClassVar, NamedTuple, Sequence
 
 import cuda.bindings.driver as drv
@@ -23,7 +22,7 @@ DiskAddress = nb_utils.DiskAddress
 DiskToDiskTask = nb_utils.DiskToDiskTask
 DiskToHostTask = nb_utils.DiskToHostTask
 HostToDiskTask = nb_utils.HostToDiskTask
-HostToHostTask = nb_utils.HostToHostTask
+MemToMemTask = nb_utils.MemToMemTask
 
 
 class CopyTask(NamedTuple):
@@ -33,9 +32,11 @@ class CopyTask(NamedTuple):
 
 def _copy_gpu_to_gpu(tasks: Sequence[CopyTask], num_bytes: int,
                      stream: CudaStream):
-    # @TODO: use a kernel to do multiple tasks in one batch
-    for dst, src in tasks:
-        _unwrap(drv.cuMemcpyDtoDAsync(dst, src, num_bytes, stream))
+    _unwrap(
+        drv.CUresult(
+            nb_utils.copy_device_to_device(
+                [MemToMemTask(dst, src) for dst, src in tasks], num_bytes,
+                stream)))
 
 
 def _copy_host_to_host(tasks: Sequence[CopyTask], num_bytes: int,
@@ -43,7 +44,7 @@ def _copy_host_to_host(tasks: Sequence[CopyTask], num_bytes: int,
     _unwrap(
         drv.CUresult(
             nb_utils.copy_host_to_host(
-                [HostToHostTask(dst, src) for dst, src in tasks], num_bytes,
+                [MemToMemTask(dst, src) for dst, src in tasks], num_bytes,
                 stream)))
 
 
@@ -68,16 +69,20 @@ def _copy_disk_to_disk(tasks: Sequence[CopyTask], num_bytes: int,
 
 def _copy_gpu_to_host(tasks: Sequence[CopyTask], num_bytes: int,
                       stream: CudaStream):
-    # @TODO: use a kernel to do multiple tasks in one batch
-    for dst, src in tasks:
-        _unwrap(drv.cuMemcpyDtoHAsync(dst, src, num_bytes, stream))
+    _unwrap(
+        drv.CUresult(
+            nb_utils.copy_device_to_host(
+                [MemToMemTask(dst, src) for dst, src in tasks], num_bytes,
+                stream)))
 
 
 def _copy_host_to_gpu(tasks: Sequence[CopyTask], num_bytes: int,
                       stream: CudaStream):
-    # @TODO: use a kernel to do multiple tasks in one batch
-    for dst, src in tasks:
-        _unwrap(drv.cuMemcpyHtoDAsync(dst, src, num_bytes, stream))
+    _unwrap(
+        drv.CUresult(
+            nb_utils.copy_host_to_device(
+                [MemToMemTask(dst, src) for dst, src in tasks], num_bytes,
+                stream)))
 
 
 def _copy_disk_to_host(tasks: Sequence[CopyTask], num_bytes: int,
@@ -179,6 +184,7 @@ class StagingBufferManager:
     # max_size is just a hint, the actual size may be smaller.
     def new(self, min_size: int, max_size: int,
             stream: CudaStream) -> 'StagingBufferManager.StagingBuffer':
+        'min_size is the min required size. max_size is for best efforts. Your should query the actual size after entering the context.'
         return self.StagingBuffer(self, min_size, max_size, stream)
 
     class StagingBuffer:
@@ -248,10 +254,17 @@ class StagingBufferManager:
 
 
 class CopyEngine:
-    # use cached_property so it's created only on first access, when cuda context has been initialized.
-    @cached_property
+    __slots__ = ("_staging_buffer_manager", )
+    _staging_buffer_manager: StagingBufferManager | None
+
+    def __init__(self):
+        self._staging_buffer_manager = None
+
+    @property
     def staging_buffer_manager(self) -> StagingBufferManager:
-        return StagingBufferManager(64 << 20)
+        if self._staging_buffer_manager is None:
+            self._staging_buffer_manager = StagingBufferManager(64 << 20)
+        return self._staging_buffer_manager
 
     # @TODO: Use a dedicated stream for each different Copier, take set[CachedCudaEvent] instead of stream, and return a new CachedCudaEvent.
     def transfer(self, dst_cache_tier: CacheTier, src_cache_tier: CacheTier,

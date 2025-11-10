@@ -405,9 +405,15 @@ class HostMem:
     Host memory aligned to 2MB, reallocable for low-cost resizing and registered to CUDA as page-locked memory.
     Resizing will keep the original memory content, like `realloc` in C.
     """
-    __slots__ = ('_address', '_size')
+    __slots__ = ('_address', '_size', '_num_registered_chunks')
     _address: int
     _size: int
+    # If True and _size > 2GB, use multiple chunks to register pinned memory due to a Linux kernel 6.11/6.12/6.13 bug preventing pinning more than 2GB of host memory in one operation.
+    _CHUNKED_REGISTRATION: ClassVar[bool] = (platform.system() == "Linux"
+                                             and platform.release()[:4]
+                                             in ["6.11", "6.12", '6.13'])
+    _CHUNK_SIZE: ClassVar[int] = 2 << 30
+    _num_registered_chunks: int
 
     @property
     def address(self) -> int:
@@ -418,6 +424,7 @@ class HostMem:
         return self._size
 
     def __init__(self, size: int):
+        self._num_registered_chunks = 0
         if size == 0:
             self._address = 0
             self._size = 0
@@ -448,23 +455,28 @@ class HostMem:
         self.destroy()
 
     def _register_to_cuda(self):
-        try:
+        assert self._num_registered_chunks == 0
+        for addr, size in self._iterate_chunks():
             _unwrap(
                 drv.cuMemHostRegister(
-                    self._address, self._size, drv.CU_MEMHOSTREGISTER_PORTABLE
+                    addr, size, drv.CU_MEMHOSTREGISTER_PORTABLE
                     | drv.CU_MEMHOSTREGISTER_DEVICEMAP))
-        except CuError as e:
-            if int(e.error_code) == int(
-                    drv.CUresult.CUDA_ERROR_INVALID_VALUE
-            ) and self._size > (2 << 30) and platform.system(
-            ) == "Linux" and platform.release()[:4] in ["6.11", "6.12", '6.13']:
-                warnings.warn(
-                    "There is a known bug in Linux kernel 6.11/6.12/6.13 preventing pinning more than 2GB of host memory. You can fix it by upgrading (>=6.14) or downgrading your kernel (<=6.10). Some linux distributions have backported the fix to 6.12.y LTS. See https://lore.kernel.org/all/20241030030116.670307-1-jhubbard@nvidia.com/"
-                )
-            raise
+            self._num_registered_chunks += 1
 
     def _unregister_from_cuda(self):
-        _unwrap(drv.cuMemHostUnregister(self._address))
+        for addr, _ in self._iterate_chunks():
+            if self._num_registered_chunks == 0:
+                break
+            _unwrap(drv.cuMemHostUnregister(addr))
+            self._num_registered_chunks -= 1
+        assert self._num_registered_chunks == 0
+
+    def _iterate_chunks(self) -> Iterator[tuple[int, int]]:
+        start = self._address
+        end = start + self._size
+        chunk_size = self._CHUNK_SIZE if self._CHUNKED_REGISTRATION else self._size
+        for addr in range(start, end, chunk_size):
+            yield addr, min(end - addr, chunk_size)
 
 
 def resize_file(fd: int, new_size: int):

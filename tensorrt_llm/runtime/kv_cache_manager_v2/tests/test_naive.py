@@ -81,14 +81,15 @@ class TestKVCacheManagerV2(unittest.TestCase):
                 BufferConfig(role=Role.VALUE_BLOCK_QUANT,
                              size=block_quant_buf_size)
             ])
+        cache_tiers = [
+            GpuCacheTierConfig(quota=gpu_quota),
+            HostCacheTierConfig(quota=host_quota),
+            DiskCacheTierConfig(quota=disk_quota, path="/workspace/"),
+        ]
         self.cfg = KVCacheManagerConfig(
             tokens_per_block=tokens_per_block,
             vocab_size=4096,
-            cache_tiers=[
-                GpuCacheTierConfig(quota=gpu_quota),
-                HostCacheTierConfig(quota=host_quota),
-                DiskCacheTierConfig(quota=disk_quota, path="/workspace/"),
-            ],
+            cache_tiers=[t for t in cache_tiers if t.quota > 0],
             layers=[
                 AttentionLayerConfig(
                     layer_id=layer_id,
@@ -415,8 +416,8 @@ class TestBatching(TestKVCacheManagerV2):
                                gpu_quota_mb: int, skip_execution: bool,
                                interval: int, tokens_per_block: int):
         self.prepare(gpu_quota_mb << 20,
-                     1 << 30,
                      4 << 30,
+                     0 << 30,
                      36,
                      128,
                      0,
