@@ -6,10 +6,11 @@ from .._common import (GPU_LEVEL, BlockOrdinal, CacheLevel, CacheTier, LayerId,
                        MemAddress, Priority, TokenIdExt)
 from .._config import DataRole, KVCacheManagerConfig
 from .._eviction_controller import PageStatus
-from .._life_cycle_registry import LifeCycle, LifeCycleRegistry
+from .._life_cycle_registry import LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._storage._config import create_storage_config
 from .._storage_manager import StorageManager
-from .._utils import HomoTuple, init_cuda_once, typed_range, unwrap_weakref
+from .._utils import (HomoTuple, init_cuda_once, typed_enumerate, typed_range,
+                      unwrap_weakref)
 from ._kv_cache import _KVCache
 
 
@@ -108,3 +109,15 @@ class KVCacheManager:
     @property
     def enable_partial_match(self) -> bool:
         return True
+
+    @property
+    def layer_grouping(self) -> HomoTuple[HomoTuple[LayerId]]:
+        layer_to_life_cycle_ids = self._storage._layer_to_life_cycle_ids
+        num_life_cycles = self._life_cycles.size
+        grouping = dict[LifeCycleId, list[LayerId]]({
+            i: []
+            for i in typed_range(num_life_cycles)
+        })
+        for layer_id, life_cycle_id in typed_enumerate(layer_to_life_cycle_ids):
+            grouping[life_cycle_id].append(layer_id)
+        return tuple(tuple(grouping[i]) for i in typed_range(num_life_cycles))
