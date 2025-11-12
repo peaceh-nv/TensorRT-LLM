@@ -27,7 +27,8 @@ from parameterized import parameterized
 seed = int.from_bytes(os.urandom(8), 'little')
 print(f"seed: {seed}")
 random.seed(seed)
-DBG_PRINT = False
+DBG_PRINT = int(os.environ.get("DBG_PRINT", "0")) != 0
+PRINT_TIME = int(os.environ.get("PRINT_TIME", "0")) != 0
 
 
 class TestKVCacheManagerV2(unittest.TestCase):
@@ -261,7 +262,8 @@ class TestNoBatching(TestKVCacheManagerV2):
     @parameterized.expand([(2**i, False) for i in range(12)])
     # @parameterized.expand([(32, True)])
     def test_naive_perf(self, interval, profile: bool):
-        self.skipTest("Skipping perf test")
+        if not PRINT_TIME:
+            self.skipTest("Skipping perf test")
         self.prepare(256 << 20, 256 << 20, 1 << 30, 36, 128, 48)
         seq_len = 10240
         self.run_naive(seq_len, interval, False)  # warm up for numba jit
@@ -275,9 +277,10 @@ class TestNoBatching(TestKVCacheManagerV2):
             for _ in range(11 if profiler is None else 1)
         ]
         median_time_taken = median(time_taken)
-        print(
-            f"Throughput: {round(seq_len / median_time_taken)} tokens/sec for interval {interval}"
-        )
+        if PRINT_TIME:
+            print(
+                f"Throughput: {round(seq_len / median_time_taken)} tokens/sec for interval {interval}"
+            )
         if profiler is not None:
             profiler.disable()
             profiler.print_stats(sort='cumtime')
@@ -446,7 +449,7 @@ class TestBatching(TestKVCacheManagerV2):
             profiler.disable()
             profiler.print_stats(sort='cumtime')
             profiler.dump_stats('profiler.prof')
-        if DBG_PRINT:
+        if DBG_PRINT or PRINT_TIME:
             print(
                 f"Time taken: {toc-tic} seconds (num_prompt_tokens: {self.acc_num_prompt_tokens}, num_decode_tokens: {self.acc_num_decode_tokens})"
             )

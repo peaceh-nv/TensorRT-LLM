@@ -26,13 +26,20 @@ import cuda.bindings.runtime as cudart
 from ._common import NDEBUG, CudaStream
 from ._exceptions import CuError, CuOOMError, DiskOOMError, HostOOMError
 
+T = TypeVar('T')
+U = TypeVar('U')
+Index = TypeVar('Index', bound=int, contravariant=True)
+IndexO = TypeVar('IndexO', bound=int, covariant=True)
+Row = TypeVar('Row', bound=int)
+Col = TypeVar('Col', bound=int)
+
 
 def _unwrap(ret: drv.CUresult
             | tuple[
                 drv.CUresult,
-                Any,
+                T,
             ]
-            | tuple[drv.CUresult, Any, Any]):
+            | tuple[drv.CUresult, T, U]):
     if isinstance(ret, drv.CUresult):
         if int(ret) != int(  # type: ignore[assignment]
                 drv.CUresult.CUDA_SUCCESS):
@@ -64,14 +71,6 @@ def in_range(x: int, lower: int, upper: int) -> bool:
 def exact_div(x: int, y: int) -> int:
     assert x % y == 0
     return x // y
-
-
-T = TypeVar('T')
-U = TypeVar('U')
-Index = TypeVar('Index', bound=int, contravariant=True)
-IndexO = TypeVar('IndexO', bound=int, covariant=True)
-Row = TypeVar('Row', bound=int)
-Col = TypeVar('Col', bound=int)
 
 
 def overlap(a: tuple[Index, Index],

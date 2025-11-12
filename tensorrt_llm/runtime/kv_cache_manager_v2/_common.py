@@ -1,10 +1,11 @@
 import enum
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, NewType, Self
 
 import cuda.bindings.driver as drv
 
-NDEBUG = True
+NDEBUG = int(os.environ.get("TLLM_KV_CACHE_MANAGER_V2_DEBUG", "0")) == 0
 
 
 # Can extend to more tiers in the future, e.g. object storage like AWS S3.

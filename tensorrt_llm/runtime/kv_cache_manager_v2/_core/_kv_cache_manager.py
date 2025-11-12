@@ -54,10 +54,10 @@ class KVCacheManager:
     def get_page_index_upper_bound(self, layer_id: LayerId,
                                    data_role: DataRole) -> int:
         'The upper bound of page indices for the given layer and data role. Note that this is not the same as the max number of pages available for this layer and data role. Internally, multiple buffers may share one memory pool. The purpose of this API is just in case users want to wrap the memory pool as a tensor with known shape.'
-        attr = self._storage.get_buffer_attr(layer_id, data_role)
-        pg_idx = self._storage.get_pool_group_index(attr.life_cycle_id)
-        return self._storage._levels[GPU_LEVEL].storage._pool_groups[
-            pg_idx].num_slots
+        storage = self._storage
+        lc_id = storage._layer_to_life_cycle_ids[layer_id]
+        pg_idx = storage.get_pool_group_index(lc_id)
+        return storage._levels[GPU_LEVEL].storage._pool_groups[pg_idx].num_slots
 
     # lora_task_id: match lora_task_id before matching any tokens.
     # stream: blocks are allocated and made ready in this stream. Later grow() also makes blocks ready in this stream, and later commit() calls also assume data are written in this stream.

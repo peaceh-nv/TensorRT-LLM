@@ -2,15 +2,12 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import NamedTuple, cast
 
-import numpy as np
-import numpy.typing as npt
-
-from .._common import LayerId, TiedBufGroupId
+from .._common import LayerId
 from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LifeCycle, LifeCycleId, LifeCycleRegistry
-from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
+from .._storage._core import PoolGroupIndex, PoolIndex
 from .._utils import (HomoTuple, TypedIndexList, exact_div, filled_list,
-                      get_uniform_attribute, is_sorted, make_typed)
+                      get_uniform_attribute, is_sorted, typed_range)
 
 
 class BufferId(NamedTuple):
@@ -87,27 +84,6 @@ class BufferAttr:
 
 
 @dataclass(slots=True, frozen=True)
-class SlotToPageIndices:
-    'Both offset and stride are in number of original buffers.'
-    tied_buffer_groups: TypedIndexList[TiedBufGroupId, TypedIndexList[
-        PoolIndex,
-        BufferId]]  # tied buffer groups in different pools of the same pool group.
-    scale: npt.NDArray[np.int32]  # same length as len(buffers)
-    bias: npt.NDArray[np.int32]  # same length as len(buffers)
-
-    def __call__(self, slot_id: SlotId) -> npt.NDArray[np.int32]:
-        return self.bias + slot_id * self.scale
-
-    @classmethod
-    def create(cls) -> 'SlotToPageIndices':
-        return cls(
-            cast(
-                TypedIndexList[TiedBufGroupId, TypedIndexList[PoolIndex,
-                                                              BufferId]], []),
-            np.array([], dtype=np.int32), np.array([], dtype=np.int32))
-
-
-@dataclass(slots=True, frozen=True)
 class StorageConfig:
     cache_tiers: HomoTuple[CacheTierConfig]
     pool_groups: HomoTuple[PoolGroupConfig]
@@ -139,37 +115,28 @@ class StorageConfig:
                             offset += cb.single_buffer_size
         return ret
 
-    def slot_to_page_indices(
-            self) -> TypedIndexList[LifeCycleId, SlotToPageIndices]:
-        ret = make_typed(SlotToPageIndices.create, self.num_life_cycles)
+    def slot_to_page_indices(self) -> TypedIndexList[LifeCycleId, int]:
+        ret = filled_list(0, self.num_life_cycles)
         for pg in self.pool_groups:
             for slot in pg.slots:
                 life_cycle = slot.life_cycle_id
-                lst: list[tuple[list[BufferId], int, int]] = []
-                for pool_idx, page in enumerate(slot.pages):
-                    offset = 0
-                    idx_buf = TiedBufGroupId(0)
-                    for cb in page.coalesced_buffers:
-                        for b in cb.buffer_ids:
-                            bias = exact_div(offset, cb.single_buffer_size)
-                            scale = exact_div(page.slot_size,
-                                              cb.single_buffer_size)
-                            if pool_idx == 0:
-                                lst.append(([b], scale, bias))
-                            else:
-                                assert scale, bias == lst[idx_buf][1:]
-                                assert pool_idx == len(lst[idx_buf][0])
-                                lst[idx_buf][0].append(b)
-                            offset += cb.single_buffer_size
-                            idx_buf = TiedBufGroupId(idx_buf + 1)
-                buffers = cast(
-                    TypedIndexList[TiedBufGroupId, TypedIndexList[PoolIndex,
-                                                                  BufferId]],
-                    [b for b, _, _ in lst])
-                scale = np.array([scale for _, scale, _ in lst], dtype=np.int32)
-                bias = np.array([bias for _, _, bias in lst], dtype=np.int32)
-                ret[life_cycle] = SlotToPageIndices(buffers, scale, bias)
+                assert len(slot.pages) == 1
+                page = slot.pages[0]
+                assert len(page.coalesced_buffers) == 1
+                scale = exact_div(page.slot_size,
+                                  page.coalesced_buffers[0].single_buffer_size)
+                ret[life_cycle] = scale
         return ret
+
+    def layer_to_life_cycle_ids(self) -> TypedIndexList[LayerId, LifeCycleId]:
+        map = dict[LayerId, LifeCycleId]()
+        for (layer_id, _), attr in self.buffer_attributes().items():
+            lc_id = map.setdefault(layer_id, attr.life_cycle_id)
+            assert lc_id == attr.life_cycle_id
+        assert len(map) == max(map.keys()) + 1
+        return cast(
+            TypedIndexList[LayerId, LifeCycleId],
+            [map[LayerId(layer_id)] for layer_id in typed_range(len(map))])
 
     def __post_init__(self) -> None:
         groups = [
@@ -197,6 +164,9 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
     # @TODO: add test for this case.
     slot_groups: list[SlotConfig] = []
     for life_cycle_id, size_to_buffers in buffer_groups.items():
+        assert len(
+            set(len(buffer_ids) for buffer_ids in size_to_buffers.values())
+        ) == 1, "Not yet supported. While we can support this easily, we need to know whether the kernels need to share page indices or not. We haven't seen such models, yet. So we leave this as a future work."
         size_to_coalesced_buffers = defaultdict[int, list[CoalescedBuffer]](
             list[CoalescedBuffer])
         for size, buffer_ids in size_to_buffers.items():

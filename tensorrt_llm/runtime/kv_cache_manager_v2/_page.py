@@ -308,11 +308,10 @@ class _SharedPageLock:
             self.page.ready_event.wait_in_stream(kv_cache.cuda_stream)
         self._user = LockOwner(weakref.ref(kv_cache), beam_index, ordinal,
                                life_cycle)
-        indices = self._get_page_indices()
-        old_indices = kv_cache._update_page_indices(beam_index, ordinal,
-                                                    life_cycle, indices)
-        assert NDEBUG or all(old_idx == BAD_PAGE_INDEX
-                             for old_idx in unwrap_optional(old_indices))
+        new_index = self._get_page_index()
+        old_index = kv_cache._update_page_index(beam_index, ordinal, life_cycle,
+                                                new_index)
+        assert old_index == BAD_PAGE_INDEX
 
     def __del__(self):
         if self._uniq_lock is not None:
@@ -323,26 +322,19 @@ class _SharedPageLock:
         page = self.page
         self._uniq_lock.finish_events.append(
             unwrap_weakref(self._user.kv_cache).finish_event)
-        num_indices = len(
-            unwrap_weakref(
-                self._user.kv_cache).manager._storage._slot_to_page_indices[
-                    self._user.life_cycle].tied_buffer_groups)
-        new_indices = [BAD_PAGE_INDEX] * num_indices
-        old_indices = unwrap_weakref(self._user.kv_cache)._update_page_indices(
+        new_index = BAD_PAGE_INDEX
+        old_index = unwrap_weakref(self._user.kv_cache)._update_page_index(
             self._user.beam_index, self._user.ordinal, self._user.life_cycle,
-            new_indices)
-        assert NDEBUG or old_indices == self._get_page_indices()
+            new_index)
+        assert NDEBUG or old_index == self._get_page_index()
         self._uniq_lock = None
         return page
 
-    def _get_page_indices(self) -> list[PageIndex]:
+    def _get_page_index(self) -> PageIndex:
         storage = unwrap_weakref(self._user.kv_cache).manager._storage
-        converter = storage._slot_to_page_indices[self._user.life_cycle]
-        # this is faster, with hand-written inlining and numba jit.
-        return _compute_page_indices(self.page.slot_id, converter.scale,
-                                     converter.bias).tolist()
-        # return storage.get_page_indices_for_slot(self._user.life_cycle,
-        #                                          self.page.slot_id)
+        num_buffers_per_slot = storage._slot_to_page_indices[
+            self._user.life_cycle]
+        return PageIndex(self.page.slot_id * num_buffers_per_slot)
 
 
 class BatchedLockTarget(NamedTuple):

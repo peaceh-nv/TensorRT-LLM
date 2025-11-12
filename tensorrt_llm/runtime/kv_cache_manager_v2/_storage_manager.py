@@ -4,7 +4,6 @@ import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator, Sequence, cast
 
-from ._buffer_registry import BufferRegistry, TiedBufGroupId
 from ._common import (GPU_LEVEL, NDEBUG, Address, CacheLevel, CacheTier,
                       LayerId, MemAddress, PageIndex)
 from ._config import CacheTierConfig, DataRole, DiskCacheTierConfig
@@ -19,15 +18,14 @@ from ._exceptions import OutOfPagesError
 from ._life_cycle_registry import LifeCycleId
 from ._page import Page
 from ._storage import CacheLevelStorage
-from ._storage._config import (BufferAttr, BufferId, SlotToPageIndices,
-                               StorageConfig)
+from ._storage._config import BufferAttr, BufferId, StorageConfig
 from ._storage._core import (DiskCacheLevelStorage, GpuCacheLevelStorage,
                              HostCacheLevelStorage, PoolGroupBase,
                              PoolGroupIndex, PoolIndex, Slot, SlotId)
 from ._utils import (Array2D, CachedCudaEvent, HomoTuple, TemporaryCudaStream,
                      TypedIndexList, exact_div, filled_array2d, filled_list,
                      get_uniform_attribute, make_typed, partition, remove_if,
-                     typed_enumerate, typed_len, typed_range, unwrap_weakref)
+                     typed_enumerate, typed_range, unwrap_weakref)
 
 
 class CacheLevelManager:
@@ -80,14 +78,12 @@ class CacheLevelManager:
 
 
 class StorageManager:
-    __slots__ = ('_parent', '_slot_to_page_indices', 'buffer_registry',
+    __slots__ = ('_parent', '_layer_to_life_cycle_ids', '_slot_to_page_indices',
                  '_buffer_attr', '_life_cycle_grouping', '_levels',
                  '_cached_num_pool_groups', '__weakref__')
     _parent: weakref.ref['KVCacheManager']
-    # Callables to convert slot_id to public page_indices.
-    _slot_to_page_indices: TypedIndexList[LifeCycleId, SlotToPageIndices]
-    buffer_registry: BufferRegistry
-    # Contains the same information as _slot_to_page_indices but in a inverse way. For ref-check only.
+    _layer_to_life_cycle_ids: TypedIndexList[LayerId, LifeCycleId]
+    _slot_to_page_indices: TypedIndexList[LifeCycleId, int]
     _buffer_attr: dict[BufferId, BufferAttr]
     _life_cycle_grouping: TypedIndexList[LifeCycleId, PoolGroupIndex]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
@@ -97,11 +93,8 @@ class StorageManager:
         assert config.cache_tiers[
             GPU_LEVEL].tier == CacheTier.GPU_MEM, "The first cache tier must be GPU memory"
         self._parent = weakref.ref(parent)
+        self._layer_to_life_cycle_ids = config.layer_to_life_cycle_ids()
         self._slot_to_page_indices = config.slot_to_page_indices()
-        self.buffer_registry = BufferRegistry()
-        for lc_converters in self._slot_to_page_indices:
-            for tied_buffers in lc_converters.tied_buffer_groups:
-                self.buffer_registry.register_mirrored_buffers(tied_buffers)
         self._buffer_attr = config.buffer_attributes()
         self._life_cycle_grouping = config.life_cycle_grouping()
         slot_size_lists = [pg.slot_size_list for pg in config.pool_groups]
@@ -380,10 +373,10 @@ class StorageManager:
                                   data_role: DataRole) -> MemAddress:
         storage = self._levels[GPU_LEVEL].storage
         attr = self.get_buffer_attr(layer_id, data_role)
-        pool_group_index = self.get_pool_group_index(attr.life_cycle_id)
-        return cast(
-            MemAddress,
-            storage.slot_address(pool_group_index, attr.pool_index, SlotId(0)))
+        pg_idx = self.get_pool_group_index(attr.life_cycle_id)
+        return MemAddress(
+            cast(int, storage.slot_address(pg_idx, attr.pool_index, SlotId(0)))
+            + attr.offset)
 
     def get_page_indices_ref(
             self, layer_id: LayerId, data_role: DataRole,
@@ -393,16 +386,16 @@ class StorageManager:
         pg_idx = self.get_pool_group_index(attr.life_cycle_id)
         pool_idx = attr.pool_index
         pool = self._levels[GPU_LEVEL].storage._pool(pg_idx, pool_idx)
-        indice_offset = exact_div(attr.offset, attr.size)
-        base = cast(int, pool.slot_address(SlotId(0)))
+        base = cast(int, pool.slot_address(SlotId(0))) + attr.offset
         assert NDEBUG or base == self.get_mem_pool_base_address(
             layer_id, data_role)
         for page in pages:
             if page is None:
                 yield None
             else:
-                offset = cast(int, pool.slot_address(page.slot_id)) - base
-                yield exact_div(offset, attr.size) + indice_offset
+                offset = cast(int, pool.slot_address(
+                    page.slot_id)) + attr.offset - base
+                yield exact_div(offset, attr.size)
 
     def get_buffer_attr(self, layer_id: LayerId,
                         data_role: DataRole) -> BufferAttr:
@@ -414,23 +407,9 @@ class StorageManager:
                                                         slot_id)
 
     def get_page_indices_for_slot(self, life_cycle: LifeCycleId,
-                                  slot_id: SlotId) -> list[PageIndex]:
-        converter = self._slot_to_page_indices[life_cycle]
-        return (converter.scale * slot_id + converter.bias).tolist()
-        # return converter(slot_id).tolist()
-
-    def get_mirrored_buffer_group_indices(
-            self, life_cycle: LifeCycleId) -> HomoTuple[TiedBufGroupId]:
-        converter = self._slot_to_page_indices[life_cycle]
-        get_id = self.buffer_registry.get_mirrored_buffer_group_index
-        return tuple(
-            get_uniform_attribute(grp, get_id)
-            for grp in converter.tied_buffer_groups)
-
-    def get_num_tied_buffer_groups(self,
-                                   life_cycle: LifeCycleId) -> TiedBufGroupId:
-        return typed_len(
-            self._slot_to_page_indices[life_cycle].tied_buffer_groups)
+                                  slot_id: SlotId) -> PageIndex:
+        scale = self._slot_to_page_indices[life_cycle]
+        return PageIndex(scale * slot_id)
 
     @dataclass(slots=True, frozen=True)
     class Statistics:

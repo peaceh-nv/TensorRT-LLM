@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, cast
 from .._block_radix_tree import Block, UselessBlockError
 from .._common import (BAD_PAGE_INDEX, GPU_LEVEL, NDEBUG, BeamIndex,
                        BlockOrdinal, BlockOrdinalT, CacheLevel, CudaStream,
-                       LayerId, PageIndex, Priority, TiedBufGroupId, TokenIdExt)
+                       LayerId, PageIndex, Priority, TokenIdExt)
 from .._config import DataRole
 from .._copy_engine import CopyTask, batched_copy
 from .._exceptions import LogicError, OutOfPagesError
@@ -19,9 +19,8 @@ from .._page import (BatchedLockTarget, CommittedPage, UncommittedPage,
                      _PageHolder, _SharedPageLock, batched_lock_to_gpu)
 from .._storage._config import BufferId
 from .._storage_manager import StorageManager
-from .._utils import (CachedCudaEvent, HomoTuple, TemporaryCudaStream,
-                      TypedIndexList, div_up, expect_type, filled_list,
-                      find_index, get_uniform_attribute, make_typed,
+from .._utils import (CachedCudaEvent, TemporaryCudaStream, TypedIndexList,
+                      div_up, expect_type, filled_list, find_index, make_typed,
                       map_optional, not_implemented, stream_wait_events,
                       to_typed, typed_enumerate, typed_len, typed_map,
                       typed_range, unwrap_optional, unwrap_weakref, value_or)
@@ -69,7 +68,6 @@ class _KVCache:
                  '_cuda_stream', '_status', '_beam_width', '_capacity',
                  '_history_length', '_commit_state', '_blocks', '_page_indices',
                  '_committed_tokens', '_num_committed_blocks', '_finish_event',
-                 '_buffer_to_mirrored_index', '_tied_grp_indices',
                  '_tokens_per_block', '__weakref__')
 
     class Status(enum.Enum):
@@ -97,7 +95,7 @@ class _KVCache:
 
     _blocks: TypedIndexList[BlockOrdinal, SeqBlock]
     # we maintain _page_indices to accelerate the get_page_indices() API. In principle it can be computed on the fly, but that would be slow due to python.
-    _page_indices: TypedIndexList[BeamIndex, TypedIndexList[TiedBufGroupId,
+    _page_indices: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId,
                                                             array.array[int]]]
     _committed_tokens: list[TokenIdExt]
     # Sometimes we can't commit a block because all its tokens are already covered by another block in the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric difference, 2. if our block is a partial block, we can't write to memory of the other blocks. Internally, we stop committing from such a block, but still give user an illusion that the block is committed. In such cases, _committed_tokens contains what users have fed with commit(), while _num_committed_blocks contains the number of blocks that are actually committed.
@@ -105,10 +103,6 @@ class _KVCache:
     # set when switch away from ACTIVE, cleared when switching to ACTIVE.
     _finish_event: CachedCudaEvent | None
 
-    # available in self.manager._storage.buffer_registry, put here to accelerate the get_page_indices() API.
-    _buffer_to_mirrored_index: dict[BufferId, TiedBufGroupId]
-    # available with self.manager._storage.get_mirrored_buffer_group_indices(). Cached here to accelerate the get_page_indices() API.
-    _tied_grp_indices: TypedIndexList[LifeCycleId, HomoTuple[TiedBufGroupId]]
     _tokens_per_block: int
 
     def __init__(self, manager: 'KVCacheManager', lora_task_id: int | None,
@@ -127,18 +121,11 @@ class _KVCache:
         self._commit_state = self.CommitState.ALLOWED
         self._blocks = cast(TypedIndexList, [])
         self._page_indices = make_typed(
-            lambda: make_typed(
-                lambda: array.array('i'), self.manager._storage.buffer_registry.
-                num_mirrored_buffer_groups), self.beam_width)
+            lambda: make_typed(lambda: array.array('i'), self.manager._storage.
+                               num_life_cycles), self.beam_width)
         self._committed_tokens = []
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
-        self._buffer_to_mirrored_index = manager._storage.buffer_registry._buffer_to_mirrored_index
-        self._tied_grp_indices = cast(
-            TypedIndexList[LifeCycleId, HomoTuple[TiedBufGroupId]], [
-                manager._storage.get_mirrored_buffer_group_indices(lc)
-                for lc in typed_range(manager._life_cycles.size)
-            ])
         self._tokens_per_block = manager.tokens_per_block
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
@@ -200,9 +187,8 @@ class _KVCache:
         layer_id: LayerId,
         data_role: DataRole,
         beam_id: BeamIndex = BeamIndex(0)) -> array.array[int]:
-        mirrored_buf_group_id = self._buffer_to_mirrored_index[BufferId(
-            layer_id, data_role)]
-        ret = self._page_indices[beam_id][mirrored_buf_group_id]
+        lc = self.manager._storage._layer_to_life_cycle_ids[layer_id]
+        ret = self._page_indices[beam_id][lc]
         assert NDEBUG or ret == array.array(
             'i',
             (value_or(i, BAD_PAGE_INDEX)
@@ -212,9 +198,10 @@ class _KVCache:
     def get_all_page_indices(
             self, beam_id: BeamIndex,
             buf_ids: Iterable[BufferId]) -> Iterator[array.array[int]]:
-        for buf_id in buf_ids:
-            mirrored_buf_group_id = self._buffer_to_mirrored_index[buf_id]
-            yield self._page_indices[beam_id][mirrored_buf_group_id]
+        layer_to_lc_ids = self.manager._storage._layer_to_life_cycle_ids
+        for (layer_id, _) in buf_ids:
+            lc = layer_to_lc_ids[layer_id]
+            yield self._page_indices[beam_id][lc]
 
     # reserve space for next inference. Request new blocks from KVCacheManager if necessary.
     # if capacity is increased and beam_width > 1, blocks containing new tokens should be allocated for each beam.
@@ -614,13 +601,10 @@ class _KVCache:
     def _get_tree_block(self, ordinal: BlockOrdinal) -> Block:
         assert self._blocks[ordinal].is_committed
         ret = unwrap_optional(self._blocks[ordinal].tree_block)
-
-        def get_block(holder: BlockPage) -> Block:
-            assert holder is not None and isinstance(holder.page, CommittedPage)
-            return unwrap_weakref(holder.page.block)
-
-        assert NDEBUG or get_uniform_attribute(
-            self._block(ordinal, BeamIndex(0)), get_block) == ret
+        if not NDEBUG:
+            for b in self._block(ordinal, BeamIndex(0)):
+                assert b is None or (isinstance(b.page, CommittedPage)
+                                     and b.page.block() is ret)
         return ret
 
     def _take_uncommitted_page(
@@ -664,7 +648,9 @@ class _KVCache:
                         if is_committed or self._commit_state != self.CommitState.ALLOWED:
                             assert holder is None
                         else:
-                            assert isinstance(holder, _PageHolder)
+                            # For the decoder-side disagg case, for the first step, we will skip the out-of-window blocks.
+                            assert isinstance(holder, _PageHolder) or (
+                                holder is None and not self._committed_tokens)
                     else:
                         assert isinstance(holder,
                                           (_SharedPageLock
@@ -831,23 +817,12 @@ class _KVCache:
         finally:
             self._finish_event = None
 
-    def _update_page_indices(
-            self, beam_idx: BeamIndex, ordinal: BlockOrdinal, lc: LifeCycleId,
-            indices: list[PageIndex]) -> list[PageIndex] | None:
-        beam = self._page_indices[beam_idx]
-        if NDEBUG:
-            for i, (buf_group_id, page_idx) in enumerate(
-                    zip(self._tied_grp_indices[lc], indices)):
-                beam[buf_group_id][ordinal] = page_idx
-            return None
-        for i, (buf_group_id,
-                page_idx) in enumerate(zip(self._tied_grp_indices[lc],
-                                           indices)):
-            arr = beam[buf_group_id]
-            old = PageIndex(arr[ordinal])
-            arr[ordinal] = page_idx
-            indices[i] = old
-        return indices
+    def _update_page_index(self, beam_idx: BeamIndex, ordinal: BlockOrdinal,
+                           lc: LifeCycleId, page_index: PageIndex) -> PageIndex:
+        indices = self._page_indices[beam_idx][lc]
+        old = PageIndex(indices[ordinal])
+        indices[ordinal] = page_index
+        return old
 
     def _get_page_indices_ref(
         self,
@@ -858,7 +833,7 @@ class _KVCache:
         assert beam_id < self.beam_width
         assert self.is_active
         storage = self._storage
-        lc = storage.get_buffer_attr(layer_id, data_role).life_cycle_id
+        lc = storage._layer_to_life_cycle_ids[layer_id]
         pages = (map_optional(
             b.pages[beam_id][lc] if beam_id < len(b.pages) else None,
             lambda h: cast(_PageHolder | _SharedPageLock, h).page)
