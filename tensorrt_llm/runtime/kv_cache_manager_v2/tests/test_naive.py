@@ -55,9 +55,10 @@ class TestKVCacheManagerV2(unittest.TestCase):
                 num_layers: int,
                 window_size: SlidingWindowSize,
                 sink_tokens: int,
-                tokens_per_block: int = 32):
+                tokens_per_block: int = 32,
+                kv_buf_size: int = 8192):
         self._init_cfg(tokens_per_block, gpu_quota, host_quota, disk_quota,
-                       num_layers, window_size, sink_tokens)
+                       num_layers, window_size, sink_tokens, kv_buf_size)
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
 
@@ -177,9 +178,9 @@ class TestNoBatching(TestKVCacheManagerV2):
         return time_taken
 
     def test_sol_mem_utilization(self):
-        self.prepare(8 << 20, 8 << 20, 1 << 30, 36, 128, 1)
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
         # if we have n blocks, we need 8192*2*18*(1+5+n) bytes of memory. For the (1+5+n), 1 is for sink blocks, 5 is for SWA (window=128), n is for full attention.
-        max_seq_len = 32 * 22  # 23 blocks will require more than 8MB memory
+        max_seq_len = 32 * 22  # 23 blocks will require more than 32MB memory
         seq_len = max_seq_len
 
         # create a request and suspend it. It shall not consume any GPU memory after suspend.
@@ -211,9 +212,9 @@ class TestNoBatching(TestKVCacheManagerV2):
 
     @parameterized.expand([(1, ), (2, ), (4, )])
     def test_cache_reuse(self, num_reusable_requests: int):
-        self.prepare(8 << 20, 8 << 20, 1 << 30, 36, 128, 1)
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
         # if we have n blocks, we need 8192*2*18*(1+5+n) bytes of memory. For the (1+5+n), 1 is for sink blocks, 5 is for SWA (window=128), n is for full attention.
-        max_seq_len = 32 * 22  # 23 blocks will require more than 8MB memory
+        max_seq_len = 32 * 22  # 23 blocks will require more than 32MB memory
         seq_len = max_seq_len
 
         req_id_gen = itertools.count()

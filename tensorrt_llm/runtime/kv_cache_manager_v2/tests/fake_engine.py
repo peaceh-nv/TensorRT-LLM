@@ -81,7 +81,8 @@ class FakeEngine:
         token_bytes = exact_div(buf.size, tokens_per_block)
         pool = manager.get_mem_pool_base_address(layer_id, role)
         stride = manager.get_page_stride(layer_id, role)
-        pages = kv_cache.get_page_indices(layer_id, role, beam)
+        lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
+        pages = kv_cache.get_page_indices(lc_id, beam)
         capacity = kv_cache.capacity
         history_len = len(history)
         assert len(history) == history_len
@@ -117,9 +118,9 @@ class FakeEngine:
         token_bytes = exact_div(buf.size, self.tokens_per_block)
         pool = manager.get_mem_pool_base_address(layer_id, role)
         stride = manager.get_page_stride(layer_id, role)
+        lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
         pages = kv_cache.get_page_indices(
-            layer_id, role,
-            beam)[:div_up(history_len + len(input), tokens_per_block)]
+            lc_id, beam)[:div_up(history_len + len(input), tokens_per_block)]
         capacity = kv_cache.capacity
         input_range = (history_len, history_len + len(input))
         assert input_range[1] <= capacity

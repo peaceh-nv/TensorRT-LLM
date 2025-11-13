@@ -10,11 +10,10 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, cast
 from .._block_radix_tree import Block, UselessBlockError
 from .._common import (BAD_PAGE_INDEX, GPU_LEVEL, NDEBUG, BeamIndex,
                        BlockOrdinal, BlockOrdinalT, CacheLevel, CudaStream,
-                       LayerId, PageIndex, Priority, TokenIdExt)
-from .._config import DataRole
+                       PageIndex, Priority, TokenIdExt)
 from .._copy_engine import CopyTask, batched_copy
 from .._exceptions import LogicError, OutOfPagesError
-from .._life_cycle_registry import LifeCycle, LifeCycleId
+from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId
 from .._page import (BatchedLockTarget, CommittedPage, UncommittedPage,
                      _PageHolder, _SharedPageLock, batched_lock_to_gpu)
 from .._storage._config import BufferId
@@ -183,16 +182,12 @@ class _KVCache:
     # Due to constraints of the current kernels, K/V data blocks and the correspondding quant scale blocks
     # share the same indices, so the output for DataRole.KEY_DATA and DataRole.KEY_BLOCK_SCALE are the same.
     def get_page_indices(
-        self,
-        layer_id: LayerId,
-        data_role: DataRole,
-        beam_id: BeamIndex = BeamIndex(0)) -> array.array[int]:
-        lc = self.manager._storage._layer_to_life_cycle_ids[layer_id]
-        ret = self._page_indices[beam_id][lc]
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = BeamIndex(0)
+    ) -> array.array[int]:
+        ret = self._page_indices[beam_id][layer_group_id]
         assert NDEBUG or ret == array.array(
-            'i',
-            (value_or(i, BAD_PAGE_INDEX)
-             for i in self._get_page_indices_ref(layer_id, data_role, beam_id)))
+            'i', (value_or(i, BAD_PAGE_INDEX)
+                  for i in self._get_page_indices_ref(layer_group_id, beam_id)))
         return ret
 
     def get_all_page_indices(
@@ -825,20 +820,15 @@ class _KVCache:
         return old
 
     def _get_page_indices_ref(
-        self,
-        layer_id: LayerId,
-        data_role: DataRole,
-        beam_id: BeamIndex = BeamIndex(0)
-    ) -> Iterator[int | None]:
+        self, lc: LifeCycleId,
+        beam_id: BeamIndex = BeamIndex(0)) -> Iterator[int | None]:
         assert beam_id < self.beam_width
         assert self.is_active
-        storage = self._storage
-        lc = storage._layer_to_life_cycle_ids[layer_id]
         pages = (map_optional(
             b.pages[beam_id][lc] if beam_id < len(b.pages) else None,
             lambda h: cast(_PageHolder | _SharedPageLock, h).page)
                  for b in self._blocks)
-        return storage.get_page_indices_ref(layer_id, data_role, pages)
+        return self._storage.get_page_indices_ref(lc, pages)
 
     def _shortcut_set_capacity(self, capacity: int) -> bool:
         'Shortcut for cases without side effects. Just for better performance.'

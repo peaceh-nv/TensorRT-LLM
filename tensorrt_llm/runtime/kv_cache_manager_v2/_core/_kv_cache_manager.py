@@ -6,7 +6,8 @@ from .._common import (GPU_LEVEL, BlockOrdinal, CacheLevel, CacheTier, LayerId,
                        MemAddress, Priority, TokenIdExt)
 from .._config import DataRole, KVCacheManagerConfig
 from .._eviction_controller import PageStatus
-from .._life_cycle_registry import LifeCycle, LifeCycleId, LifeCycleRegistry
+from .._life_cycle_registry import (LayerGroupId, LifeCycle, LifeCycleId,
+                                    LifeCycleRegistry)
 from .._storage._config import create_storage_config
 from .._storage_manager import StorageManager
 from .._utils import (HomoTuple, init_cuda_once, typed_enumerate, typed_range,
@@ -109,6 +110,9 @@ class KVCacheManager:
     @property
     def enable_partial_match(self) -> bool:
         return True
+
+    def get_layer_group_id(self, layer_id: LayerId) -> LayerGroupId:
+        return self._storage._layer_to_life_cycle_ids[layer_id]
 
     @property
     def layer_grouping(self) -> HomoTuple[HomoTuple[LayerId]]:

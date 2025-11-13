@@ -1,4 +1,4 @@
-from typing import Iterator, NamedTuple, NewType, cast
+from typing import Iterator, NamedTuple, NewType, TypeAlias, cast
 
 from ._common import SlidingWindowSize
 from ._config import KVCacheManagerConfig
@@ -21,6 +21,9 @@ class LifeCycle(NamedTuple):
 
 
 LifeCycleId = NewType("LifeCycleId", int)
+
+# For public exposure
+LayerGroupId: TypeAlias = LifeCycleId
 
 
 class LifeCycleRegistry:

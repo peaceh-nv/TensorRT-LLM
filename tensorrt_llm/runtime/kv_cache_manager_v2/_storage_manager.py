@@ -23,9 +23,9 @@ from ._storage._core import (DiskCacheLevelStorage, GpuCacheLevelStorage,
                              HostCacheLevelStorage, PoolGroupBase,
                              PoolGroupIndex, PoolIndex, Slot, SlotId)
 from ._utils import (Array2D, CachedCudaEvent, HomoTuple, TemporaryCudaStream,
-                     TypedIndexList, exact_div, filled_array2d, filled_list,
-                     get_uniform_attribute, make_typed, partition, remove_if,
-                     typed_enumerate, typed_range, unwrap_weakref)
+                     TypedIndexList, filled_array2d, filled_list,
+                     get_uniform_attribute, make_typed, map_optional, partition,
+                     remove_if, typed_enumerate, typed_range, unwrap_weakref)
 
 
 class CacheLevelManager:
@@ -379,23 +379,12 @@ class StorageManager:
             + attr.offset)
 
     def get_page_indices_ref(
-            self, layer_id: LayerId, data_role: DataRole,
+            self, lc_id: LifeCycleId,
             pages: Iterator[Page | None]) -> Iterator[int | None]:
         'Reference implementation. Not fast enough for production.'
-        attr = self.get_buffer_attr(layer_id, data_role)
-        pg_idx = self.get_pool_group_index(attr.life_cycle_id)
-        pool_idx = attr.pool_index
-        pool = self._levels[GPU_LEVEL].storage._pool(pg_idx, pool_idx)
-        base = cast(int, pool.slot_address(SlotId(0))) + attr.offset
-        assert NDEBUG or base == self.get_mem_pool_base_address(
-            layer_id, data_role)
-        for page in pages:
-            if page is None:
-                yield None
-            else:
-                offset = cast(int, pool.slot_address(
-                    page.slot_id)) + attr.offset - base
-                yield exact_div(offset, attr.size)
+        scale = self._slot_to_page_indices[lc_id]
+        return (map_optional(page, lambda p: scale * int(p.slot_id))
+                for page in pages)
 
     def get_buffer_attr(self, layer_id: LayerId,
                         data_role: DataRole) -> BufferAttr:
