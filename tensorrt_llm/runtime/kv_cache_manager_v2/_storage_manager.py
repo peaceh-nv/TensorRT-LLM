@@ -355,6 +355,11 @@ class StorageManager:
         return get_uniform_attribute(
             self._levels, lambda l: l.storage.slot_size(pool_group_index))
 
+    def num_slots(self,
+                  pool_group_index: PoolGroupIndex,
+                  cache_level: CacheLevel = GPU_LEVEL) -> int:
+        return self._levels[cache_level].storage.num_slots(pool_group_index)
+
     def release_slot(self, life_cycle: LifeCycleId, cache_level: CacheLevel,
                      slot: Slot) -> None:
         pg_idx = self.get_pool_group_index(life_cycle)

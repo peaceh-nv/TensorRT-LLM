@@ -222,7 +222,7 @@ class _KVCache:
         old_num_blocks = BlockOrdinal(div_up(self._capacity, tokens_per_block))
         new_num_blocks = BlockOrdinal(div_up(capacity, tokens_per_block))
         beam_width = BeamIndex(self.beam_width)
-        num_life_cycles = self._storage.num_life_cycles
+        num_life_cycles = self.manager._life_cycles.size
         if new_num_blocks < old_num_blocks:
             del self._blocks[new_num_blocks:]
             for beam_indices in self._page_indices:
@@ -233,7 +233,7 @@ class _KVCache:
         elif new_num_blocks > old_num_blocks:
             num_new_slots = filled_list(0, num_life_cycles)
             stale_ranges = [
-                self._get_stale_range(history_length, lc)
+                _KVCache._get_stale_range(tokens_per_block, history_length, lc)
                 for _, lc in self.manager._life_cycles.items()
             ]
             for lc in typed_range(num_life_cycles):
@@ -364,7 +364,8 @@ class _KVCache:
             return
         assert self._commit_state == self.CommitState.ALLOWED
         if self.num_committed_tokens % self.tokens_per_block != 0:
-            ordinal = self._to_block_ordinal(self.num_committed_tokens)
+            ordinal = _KVCache._to_block_ordinal(self.tokens_per_block,
+                                                 self.num_committed_tokens)
             with self._record_event():
                 self._commit_block(ordinal, True)
         else:
@@ -418,8 +419,8 @@ class _KVCache:
     def _active_pages(
             self) -> Iterator[tuple[BlockOrdinal, BeamIndex, LifeCycleId]]:
         for lc_idx, lc in self.manager._life_cycles.items():
-            stale_start, stale_end = self._get_stale_range(
-                self.history_length, lc)
+            stale_start, stale_end = _KVCache._get_stale_range(
+                self.tokens_per_block, self.history_length, lc)
             sink_blocks = typed_range(stale_start)
             window_blocks = typed_range(stale_end, typed_len(self._blocks))
             for ordinal in chain(sink_blocks, window_blocks):
@@ -538,7 +539,8 @@ class _KVCache:
         # If there are stale held uncommitted pages, release them.
         # @TODO: add test for this.
         for lc_idx, lc in self.manager._life_cycles.items():
-            start, end = self._get_stale_range(self.history_length, lc)
+            start, end = _KVCache._get_stale_range(self.tokens_per_block,
+                                                   self.history_length, lc)
             start = max(start, self._num_committed_blocks)
             for ordinal in typed_range(start, end):
                 block = self._blocks[ordinal]
@@ -558,8 +560,10 @@ class _KVCache:
             for lc_idx, lc in self.manager._life_cycles.items():
                 if lc.window_size is None:
                     continue
-                _, old_end = self._get_stale_range(self.history_length, lc)
-                new_beg, new_end = self._get_stale_range(new_history_length, lc)
+                _, old_end = _KVCache._get_stale_range(self.tokens_per_block,
+                                                       self.history_length, lc)
+                new_beg, new_end = _KVCache._get_stale_range(
+                    self.tokens_per_block, new_history_length, lc)
                 for ordinal in typed_range(
                         max(old_end, new_beg),
                         min(typed_len(self._blocks), new_end)):
@@ -590,8 +594,10 @@ class _KVCache:
     def _storage(self) -> StorageManager:
         return self.manager._storage
 
-    def _to_block_ordinal(self, token_ordinal: int) -> BlockOrdinal:
-        return BlockOrdinal(token_ordinal // self.tokens_per_block)
+    @staticmethod
+    def _to_block_ordinal(tokens_per_block: int,
+                          token_ordinal: int) -> BlockOrdinal:
+        return BlockOrdinal(token_ordinal // tokens_per_block)
 
     def _get_tree_block(self, ordinal: BlockOrdinal) -> Block:
         assert self._blocks[ordinal].is_committed
@@ -607,7 +613,7 @@ class _KVCache:
     ) -> TypedIndexList[LifeCycleId, tuple[UncommittedPage | None, bool]]:
         'Take ownership of the uncommitted pages, together with bool flag indicating if it was locked. And reset holders to None.'
         holders = self._block(ordinal, beam_idx)
-        num_life_cycles = self.manager._storage.num_life_cycles
+        num_life_cycles = self.manager._life_cycles.size
         ret: TypedIndexList[LifeCycleId,
                             tuple[UncommittedPage | None, bool]] = filled_list(
                                 (None, False), num_life_cycles)
@@ -628,15 +634,16 @@ class _KVCache:
         assert (self.num_committed_tokens <= self.history_length <=
                 self.capacity)
         assert len(self._blocks) == div_up(self.capacity, self.tokens_per_block)
-        get_range = lambda lc: self._get_stale_range(self.history_length, lc)
+        get_range = lambda lc: _KVCache._get_stale_range(
+            self.tokens_per_block, self.history_length, lc)
         stale_ranges = typed_map(self.manager._life_cycles.get(), get_range)
+        num_life_cycles = self.manager._life_cycles.size
         for ordinal, block in typed_enumerate(self._blocks):
             is_committed = ordinal < self._num_committed_blocks
             assert is_committed == block.is_committed
             for beam_block in block.pages:
-                assert typed_len(
-                    beam_block) == self.manager._storage.num_life_cycles
-                for lc in typed_range(self.manager._storage.num_life_cycles):
+                assert typed_len(beam_block) == num_life_cycles
+                for lc in typed_range(num_life_cycles):
                     holder = beam_block[lc]
                     start, end = stale_ranges[lc]
                     if start <= ordinal < end:
@@ -655,18 +662,21 @@ class _KVCache:
                             holder.page, CommittedPage)
         return True
 
+    @staticmethod
     def _get_stale_range(
-            self, history_length: int,
+            tokens_per_block: int, history_length: int,
             life_cycle: LifeCycle) -> tuple[BlockOrdinal, BlockOrdinal]:
         'Range of the stale blocks. Stale blocks are no longer needed for inference. Stale pages should be held if we may commit them later, or droppable otherwise.'
-        num_blocks = div_up(history_length, self.tokens_per_block)
+        num_blocks = div_up(history_length, tokens_per_block)
         start = BlockOrdinal(min(num_blocks, life_cycle.num_sink_blocks))
         window_size = life_cycle.window_size
         if window_size is None:
             return start, start
         # +1 because the next input token will be in the window as well.
         return start, max(
-            start, self._to_block_ordinal(history_length + 1 - window_size))
+            start,
+            _KVCache._to_block_ordinal(tokens_per_block,
+                                       history_length + 1 - window_size))
 
     def _setup_for_reuse(self, input_tokens: Sequence[TokenIdExt]):
         manager = self.manager
@@ -715,7 +725,8 @@ class _KVCache:
                 if n != 0:
                     matched = matched[:-n]
                     break
-                _, stale_end = self._get_stale_range(num_tokens, lc)
+                _, stale_end = _KVCache._get_stale_range(
+                    tokens_per_block, num_tokens, lc)
                 n = find_index(reversed(matched[stale_end:]),
                                lambda b: not has_page(b[0], lc_idx))
                 if len(matched) - n > stale_end:
@@ -738,8 +749,8 @@ class _KVCache:
 
         beam_idx = BeamIndex(0)
         for lc_idx, lc in life_cycles.items():
-            stale_start, stale_end = self._get_stale_range(
-                get_num_matched_tokens(matched), lc)
+            stale_start, stale_end = _KVCache._get_stale_range(
+                tokens_per_block, get_num_matched_tokens(matched), lc)
             for ordinal in chain(
                     typed_range(stale_start),
                     typed_range(stale_end, BlockOrdinal(len(matched)))):

@@ -1,5 +1,5 @@
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, cast
 
 from .._block_radix_tree import BlockRadixTree
 from .._common import (GPU_LEVEL, BlockOrdinal, CacheLevel, CacheTier, LayerId,
@@ -9,8 +9,10 @@ from .._eviction_controller import PageStatus
 from .._life_cycle_registry import (LayerGroupId, LifeCycle, LifeCycleId,
                                     LifeCycleRegistry)
 from .._storage._config import create_storage_config
+from .._storage._core import PoolGroupIndex
 from .._storage_manager import StorageManager
-from .._utils import (HomoTuple, init_cuda_once, typed_enumerate, typed_range,
+from .._utils import (HomoTuple, TypedIndexList, div_up, filled_list,
+                      init_cuda_once, typed_enumerate, typed_range,
                       unwrap_weakref)
 from ._kv_cache import _KVCache
 
@@ -125,3 +127,46 @@ class KVCacheManager:
         for layer_id, life_cycle_id in typed_enumerate(layer_to_life_cycle_ids):
             grouping[life_cycle_id].append(layer_id)
         return tuple(tuple(grouping[i]) for i in typed_range(num_life_cycles))
+
+    # @TODO: need updating when dynamic resizing is supported.
+    def clamp_max_seq_len_for_mem(self, batch_size: int,
+                                  model_max_seq_len: int) -> int:
+        'Get the max possible sequence length limited by the GPU memory pools.'
+        assert batch_size > 0
+        tokens_per_block = self.tokens_per_block
+        life_cycles = self._life_cycles
+        storage = self._storage
+        num_pool_groups = storage.num_pool_groups
+        remaining_slots = cast(
+            TypedIndexList[PoolGroupIndex, int],
+            [storage.num_slots(pg) for pg in typed_range(num_pool_groups)])
+        lc_to_pg_idx = storage._life_cycle_grouping
+
+        def get_num_slots(seq_len: int) -> TypedIndexList[PoolGroupIndex, int]:
+            ret = filled_list(0, num_pool_groups)
+            for lc_id, lc in life_cycles.items():
+                stale_range = _KVCache._get_stale_range(tokens_per_block,
+                                                        seq_len, lc)
+                num_stale_blocks = stale_range[1] - stale_range[0]
+                num_slots = div_up(seq_len, tokens_per_block) - num_stale_blocks
+                pg_idx = lc_to_pg_idx[lc_id]
+                ret[pg_idx] += num_slots
+            return ret
+
+        for pg in typed_range(num_pool_groups):
+            remaining_slots[pg] -= get_num_slots(1)[pg] * (batch_size - 1)
+            assert remaining_slots[pg] >= 0
+        is_enough = lambda num_blocks: all(cnt <= rem for cnt, rem in zip(
+            get_num_slots(num_blocks * tokens_per_block), remaining_slots))
+        assert is_enough(1)
+        lb = 1
+        ub = div_up(model_max_seq_len, tokens_per_block)
+        if is_enough(ub):
+            return model_max_seq_len
+        while lb < ub:
+            mid = (lb + ub) // 2
+            if is_enough(mid):
+                lb = mid
+            else:
+                ub = mid - 1
+        return min(lb * tokens_per_block, model_max_seq_len)
