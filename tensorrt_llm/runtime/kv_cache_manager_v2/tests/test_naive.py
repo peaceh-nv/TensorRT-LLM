@@ -413,7 +413,8 @@ class TestBatching(TestKVCacheManagerV2):
             f"update_batch: found {len(removed)} finished requests, now with {len(self.batch)} requests"
         )
 
-    @parameterized.expand([(1000, 1000, 1024, True, 1, 32),
+    @parameterized.expand([(1000, 1000, 1024, True, 32, 32),
+                           (100, 100, 128, False, 1, 128),
                            (100, 100, 128, False, 4, 64)])
     # @parameterized.expand([(1000, 1000, 1024, True, 32, 32)])
     def test_inflight_batching(self, num_requests: int, avg_length: int,
