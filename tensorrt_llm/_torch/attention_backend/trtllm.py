@@ -827,11 +827,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         assert self.request_ids is not None
         if self.kv_cache_manager is not None:
             # Copy blocks for all context requests
-            self.kv_cache_manager.impl.copy_batch_block_offsets(
+            self.kv_cache_manager.copy_batch_block_offsets(
                 self.host_kv_cache_block_offsets,
                 self.request_ids[:self.num_contexts], 1, 0)
             # Copy blocks for all generation requests
-            self.kv_cache_manager.impl.copy_batch_block_offsets(
+            self.kv_cache_manager.copy_batch_block_offsets(
                 self.host_kv_cache_block_offsets,
                 self.request_ids[self.num_contexts:], self.beam_width,
                 self.num_contexts)
@@ -1269,6 +1269,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         assert not metadata.is_cross, "TRT-LLM Attention does not support cross attention yet."
 
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.synchronize()
+
         use_paged_context_fmha = (
             metadata.runtime_features.chunked_prefill
             or metadata.runtime_features.cache_reuse
@@ -1372,6 +1375,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             is_fused_qkv=not metadata.is_cross and k is None,
             update_kv_cache=not metadata.is_cross or k is not None,
             attention_mask=attention_mask)
+
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.synchronize()
 
         if use_nvfp4_output:
             return output, output_sf

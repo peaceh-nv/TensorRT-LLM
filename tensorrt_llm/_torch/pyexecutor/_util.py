@@ -39,7 +39,7 @@ from .resource_manager import (KVCacheManager, PeftCacheManager,
                                ResourceManager, ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
-from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
+from .scheduler import (BindMicroBatchScheduler, GuaranteedNoEvictScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
 
@@ -462,6 +462,7 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
+                vocab_size=config.vocab_size,
                 max_beam_width=self._max_beam_width,
                 is_draft=model_engine.is_draft_model,
                 kv_connector_manager=self._kv_connector_manager
@@ -582,6 +583,7 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
+                vocab_size=config.vocab_size,
                 max_num_tokens=self._max_num_tokens,
                 model_config=binding_model_config,
                 max_beam_width=self._max_beam_width,
@@ -772,12 +774,9 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
-    capacity_scheduler = BindCapacityScheduler(
+    capacity_scheduler = GuaranteedNoEvictScheduler(
         scheduler_capacity,
-        kv_cache_manager.impl if kv_cache_manager is not None else None,
-        peft_cache_manager.impl if peft_cache_manager is not None else None,
-        scheduler_config.capacity_scheduler_policy,
-        two_step_lookahead=mapping.has_pp())
+        kv_cache_manager if kv_cache_manager is not None else None)
     mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                            ctx_chunk_config)
     scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)

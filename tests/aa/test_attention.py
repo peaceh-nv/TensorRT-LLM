@@ -1,12 +1,11 @@
 import math
+import unittest
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
 import flashinfer
 import pytest
 import torch
-# from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from fake_kv_cache_manager import KVCacheManager
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import (AttentionBackend,
@@ -15,6 +14,8 @@ from tensorrt_llm._torch.attention_backend import (AttentionBackend,
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.resource_manager import \
+    KVCacheManagerV2 as KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -244,12 +245,13 @@ def produce_outputs(
     for layer_idx in range(s.num_layers):
         buffer = kv_cache_manager.get_buffers(layer_idx)
         batch_cache_indices_flatten = [
-            i for j in kv_cache_manager.get_batch_cache_indices(
-                request_ids, layer_idx) for i in j
+            i for j in kv_cache_manager.get_batch_cache_indices(request_ids, 0)
+            for i in j
         ]
         print(batch_cache_indices_flatten)
         kv_cache_layer = kv_cache[layer_idx]
-        print(buffer.shape, kv_cache_layer.shape)
+        print(buffer.shape, buffer.dtype, kv_cache_layer.shape,
+              kv_cache_layer.dtype)
         print(buffer.data_ptr(), buffer[1].data_ptr(), kv_cache.data_ptr())
         for ii, idx in enumerate(batch_cache_indices_flatten):
             buffer[idx].copy_(kv_cache_layer[ii])
@@ -783,5 +785,4 @@ def test_attention_backend_ifb(s: PagedScenario):
 
 
 if __name__ == "__main__":
-    # test_attention_backend(Scenario(num_layers=1))
-    test_attention_backend_ifb(PagedScenario(num_layers=1, num_generations=5))
+    unittest.main()

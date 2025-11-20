@@ -14,7 +14,8 @@ from parameterized import parameterized
 
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
     traverse_post_order
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import CudaStream
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import (CudaStream,
+                                                              SlidingWindowSize)
 from tensorrt_llm.runtime.kv_cache_manager_v2._eviction_controller import \
     PageStatus
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
@@ -482,4 +483,5 @@ class TestDisagg(TestKVCacheManagerV2):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    a = TestNoBatching()
+    a.test_sol_mem_utilization()
