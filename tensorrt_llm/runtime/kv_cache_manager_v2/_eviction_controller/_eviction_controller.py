@@ -8,7 +8,7 @@ from .._exceptions import OutOfPagesError
 from .._life_cycle_registry import LifeCycleId
 from .._storage._core import PoolGroupIndex
 from .._utils import (TypedIndexList, assert_critical, make_typed, noexcept,
-                      unwrap_optional)
+                      typed_enumerate, typed_len, unwrap_optional)
 
 
 @runtime_checkable
@@ -188,9 +188,7 @@ class PerLevelEvictionController:  # for one cache level
         assert NDEBUG or len(min_num_pages) == self.num_pool_groups
         ret = make_typed(lambda: list[EvictablePage](), self.num_pool_groups)
         try:
-            for pg_idx, count in enumerate(min_num_pages):
-                pg_idx = PoolGroupIndex(pg_idx)
-                count = min_num_pages[pg_idx]
+            for pg_idx, count in typed_enumerate(min_num_pages):
                 policy = self._policies[pg_idx]
                 if (len(policy) + len(ret[pg_idx])) < count:
                     raise OutOfPagesError(
@@ -227,4 +225,4 @@ class PerLevelEvictionController:  # for one cache level
 
     @property
     def num_pool_groups(self) -> PoolGroupIndex:
-        return PoolGroupIndex(len(self._policies))
+        return typed_len(self._policies)
