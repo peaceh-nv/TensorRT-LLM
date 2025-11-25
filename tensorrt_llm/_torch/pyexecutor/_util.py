@@ -39,7 +39,7 @@ from .resource_manager import (KVCacheManager, PeftCacheManager,
                                ResourceManager, ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
-from .scheduler import (BindMicroBatchScheduler, GuaranteedNoEvictScheduler,
+from .scheduler import (BindMicroBatchScheduler, MaxUtilizationScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
 
@@ -51,6 +51,7 @@ def get_kv_cache_manager_cls(model_config: ModelConfig):
     sparse_attn_config = model_config.sparse_attention_config
     if is_mla(config):
         return KVCacheManager
+        # return KVCacheManagerV2
     elif is_nemotron_hybrid(config):
         return MambaHybridCacheManager
     else:
@@ -58,6 +59,7 @@ def get_kv_cache_manager_cls(model_config: ModelConfig):
             return get_sparse_attn_kv_cache_manager(sparse_attn_config)
         else:
             return KVCacheManager
+            # return KVCacheManagerV2
 
 
 class KvCacheCreator:
@@ -774,7 +776,16 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
-    capacity_scheduler = GuaranteedNoEvictScheduler(
+    # capacity_scheduler = BindCapacityScheduler(
+    #     scheduler_capacity,
+    #     kv_cache_manager.impl if kv_cache_manager is not None else None,
+    #     peft_cache_manager.impl if peft_cache_manager is not None else None,
+    #     scheduler_config.capacity_scheduler_policy,
+    #     two_step_lookahead=mapping.has_pp())
+    # capacity_scheduler = GuaranteedNoEvictScheduler(
+    #     scheduler_capacity,
+    #     kv_cache_manager if kv_cache_manager is not None else None)
+    capacity_scheduler = MaxUtilizationScheduler(
         scheduler_capacity,
         kv_cache_manager if kv_cache_manager is not None else None)
     mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
@@ -787,6 +798,8 @@ def create_py_executor_instance(
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,
         cache_transceiver_config)
+    if max_num_sequences > 10000:
+        print(f"max_num_sequences: {max_num_sequences}")
     return PyExecutor(
         resource_manager,
         scheduler,

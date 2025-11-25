@@ -22,10 +22,11 @@ from tensorrt_llm import LLM
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.pyexecutor.config import MoeLoadBalancerConfig
-from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
-                                 EagleDecodingConfig, KvCacheConfig, MoeConfig,
-                                 MTPDecodingConfig, NGramDecodingConfig,
-                                 SamplingParams, TorchCompileConfig)
+from tensorrt_llm.llmapi import (AutoDecodingConfig, CapacitySchedulerPolicy,
+                                 CudaGraphConfig, EagleDecodingConfig,
+                                 KvCacheConfig, MoeConfig, MTPDecodingConfig,
+                                 NGramDecodingConfig, SamplingParams,
+                                 SchedulerConfig, TorchCompileConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
@@ -34,6 +35,8 @@ from ..conftest import (get_device_count, get_device_memory, llm_models_root,
                         skip_pre_hopper, skip_ray)
 from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness)
+
+# from tensorrt_llm.bindings.executor import SchedulerConfig, CapacitySchedulerPolicy
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
@@ -3361,8 +3364,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     ])
     def test_w4_1gpu(self, kv_cache_dtype, moe_backend, cuda_graph,
                      overlap_scheduler, mocker):
-        MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-20b"
-        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        # MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-20b"
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 32768)
+        mocker.patch.object(GSM8K, "MAX_INPUT_LEN", 20)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
         if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
@@ -3372,16 +3376,21 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.05,
                                         dtype=kv_cache_dtype)
 
-        llm = LLM(MODEL_PATH,
+        llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=1,
                   pipeline_parallel_size=1,
                   moe_expert_parallel_size=1,
                   kv_cache_config=kv_cache_config,
                   **pytorch_config,
-                  moe_config=MoeConfig(backend=moe_backend))
+                  moe_config=MoeConfig(backend=moe_backend),
+                  scheduler_config=SchedulerConfig(
+                      capacity_scheduler_policy=CapacitySchedulerPolicy.
+                      MAX_UTILIZATION))
+        #   scheduler_config=SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT))
+        #   scheduler_config=SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT))
 
         with llm:
             model_name = "GPT-OSS/MXFP4"

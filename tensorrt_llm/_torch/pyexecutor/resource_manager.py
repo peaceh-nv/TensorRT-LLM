@@ -97,6 +97,12 @@ class BaseResourceManager(ABC):
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         raise NotImplementedError
 
+    def get_needed_resource_for_next_step(
+            self,
+            request: LlmRequest,
+            two_steps_lookahead: bool = False) -> int:
+        pass
+
     def add_dummy_requests(self, request_ids: List[int]):
         pass
 
@@ -434,6 +440,32 @@ class KVCacheManager(BaseResourceManager):
             remaining_tokens / self.tokens_per_block)
         return need_blocks
 
+    def get_needed_resource_for_next_step(
+            self,
+            request: LlmRequest,
+            two_steps_lookahead: bool = False) -> int:
+        """
+        Calculate the number of KV cache blocks needed for the next step.
+        This is the Python wrapper for the C++ getNeededBlocksOneStep function.
+
+        Args:
+            request: The request for which to calculate needed blocks
+            two_steps_lookahead: Whether to look ahead two steps (for speculative decoding)
+
+        Returns:
+            Number of blocks needed for the next step
+        """
+        # For VSWA (Variable Sliding Window Attention), we need to specify window size
+        # For now, use the first window size as default
+        # TODO: Support proper window size selection for VSWA
+        window_size = self.max_attention_window_vec[0]
+        print(
+            f"window_size: {window_size}, blocks needed: {self.impl.get_needed_blocks_one_step(request, two_steps_lookahead, window_size)}"
+        )
+        return self.impl.get_needed_blocks_one_step(request,
+                                                    two_steps_lookahead,
+                                                    window_size)
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
             context_batch = scheduled_batch.context_requests
@@ -507,6 +539,8 @@ class KVCacheManager(BaseResourceManager):
         # occur.
         num_extra_decoding_steps: int = 0,
     ):
+        print(f"running add_dummy_requests in KVCacheManager")
+
         beam_width = max_beam_width
         requests = []
         for i, req_id in enumerate(request_ids):
@@ -1582,7 +1616,7 @@ class KVCacheManagerV2(BaseResourceManager):
             num_extra_decoding_steps:
         int = 0,  # TODO: support num_extra_decoding_steps
     ):
-
+        print(f"running add_dummy_requests in KVCacheManagerV2")
         beam_width = max_beam_width
         requests = []
         for i, req_id in enumerate(request_ids):
@@ -1757,6 +1791,93 @@ class KVCacheManagerV2(BaseResourceManager):
         # need_blocks = num_context_blocks + math.ceil(
         #     remaining_tokens / self.tokens_per_block)
         # return need_blocks
+        return 0
+
+    def get_needed_resource_for_next_step(
+            self,
+            request: LlmRequest,
+            two_steps_lookahead: bool = False) -> int:
+        """
+        Calculate the number of KV cache blocks needed for the next step.
+        Python implementation matching C++ getNeededBlocksOneStep.
+
+        Args:
+            request: The request for which to calculate needed blocks
+            two_steps_lookahead: Whether to look ahead two steps (for speculative decoding)
+
+        Returns:
+            Number of blocks needed for the next step
+        """
+        from .llm_request import LlmRequestState
+
+        # Get window size - use first window for now (TODO: support VSWA)
+        window_size = self.max_attention_window_vec[0]
+        if window_size is None:
+            window_size = self.max_seq_len
+
+        # Handle context init state (first chunk) or disagg generation init
+        if request.state == LlmRequestState.CONTEXT_INIT and request.is_first_context_chunk:
+            chunk_size = request.max_new_tokens
+            max_draft_tokens_to_add = len(getattr(request, 'draft_tokens', []))
+
+            # For cross KV, use encoder output length; for self KV, use prompt length
+            is_cross_kv = self.kv_cache_type == CacheTypeCpp.CROSS
+            if is_cross_kv:
+                # For encoder-decoder models, use encoder input tokens length as proxy
+                encoder_tokens = getattr(request, 'encoder_input_tokens', None)
+                prompt_len = len(
+                    encoder_tokens) if encoder_tokens else request.prompt_len
+            else:
+                prompt_len = request.prompt_len
+
+            prompt_cache_len = min(prompt_len + max_draft_tokens_to_add,
+                                   window_size + chunk_size)
+            # Note: sink_bubble_length is not directly accessible, simplified to 0 for now
+
+            num_shared_blocks = prompt_cache_len // self.tokens_per_block
+            num_unshared_tokens = prompt_cache_len % self.tokens_per_block
+            beam_width = request.sampling_config.beam_width
+            num_unshared_blocks = math.ceil(
+                num_unshared_tokens / self.tokens_per_block) * beam_width
+            num_required_blocks = num_shared_blocks + num_unshared_blocks
+            return num_required_blocks
+
+        # Handle generation in progress
+        if request.state == LlmRequestState.GENERATION_IN_PROGRESS:
+            # Cross KV cache doesn't grow during generation
+            is_cross_kv = self.kv_cache_type == CacheTypeCpp.CROSS
+            if is_cross_kv:
+                return 0
+
+            # Get current number of tokens from kv_cache
+            if request.py_request_id not in self.kv_cache_map:
+                return 0
+
+            kv_cache = self.kv_cache_map[request.py_request_id]
+            num_curr_tokens = kv_cache.history_length
+
+            generated_tokens = num_curr_tokens - request.prompt_len
+            max_tokens_to_add_to_kv_cache = request.max_new_tokens - generated_tokens
+
+            num_draft_tokens = len(getattr(request, 'draft_tokens', []))
+            tokens_per_step = num_draft_tokens + 1
+            max_tokens_to_add = min(
+                (2 if two_steps_lookahead else 1) * tokens_per_step,
+                max_tokens_to_add_to_kv_cache)
+            num_next_tokens = num_curr_tokens + max_tokens_to_add
+
+            # Check if would exceed max window (simplified - no metadata access)
+            max_token_num = window_size
+            if num_next_tokens > max_token_num:
+                return 0
+
+            num_curr_blocks = math.ceil(num_curr_tokens / self.tokens_per_block)
+            num_next_blocks = math.ceil(num_next_tokens / self.tokens_per_block)
+            beam_width = request.sampling_config.beam_width
+            num_required_blocks = (num_next_blocks -
+                                   num_curr_blocks) * beam_width
+            return num_required_blocks
+
         return 0
 
     # TODO: refactor get_cache_size_per_token and get_cache_bytes_per_token to use the same logic
@@ -2035,6 +2156,13 @@ class PeftCacheManager(BaseResourceManager):
         return 0
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
+        return 0
+
+    def get_needed_resource_for_next_step(
+            self,
+            request: LlmRequest,
+            two_steps_lookahead: bool = False) -> int:
+        """PEFT cache manager doesn't use block-based resources."""
         return 0
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):

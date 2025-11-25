@@ -197,6 +197,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
 {
+    std::cout << "GuaranteedNoEvictScheduler::impl<" << StaticBatchScheduling << ">" << std::endl;
     RequestVector scheduledRequests;
 
     // Now check if we can add pending requests
@@ -340,6 +341,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
     kv_cache_manager::BaseKVCacheManager& kvCacheManager, OptionalRef<BasePeftCacheManager const> peftCacheManager,
     RequestList const& activeRequests) const
 {
+    // std::cout << "MaxUtilizationScheduler::operator()" << std::endl;
     kvCacheManager.startScheduling();
 
     // The optimization of delaying requests won't work for variable window attention
@@ -394,7 +396,8 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
             scheduledBlocksManager, peftCacheManager, numScheduledPeftPages, seenTaskIds);
         if (wasScheduled)
         {
-            TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu -> start", req->mRequestId);
+            // TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu -> start", req->mRequestId);
+            // std::cout << "MaxUtilizationScheduler: request ID " << req->mRequestId << " -> start" << std::endl;
             reqIt++;
         }
         else
@@ -409,7 +412,9 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
                 // Here we simulate freeing the kvCache blocks associated with that sequence
                 kvCacheManager.schedulingRemoveSequence((*lastStartedReqIt)->mRequestId);
                 pausedRequests.emplace_back(*lastStartedReqIt);
-                TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu -> pause", (*lastStartedReqIt)->mRequestId);
+                // TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu -> pause", (*lastStartedReqIt)->mRequestId);
+                // std::cout << "MaxUtilizationScheduler: request ID " << (*lastStartedReqIt)->mRequestId << " -> pause"
+                // << std::endl;
                 reqItEnd = std::next(lastStartedReqIt).base();
             }
             else
@@ -427,6 +432,7 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
     OptionalRef<BasePeftCacheManager const> peftCacheManager, SizeType32& numScheduledPeftPages,
     std::unordered_set<uint64_t>& seenTaskIds)
 {
+    // std::cout << "trySchedulingRequestMaxUtilization" << std::endl;
     if (scheduledRequests.size() < static_cast<std::size_t>(maxNumRequests))
     {
         bool reqHasLora = req->getLoraTaskId().has_value();

@@ -317,6 +317,8 @@ class PyExecutor:
                     "Please disable disagg/pipeline parallelism scheduler.")
         self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
         self.max_seq_len = max_seq_len
+        if self.max_seq_len > 10000:
+            print(f"max_seq_len: {self.max_seq_len}")
 
         self.worker_started = False
         self.worker_lock = threading.Lock()

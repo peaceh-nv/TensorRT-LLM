@@ -2068,6 +2068,9 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
         auto const numUnSharedBlocks
             = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.beamWidth;
         auto const numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
+        std::cout << "In context init state, request ID: " << req.mRequestId << " numSharedBlocks: " << numSharedBlocks
+                  << " numUnSharedBlocks: " << numUnSharedBlocks << " numRequiredBlocks: " << numRequiredBlocks
+                  << std::endl;
         return numRequiredBlocks;
     }
 
@@ -2093,6 +2096,11 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
         auto const numCurrBlocks = tc::ceilDiv(numCurrTokens, getTokensPerBlock());
         auto const numNextBlocks = tc::ceilDiv(numNextTokens, getTokensPerBlock());
         auto const numRequiredBlocks = (numNextBlocks - numCurrBlocks) * req.mSamplingConfig.beamWidth;
+        std::cout << "In generation progress state, request ID: " << req.mRequestId
+                  << " numCurrTokens: " << numCurrTokens << " generatedTokens: " << generatedTokens
+                  << " maxTokensToAddToKVCache: " << maxTokensToAddToKVCache << " tokensPerStep: " << tokensPerStep
+                  << " maxTokensToAdd: " << maxTokensToAdd << " numNextTokens: " << numNextTokens
+                  << " numRequiredBlocks: " << numRequiredBlocks << std::endl;
         return numRequiredBlocks;
     }
 
