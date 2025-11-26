@@ -1,25 +1,39 @@
 from collections.abc import Callable, Sequence
 from typing import Any, cast
 
+from ...._utils import nvtx_range
 from .._block_radix_tree import BlockRadixTree
-from .._common import (GPU_LEVEL, BlockOrdinal, CacheLevel, CacheTier, LayerId,
-                       MemAddress, Priority, TokenIdExt)
+from .._common import (
+    GPU_LEVEL,
+    BlockOrdinal,
+    CacheLevel,
+    CacheTier,
+    LayerId,
+    MemAddress,
+    Priority,
+    TokenIdExt,
+)
 from .._config import DataRole, KVCacheManagerConfig
 from .._eviction_controller import PageStatus
-from .._life_cycle_registry import (LayerGroupId, LifeCycle, LifeCycleId,
-                                    LifeCycleRegistry)
+from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._storage._config import create_storage_config
 from .._storage._core import PoolGroupIndex
 from .._storage_manager import StorageManager
-from .._utils import (HomoTuple, TypedIndexList, div_up, filled_list,
-                      init_cuda_once, typed_enumerate, typed_range,
-                      unwrap_weakref)
+from .._utils import (
+    HomoTuple,
+    TypedIndexList,
+    div_up,
+    filled_list,
+    init_cuda_once,
+    typed_enumerate,
+    typed_range,
+    unwrap_weakref,
+)
 from ._kv_cache import _KVCache
 
 
 class KVCacheManager:
-    __slots__ = ('_init_config', '_life_cycles', '_radix_tree', '_storage',
-                 '__weakref__')
+    __slots__ = ("_init_config", "_life_cycles", "_radix_tree", "_storage", "__weakref__")
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
     _radix_tree: BlockRadixTree
@@ -29,8 +43,7 @@ class KVCacheManager:
         init_cuda_once()
         self._init_config = config
         self._life_cycles = LifeCycleRegistry(config)
-        self._radix_tree = BlockRadixTree(self._life_cycles,
-                                          config.tokens_per_block)
+        self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block)
         storage_config = create_storage_config(config)
         self._storage = StorageManager(self, storage_config)
 
@@ -41,13 +54,15 @@ class KVCacheManager:
         for ref in self._radix_tree.clear():
             assert unwrap_weakref(ref).status == PageStatus.DROPPABLE
             self._storage.exclude_from_eviction(unwrap_weakref(ref))
-        for l in self._storage._levels:
-            for pg_idx in typed_range(l.storage.num_pool_groups):
-                assert l.controller.num_evictable_pages(pg_idx) == 0
+        for level in self._storage._levels:
+            for pg_idx in typed_range(level.storage.num_pool_groups):
+                assert level.controller.num_evictable_pages(pg_idx) == 0
 
-    def get_mem_pool_base_address(self, layer_id: LayerId,
-                                  data_role: DataRole) -> MemAddress:
-        "Get the base address of the memory pool holding pages for the given layer and data role. It's guaranteed that for one layer, multiple buffers of the same size have the same base address."
+    def get_mem_pool_base_address(self, layer_id: LayerId, data_role: DataRole) -> MemAddress:
+        """
+        Get the base address of the memory pool holding pages for the given layer and data role.
+        It's guaranteed that for one layer, multiple buffers of the same size have the same base address.
+        """
         return self._storage.get_mem_pool_base_address(layer_id, data_role)
 
     # Currently always equals to page size. In the future, that will change when kernels support page stride.
@@ -55,41 +70,45 @@ class KVCacheManager:
         attr = self._storage.get_buffer_attr(layer_id, data_role)
         return attr.size
 
-    def get_page_index_upper_bound(self, layer_id: LayerId,
-                                   data_role: DataRole) -> int:
-        'The upper bound of page indices for the given layer and data role. Note that this is not the same as the max number of pages available for this layer and data role. Internally, multiple buffers may share one memory pool. The purpose of this API is just in case users want to wrap the memory pool as a tensor with known shape.'
+    def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int:
+        """
+        The upper bound of page indices for the given layer and data role.
+        Note that this is not the same as the max number of pages available for this layer and data role.
+        Internally, multiple buffers may share one memory pool.
+        The purpose of this API is just in case users want to wrap the memory pool as a tensor with known shape.
+        """
         storage = self._storage
         lc_id = storage._layer_to_life_cycle_ids[layer_id]
         pg_idx = storage.get_pool_group_index(lc_id)
         return storage._levels[GPU_LEVEL].storage._pool_groups[pg_idx].num_slots
 
     # lora_task_id: match lora_task_id before matching any tokens.
-    # stream: blocks are allocated and made ready in this stream. Later grow() also makes blocks ready in this stream, and later commit() calls also assume data are written in this stream.
+    # stream: blocks are allocated and made ready in this stream. Later grow() also makes blocks ready in this stream,
+    #         and later commit() calls also assume data are written in this stream.
     # custom_priority_callback: takes block index and layer sliding window size, returns priority.
     # If priority returned is higher than existing priority for reused blocks, the block priority is updated.
-    # Newly created KV cache is suspended. You need to call resume() with a cuda stream to make it active & ready in that stream.
+    # Newly created KV cache is suspended. You need to call resume() with a cuda stream to
+    # make it active & ready in that stream.
     # Returns None if suspended=False and we don't have enough resource.
     # This call will attempt to reuse KV cache blocks.
-    # It's user responsibility to remove the last token from prompts if we need to re-compute the token generated by prefill.
+    # It's user responsibility to remove the last token from prompts if we need to
+    # re-compute the token generated by prefill.
 
+    @nvtx_range("create_kv_cache")
     def create_kv_cache(
         self,
         lora_task_id: int | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
-        custom_priority_callback: Callable[
-            [BlockOrdinal, LifeCycle],
-            Priority] = lambda _, __: Priority.DEFAULT
+        custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
+        __: Priority.DEFAULT,
     ) -> _KVCache:
-        return _KVCache(self, lora_task_id, input_tokens, id,
-                        custom_priority_callback)
+        return _KVCache(self, lora_task_id, input_tokens, id, custom_priority_callback)
 
-    # If best_efforts is True, we will try to resize the quota to the largest possible value that is still <= quota, and returns False only when we cannot resize the quota at all.
+    # If best_efforts is True, we will try to resize the quota to the largest possible value that is still <= quota,
+    # and returns False only when we cannot resize the quota at all.
     # If best_efforts is False, we will resize the quota to the exact value of quota, and give up if not possible.
-    def resize(self,
-               cache_level: CacheLevel,
-               quota: int,
-               best_efforts: bool = False) -> bool:
+    def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool:
         raise NotImplementedError("Not implemented")
 
     def get_quota(self, cache_level: CacheLevel) -> int:
@@ -106,7 +125,10 @@ class KVCacheManager:
 
     @property
     def allow_seq_rebasing(self) -> bool:
-        'If True, when we commit a full block, we will try to find a existing reusable block with the same tokens and reuse that block instead to save some memory. Intra-batch reuse will be enabled if this is True.'
+        """
+        If True, when we commit a full block, we will try to find a existing reusable block with the same tokens
+        and reuse that block instead to save some memory. Intra-batch reuse will be enabled if this is True.
+        """
         return True
 
     @property
@@ -120,33 +142,28 @@ class KVCacheManager:
     def layer_grouping(self) -> HomoTuple[HomoTuple[LayerId]]:
         layer_to_life_cycle_ids = self._storage._layer_to_life_cycle_ids
         num_life_cycles = self._life_cycles.size
-        grouping = dict[LifeCycleId, list[LayerId]]({
-            i: []
-            for i in typed_range(num_life_cycles)
-        })
+        grouping = dict[LifeCycleId, list[LayerId]]({i: [] for i in typed_range(num_life_cycles)})
         for layer_id, life_cycle_id in typed_enumerate(layer_to_life_cycle_ids):
             grouping[life_cycle_id].append(layer_id)
         return tuple(tuple(grouping[i]) for i in typed_range(num_life_cycles))
 
     # @TODO: need updating when dynamic resizing is supported.
-    def clamp_max_seq_len_for_mem(self, batch_size: int,
-                                  model_max_seq_len: int) -> int:
-        'Get the max possible sequence length limited by the GPU memory pools.'
-        assert batch_size > 0
+    def clamp_max_seq_len_for_mem(self, batch_size: int) -> int:
+        "Get the max possible sequence length limited by the GPU memory pools."
         tokens_per_block = self.tokens_per_block
         life_cycles = self._life_cycles
         storage = self._storage
         num_pool_groups = storage.num_pool_groups
         remaining_slots = cast(
             TypedIndexList[PoolGroupIndex, int],
-            [storage.num_slots(pg) for pg in typed_range(num_pool_groups)])
+            [storage.num_slots(pg) for pg in typed_range(num_pool_groups)],
+        )
         lc_to_pg_idx = storage._life_cycle_grouping
 
         def get_num_slots(seq_len: int) -> TypedIndexList[PoolGroupIndex, int]:
             ret = filled_list(0, num_pool_groups)
             for lc_id, lc in life_cycles.items():
-                stale_range = _KVCache._get_stale_range(tokens_per_block,
-                                                        seq_len, lc)
+                stale_range = _KVCache._get_stale_range(tokens_per_block, seq_len, lc)
                 num_stale_blocks = stale_range[1] - stale_range[0]
                 num_slots = div_up(seq_len, tokens_per_block) - num_stale_blocks
                 pg_idx = lc_to_pg_idx[lc_id]
@@ -156,17 +173,23 @@ class KVCacheManager:
         for pg in typed_range(num_pool_groups):
             remaining_slots[pg] -= get_num_slots(1)[pg] * (batch_size - 1)
             assert remaining_slots[pg] >= 0
-        is_enough = lambda num_blocks: all(cnt <= rem for cnt, rem in zip(
-            get_num_slots(num_blocks * tokens_per_block), remaining_slots))
+
+        def is_enough(num_blocks: int) -> bool:
+            return all(
+                cnt <= rem
+                for cnt, rem in zip(get_num_slots(num_blocks * tokens_per_block), remaining_slots)
+            )
+
         assert is_enough(1)
         lb = 1
-        ub = div_up(model_max_seq_len, tokens_per_block)
-        if is_enough(ub):
-            return model_max_seq_len
-        while lb < ub:
+        ub = lb
+        while is_enough(ub):
+            lb = ub
+            ub *= 2
+        while lb < ub - 1:
             mid = (lb + ub) // 2
             if is_enough(mid):
                 lb = mid
             else:
-                ub = mid - 1
-        return min(lb * tokens_per_block, model_max_seq_len)
+                ub = mid
+        return lb * tokens_per_block
