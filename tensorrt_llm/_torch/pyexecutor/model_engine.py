@@ -141,6 +141,7 @@ class PyTorchModelEngine(ModelEngine):
                                                  torch.nn.Module]] = None,
         model: Optional[torch.nn.Module] = None,
     ):
+        gc.disable()
         self.forward_pass_callable = None
         self.ub_buffers = None
         (
