@@ -10,12 +10,10 @@ from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
-                                          EagleDecodingConfig, KvCacheConfig,
-                                          MTPDecodingConfig, PeftCacheConfig,
-                                          SamplerType, SchedulerConfig,
-                                          SparseAttentionConfig,
-                                          SpeculativeConfig, TorchLlmArgs)
+from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
+    KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
+    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -38,8 +36,8 @@ from .resource_manager import (KVCacheManager, KVCacheManagerV2,
                                ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
-from .scheduler import (BindMicroBatchScheduler, MaxUtilizationScheduler,
-                        SimpleScheduler)
+from .scheduler import (BindMicroBatchScheduler, GuaranteedNoEvictScheduler,
+                        MaxUtilizationScheduler, SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -77,6 +75,7 @@ class KvCacheCreator:
         speculative_config: SpeculativeConfig,
         sparse_attention_config: SparseAttentionConfig,
         profiling_stage_data: Optional[dict],
+        scheduler_config: Optional[SchedulerConfig] = None,
     ):
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
@@ -95,6 +94,10 @@ class KvCacheCreator:
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
         self._profiling_stage_data = profiling_stage_data
+        self._scheduler_config = scheduler_config
+        self._capacity_scheduler_policy = (
+            scheduler_config.capacity_scheduler_policy if scheduler_config
+            is not None else CapacitySchedulerPolicy.GUARANTEED_NO_EVICT)
         self._kv_cache_manager_cls = get_kv_cache_manager_cls(
             model_engine.model.model_config)
         if self._kv_cache_manager_cls == KVCacheManager and kv_cache_config.use_kv_cache_manager_v2:
@@ -476,6 +479,7 @@ class KvCacheCreator:
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
                 sparse_attn_config=sparse_attn_config,
+                capacity_scheduler_policy=self._capacity_scheduler_policy,
             )
         elif is_nemotron_hybrid(config):
             if self._max_beam_width > 1:
@@ -600,6 +604,7 @@ class KvCacheCreator:
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
                 sparse_attn_config=sparse_attn_config,
+                capacity_scheduler_policy=self._capacity_scheduler_policy,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
@@ -784,12 +789,18 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
-    # capacity_scheduler = GuaranteedNoEvictScheduler(
-    #     scheduler_capacity,
-    #     kv_cache_manager if kv_cache_manager is not None else None)
-    capacity_scheduler = MaxUtilizationScheduler(
-        scheduler_capacity,
-        kv_cache_manager if kv_cache_manager is not None else None)
+    # Select the capacity scheduler based on the scheduler_config policy
+    capacity_scheduler_policy = (scheduler_config.capacity_scheduler_policy
+                                 if scheduler_config is not None else
+                                 CapacitySchedulerPolicy.GUARANTEED_NO_EVICT)
+    if capacity_scheduler_policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
+        capacity_scheduler = MaxUtilizationScheduler(
+            scheduler_capacity,
+            kv_cache_manager if kv_cache_manager is not None else None)
+    else:
+        capacity_scheduler = GuaranteedNoEvictScheduler(
+            scheduler_capacity,
+            kv_cache_manager if kv_cache_manager is not None else None)
     mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                            ctx_chunk_config)
     scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)

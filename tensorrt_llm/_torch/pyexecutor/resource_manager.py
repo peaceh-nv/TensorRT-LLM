@@ -16,7 +16,8 @@ from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper, copy_batch_block_offsets_to_device)
-from tensorrt_llm.llmapi.llm_args import (KvCacheConfig, PeftCacheConfig,
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                          KvCacheConfig, PeftCacheConfig,
                                           PybindMirror)
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
@@ -1292,10 +1293,13 @@ class KVCacheManagerV2(BaseResourceManager):
         max_beam_width: int = 1,
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+        capacity_scheduler_policy:
+        CapacitySchedulerPolicy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
+        self.capacity_scheduler_policy = capacity_scheduler_policy
 
         assert self.dtype != DataType.NVFP4, "NVFP4 is not supported for KVCacheManagerV2"
         assert kv_connector_manager is None, "kv_connector_manager is not supported for KVCacheManagerV2"
@@ -1578,7 +1582,17 @@ class KVCacheManagerV2(BaseResourceManager):
         return max_num_pages // self.kv_factor
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
-    def prepare_resources_1(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        """Unified prepare_resources that dispatches based on capacity_scheduler_policy."""
+        if self.capacity_scheduler_policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
+            self._prepare_resources_max_utilization(scheduled_batch)
+        else:
+            # Default to GUARANTEED_NO_EVICT
+            self._prepare_resources_guaranteed_no_evict(scheduled_batch)
+
+    @nvtx_range("prepare_resources_kv_cache_manager_v2_guaranteed_no_evict")
+    def _prepare_resources_guaranteed_no_evict(
+            self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
             context_batch = scheduled_batch.context_requests
             generation_batch = scheduled_batch.generation_requests
@@ -1635,8 +1649,9 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self)
 
-    @nvtx_range("prepare_resources_kv_cache_manager_v2_1")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    @nvtx_range("prepare_resources_kv_cache_manager_v2_max_utilization")
+    def _prepare_resources_max_utilization(self,
+                                           scheduled_batch: ScheduledRequests):
         evicted_requests = []
         no_scheduled = []
         with request_context(self.is_draft, scheduled_batch):
@@ -1678,9 +1693,6 @@ class KVCacheManagerV2(BaseResourceManager):
                         if evicted in new_generation_batch:
                             new_generation_batch.remove(evicted)
                         evicted_requests.append(evicted)
-                        print(
-                            f"evicted: {evicted.py_request_id}, state: {evicted.state}"
-                        )
 
                 if not capacity_increased:
                     # Could not increase capacity even after evicting all possible requests
@@ -1828,9 +1840,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if not can_evict:
                 continue
 
-            # Suspend the kv_cache (TestBatching line 392)
-            # try:
-            print(f"  Evicting request {req_id} to make room")
+            # Suspend the kv_cache
             kv_cache.suspend()
             evicted_request = req
             break
@@ -1858,7 +1868,6 @@ class KVCacheManagerV2(BaseResourceManager):
 
                 if not can_evict:
                     continue
-                print(f"  Evicting request {req_id} to make room 2")
                 kv_cache.suspend()
                 evicted_request = req
                 break
@@ -2132,7 +2141,7 @@ class KVCacheManagerV2(BaseResourceManager):
                             req.get_tokens(0)[kv_cache.num_committed_tokens:req.
                                               context_current_position])
                     except Exception as e:
-                        print(
+                        logger.warning(
                             f"Error committing tokens for request {req.py_request_id if hasattr(req, 'py_request_id') else req.request_id}: {e}"
                         )
                         continue
