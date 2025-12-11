@@ -38,7 +38,7 @@ from .resource_manager import (KVCacheManager, KVCacheManagerV2,
                                ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
-from .scheduler import (BindMicroBatchScheduler, GuaranteedNoEvictScheduler,
+from .scheduler import (BindMicroBatchScheduler, MaxUtilizationScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
 
@@ -784,7 +784,10 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
-    capacity_scheduler = GuaranteedNoEvictScheduler(
+    # capacity_scheduler = GuaranteedNoEvictScheduler(
+    #     scheduler_capacity,
+    #     kv_cache_manager if kv_cache_manager is not None else None)
+    capacity_scheduler = MaxUtilizationScheduler(
         scheduler_capacity,
         kv_cache_manager if kv_cache_manager is not None else None)
     mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,

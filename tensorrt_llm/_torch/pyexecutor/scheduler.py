@@ -99,6 +99,40 @@ class BindCapacityScheduler(CapacityScheduler):
                          self.peft_cache_manager)
 
 
+class MaxUtilizationScheduler(CapacityScheduler):
+
+    # only schedule requests has no_schedule_until_state <= state < no_schedule_after_state
+    no_schedule_until_state = LlmRequestState.CONTEXT_INIT
+    no_schedule_after_state = LlmRequestState.GENERATION_COMPLETE
+
+    def __init__(self, max_num_requests: int, kv_cache_manager):
+        """
+        Args:
+            max_num_requests: Maximum number of concurrent requests
+            kv_cache_manager: KV cache manager instance (KVCacheManagerV2)
+        """
+        super(MaxUtilizationScheduler, self).__init__()
+        self.max_num_requests = max_num_requests
+        self.kv_cache_manager = kv_cache_manager
+
+    def schedule_request(
+        self, active_requests: RequestList
+    ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
+
+        scheduled_requests = []
+
+        for request in active_requests:
+            req_state = request.state
+            # if request cannot be scheduled yet or request should no longer be scheduled, skip
+            if len(scheduled_requests) >= self.max_num_requests:
+                break
+            elif req_state.value < self.no_schedule_until_state.value or req_state.value >= self.no_schedule_after_state.value:
+                continue
+            scheduled_requests.append(request)
+
+        return scheduled_requests, [], []
+
+
 class GuaranteedNoEvictScheduler(CapacityScheduler):
     # only schedule requests has no_schedule_until_state <= state < no_schedule_after_state
     no_schedule_until_state = LlmRequestState.CONTEXT_INIT

@@ -1386,6 +1386,14 @@ class PyExecutor:
                 if self.kv_connector_manager:
                     can_queue = self._can_queue(scheduled_batch)
 
+                can_queue = self._can_queue(scheduled_batch)
+
+                if not can_queue:
+                    print("can not queue any more")
+                    for request in self.active_requests:
+                        if request.is_finished:
+                            print(
+                                f"request {request.py_request_id} is finished")
                 if can_queue:
 
                     # The generation requests that are do not have batch_idx,
