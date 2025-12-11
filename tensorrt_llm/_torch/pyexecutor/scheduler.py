@@ -99,6 +99,40 @@ class BindCapacityScheduler(CapacityScheduler):
                          self.peft_cache_manager)
 
 
+class MaxUtilizationScheduler(CapacityScheduler):
+
+    # only schedule requests has no_schedule_until_state <= state < no_schedule_after_state
+    no_schedule_until_state = LlmRequestState.CONTEXT_INIT
+    no_schedule_after_state = LlmRequestState.GENERATION_COMPLETE
+
+    def __init__(self, max_num_requests: int, kv_cache_manager):
+        """
+        Args:
+            max_num_requests: Maximum number of concurrent requests
+            kv_cache_manager: KV cache manager instance (KVCacheManagerV2)
+        """
+        super(MaxUtilizationScheduler, self).__init__()
+        self.max_num_requests = max_num_requests
+        self.kv_cache_manager = kv_cache_manager
+
+    def schedule_request(
+        self, active_requests: RequestList
+    ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
+
+        scheduled_requests = []
+
+        for request in active_requests:
+            req_state = request.state
+            # if request cannot be scheduled yet or request should no longer be scheduled, skip
+            if len(scheduled_requests) >= self.max_num_requests:
+                break
+            elif req_state.value < self.no_schedule_until_state.value or req_state.value >= self.no_schedule_after_state.value:
+                continue
+            scheduled_requests.append(request)
+
+        return scheduled_requests, [], []
+
+
 class GuaranteedNoEvictScheduler(CapacityScheduler):
     # only schedule requests has no_schedule_until_state <= state < no_schedule_after_state
     no_schedule_until_state = LlmRequestState.CONTEXT_INIT
@@ -205,11 +239,32 @@ class SimpleScheduler(RequestScheduler):
 
     def schedule_request(self, active_requests: RequestList,
                          inflight_request_ids: set[int]) -> SchedulerOutput:
+        # if len(active_requests) > 0:
+        #     num_context_req = 0
+        #     num_generation_req = 0
+        #     print(f"len(active_requests): {len(active_requests)}")
+        #     for request in active_requests:
+        #         if request.state == LlmRequestState.CONTEXT_INIT:
+        #             num_context_req += 1
+        #         elif request.state == LlmRequestState.GENERATION_IN_PROGRESS:
+        #             num_generation_req += 1
+        #     print(
+        #         f"num_context_req: {num_context_req}, num_generation_req: {num_generation_req}"
+        #     )
+        # if len(active_requests) == 1319:
+        #     print("the length of active_requests is 1319")
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = self.capacity_scheduler.schedule_request(
             active_requests)
 
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids)
+        # if len(active_requests) > 0:
+        #     print(f"len(fitting_requests) after mb scheduler: {len(fitting_requests)}")
+        #     print(
+        #         f"len(context_requests): {len(context_requests)}, len(generation_requests): {len(generation_requests)}"
+        #     )
+        # for req in context_requests:
+        #     print(f"context_request: {req.py_request_id if hasattr(req, 'py_request_id') else req.request_id}, state: {req.state}")
         # Convert from binding type RequestVector to list[LlmRequest],
         # so Python fields on LlmRequest won't be stripped away
         return SchedulerOutput(list(context_requests),

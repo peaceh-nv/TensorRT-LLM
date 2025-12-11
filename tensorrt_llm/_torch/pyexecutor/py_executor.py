@@ -1394,14 +1394,46 @@ class PyExecutor:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
+                    # print(
+                    #     f"len(scheduled_batch.generation_requests) before prepare_resources: {len(scheduled_batch.generation_requests)}"
+                    # )
+                    # print(
+                    #     f"len(scheduled_batch.context_requests) before prepare_resources: {len(scheduled_batch.context_requests)}"
+                    # )
                     self.resource_manager.prepare_resources(scheduled_batch)
-
+                    # print(
+                    #     f"len(scheduled_batch.generation_requests) after prepare_resources: {len(scheduled_batch.generation_requests)}"
+                    # )
+                    # print(
+                    #     f"len(scheduled_batch.context_requests) after prepare_resources: {len(scheduled_batch.context_requests)}"
+                    # )
                     self._kv_connector_start_batch(scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
                 if self.kv_connector_manager:
                     can_queue = self._can_queue(scheduled_batch)
 
+                # print(f"scheduled_batch.batch_size before can_queue: {scheduled_batch.batch_size}")
+                # if isinstance(self.resource_manager, KVCacheManagerV2):
+                #     print(f"len(scheduled_batch.generation_requests) before can_queue: {len(scheduled_batch.generation_requests)}")
+                #     print(f"len(scheduled_batch.context_requests) before can_queue: {len(scheduled_batch.context_requests)}")
+                #     print(f"scheduled_batch.batch_size: {scheduled_batch.batch_size}")
+                can_queue = self._can_queue(scheduled_batch)
+                # print(f"can_queue: {can_queue}")
+                # if self.dist.rank == 0:
+                #     print(f"len(active_requests): {len(self.active_requests)}")
+                #     print(f"scheduled_batch.batch_size: {scheduled_batch.batch_size}")
+                #     print(f"len(scheduled_batch.generation_requests): {len(scheduled_batch.generation_requests)}")
+                #     print(f"len(scheduled_batch.context_requests): {len(scheduled_batch.context_requests)}")
+                #     print(f"iter_counter: {self.iter_counter}")
+                #     for req in scheduled_batch.context_requests:
+                #         print(f"context_request: {req.py_request_id if hasattr(req, 'py_request_id') else req.request_id}, state: {req.state}")
+                if not can_queue:
+                    print("can not queue any more")
+                    for request in self.active_requests:
+                        if request.is_finished:
+                            print(
+                                f"request {request.py_request_id} is finished")
                 if can_queue:
 
                     # The generation requests that are do not have batch_idx,
@@ -1598,6 +1630,10 @@ class PyExecutor:
 
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
+        for req in finished_requests:
+            print(
+                f"req.py_request_id: {req.py_request_id}, req.state: {req.state} is finished"
+            )
         scheduled_requests = self.previous_batch.sample_state.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,

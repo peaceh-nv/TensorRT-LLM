@@ -33,6 +33,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import LayerId, _KVCache
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (exact_div,
                                                              typed_range)
 from tensorrt_llm.sampling_params import SamplingParams
@@ -1441,6 +1442,10 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(
             f"Allocated {self.quota.quota / (1 << 30)} GiB in paged KV cache.")
 
+        buffer_type = [Role.KEY]
+        if kv_cache_type != CacheTypeCpp.SELFKONLY:
+            buffer_type.append(Role.VALUE)
+
         config = KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
             vocab_size=vocab_size,
@@ -1456,17 +1461,11 @@ class KVCacheManagerV2(BaseResourceManager):
                     layer_id=layer_id,
                     buffers=[
                         BufferConfig(
-                            role=Role.KEY,
+                            role=role,
                             size=self.get_cache_bytes_per_token(
-                                local_layer_idx=layer_id, data_role=Role.KEY) *
+                                local_layer_idx=layer_id, data_role=role) *
                             tokens_per_block,
-                        ),
-                        BufferConfig(
-                            role=Role.VALUE,
-                            size=self.get_cache_bytes_per_token(
-                                local_layer_idx=layer_id, data_role=Role.VALUE)
-                            * tokens_per_block,
-                        ),
+                        ) for role in buffer_type
                     ],
                     sliding_window_size=self.max_attention_window_vec[
                         layer_id % len(self.max_attention_window_vec)],
@@ -1583,7 +1582,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return max_num_pages // self.kv_factor
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources_1(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
             context_batch = scheduled_batch.context_requests
             generation_batch = scheduled_batch.generation_requests
@@ -1627,9 +1626,7 @@ class KVCacheManagerV2(BaseResourceManager):
                             torch.cuda.current_stream().cuda_stream)
                         assert success
 
-                        nvtx_mark("set_capacity")
                         kv_cache.capacity = req.prompt_len
-                        nvtx_mark("set_capacity_end")
 
                         if self.kv_connector_manager is not None:
                             block_ids = self.get_cache_indices(req)
@@ -1638,13 +1635,246 @@ class KVCacheManagerV2(BaseResourceManager):
 
             for req in generation_batch:
                 kv_cache = self.kv_cache_map[req.py_request_id]
-                nvtx_mark("update_capacity")
                 kv_cache.capacity += 1
-                nvtx_mark("update_capacity_end")
 
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self)
+
+    @nvtx_range("prepare_resources_kv_cache_manager_v2_1")
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        evicted_requests = []
+        no_scheduled = []
+        with request_context(self.is_draft, scheduled_batch):
+            context_batch = scheduled_batch.context_requests
+            generation_batch = scheduled_batch.generation_requests
+
+            new_generation_batch: RequestList = []
+
+            for req in generation_batch:
+                if req in evicted_requests:
+                    continue
+                kv_cache = self.kv_cache_map[req.py_request_id]
+                nvtx_mark("update_capacity")
+
+                if not kv_cache.is_active:
+                    result = kv_cache.resume(
+                        torch.cuda.current_stream().cuda_stream)
+                    if not result:
+                        no_scheduled.append(req)
+                        continue
+                # Max Utilization Scheduler: Try to increase capacity for generation
+                # Recursively try to evict requests until we have enough capacity
+                max_eviction_attempts = len(generation_batch) - len(
+                    evicted_requests)
+                capacity_increased = False
+
+                for _ in range(max_eviction_attempts):
+                    try:
+                        kv_cache.capacity += 1
+                        new_generation_batch.append(req)
+                        capacity_increased = True
+                        break
+                    except OutOfPagesError:
+                        evicted = self._try_evict_requests_for_capacity(
+                            scheduled_batch, req, kv_cache.capacity + 1,
+                            kv_cache, new_generation_batch)
+                        if evicted is None:
+                            # No more requests to evict
+                            break
+                        if evicted in new_generation_batch:
+                            new_generation_batch.remove(evicted)
+                        evicted_requests.append(evicted)
+                        print(
+                            f"evicted: {evicted.py_request_id}, state: {evicted.state}"
+                        )
+
+                if not capacity_increased:
+                    # Could not increase capacity even after evicting all possible requests
+                    no_scheduled.append(req)
+                    continue
+
+                nvtx_mark("update_capacity_end")
+
+            scheduled_batch.generation_requests = new_generation_batch
+
+            # allocate KV Cache
+
+            new_context_batch: RequestList = []
+            # print(f"len(context_batch): {len(context_batch)}")
+            for req in context_batch:
+                beam_width = req.sampling_config.beam_width
+                if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
+                        'cp_type']:
+                    raise RuntimeError(
+                        "Star attention is not supported for kv cache manager v2"
+                    )
+                else:
+                    kv_cache = None
+                    # print(
+                    #     f"req.py_request_id: {req.py_request_id if hasattr(req, 'py_request_id') else req.request_id}, req.is_first_context_chunk: {req.is_first_context_chunk}, self._kv_connector_should_add_sequence(req): {self._kv_connector_should_add_sequence(req)}"
+                    # )
+                    if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
+                            req):
+                        if req.py_request_id in self.kv_cache_map:
+                            kv_cache = self.kv_cache_map[req.py_request_id]
+                        else:
+                            # Last token cannot be recovered, so we don't include it in the input tokens to look up for the block that can be reused.
+                            kv_cache = self.impl.create_kv_cache(
+                                req.lora_task_id,
+                                req.get_tokens(0)[:-1]
+                                if self.enable_block_reuse else None)
+                            assert beam_width == 1, "Currently, KVCacheManagerV2 only supports beam width 1"
+                            assert req.py_request_id not in self.kv_cache_map, f"req.py_request_id {req.py_request_id} already in kv_cache_map"
+                            self.kv_cache_map[req.py_request_id] = kv_cache
+                        if not self.enable_block_reuse:
+                            assert kv_cache.num_committed_tokens == 0
+                            kv_cache.stop_committing()
+                        else:
+                            req.context_current_position = kv_cache.num_committed_tokens
+                            chunk_size = req.context_chunk_size
+                            if req.context_current_position + req.context_chunk_size < req.prompt_len:
+                                floored_end_position = (
+                                    req.context_current_position +
+                                    req.context_chunk_size
+                                ) // self.tokens_per_block * self.tokens_per_block
+                                chunk_size = floored_end_position - req.context_current_position
+
+                            req.context_chunk_size = min(
+                                chunk_size,
+                                req.prompt_len - req.context_current_position)
+
+                        success = kv_cache.resume(
+                            torch.cuda.current_stream().cuda_stream)
+                        if not success:
+                            # print(
+                            #     f"resume no success failed to resume kv_cache for request {req.py_request_id if hasattr(req, 'py_request_id') else req.request_id}"
+                            # )
+                            no_scheduled.append(req)
+                            continue
+                        nvtx_mark("set_capacity")
+                        try:
+                            kv_cache.capacity = req.prompt_len
+                            new_context_batch.append(req)
+                        except OutOfPagesError:
+                            # print(
+                            #     f"OutOfPagesError failed to resume kv_cache for request {req.py_request_id if hasattr(req, 'py_request_id') else req.request_id}"
+                            # )
+                            no_scheduled.append(req)
+                            kv_cache.suspend()
+                            continue
+
+                        nvtx_mark("set_capacity_end")
+
+                        if self.kv_connector_manager is not None:
+                            block_ids = self.get_cache_indices(req)
+                            self.kv_connector_manager.update_state_after_alloc(
+                                req, block_ids)
+                    else:
+                        assert req.py_request_id in self.kv_cache_map, f"req.py_request_id {req.py_request_id} not in kv_cache_map"
+                        kv_cache = self.kv_cache_map[req.py_request_id]
+                        assert kv_cache.status is _KVCache.Status.ACTIVE, f"kv_cache {req.py_request_id} is not active"
+                        new_context_batch.append(req)
+
+            scheduled_batch.context_requests = new_context_batch
+
+        if self.kv_connector_manager is not None:
+            self.kv_connector_manager.build_scheduler_output(
+                scheduled_batch, self)
+
+    def _try_evict_requests_for_capacity(self,
+                                         scheduled_batch: ScheduledRequests,
+                                         current_req: LlmRequest,
+                                         needed_capacity: int, current_kv_cache,
+                                         new_generation_batch) -> LlmRequest:
+        """
+        Try to evict requests to make room for capacity allocation.
+
+        Based on TestBatching pattern (lines 387-393):
+        - Find requests that can be evicted (from the end - LIFO)
+        - Suspend their kv_caches
+        - Move them from scheduled to paused
+
+        Args:
+            scheduled_batch: Current scheduled batch
+            current_req: Request that needs capacity
+            needed_capacity: Required capacity
+            current_kv_cache: KV cache of current request
+
+        Returns:
+            List of evicted requests
+        """
+        evicted_request = None
+        all_scheduled_requests = scheduled_batch.context_requests + scheduled_batch.generation_requests
+
+        # Try to evict from the end (LIFO - Last In First Out)
+        # Don't evict the current request itself
+        # for req in reversed(scheduled_batch.generation_requests):
+        for req in reversed(new_generation_batch):
+            # for req in scheduled_batch.generation_requests:
+            if req == current_req:
+                continue
+
+            req_id = req.py_request_id if hasattr(
+                req, 'py_request_id') else req.request_id
+
+            # Check if this request has a kv_cache
+            if req_id not in self.kv_cache_map:
+                continue
+
+            kv_cache = self.kv_cache_map[req_id]
+
+            if kv_cache.status is not _KVCache.Status.ACTIVE:
+                continue
+
+            # Only evict requests that are in generation or have started context processing
+            # (similar to TestBatching line 223-227)
+            can_evict = False
+            if req.state == LlmRequestState.GENERATION_IN_PROGRESS:
+                can_evict = True
+            elif req.state == LlmRequestState.CONTEXT_INIT and \
+                 hasattr(req, 'context_current_position') and \
+                 req.context_current_position > 0:
+                can_evict = True
+
+            if not can_evict:
+                continue
+
+            # Suspend the kv_cache (TestBatching line 392)
+            # try:
+            print(f"  Evicting request {req_id} to make room")
+            kv_cache.suspend()
+            evicted_request = req
+            break
+        if evicted_request is None:
+            for req in all_scheduled_requests:
+                if req == current_req:
+                    continue
+                req_id = req.py_request_id if hasattr(
+                    req, 'py_request_id') else req.request_id
+
+                # Check if this request has a kv_cache
+                if req_id not in self.kv_cache_map:
+                    continue
+
+                kv_cache = self.kv_cache_map[req_id]
+                if kv_cache.status is not _KVCache.Status.ACTIVE:
+                    continue
+                can_evict = False
+                if req.state == LlmRequestState.GENERATION_IN_PROGRESS:
+                    can_evict = True
+                elif req.state == LlmRequestState.CONTEXT_INIT and \
+                    hasattr(req, 'context_current_position') and \
+                    req.context_current_position > 0:
+                    can_evict = True
+
+                if not can_evict:
+                    continue
+                print(f"  Evicting request {req_id} to make room 2")
+                kv_cache.suspend()
+                evicted_request = req
+                break
+        return evicted_request
 
     def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
         return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
@@ -1742,8 +1972,9 @@ class KVCacheManagerV2(BaseResourceManager):
         return requests
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        kv_cache = self.kv_cache_map.pop(request.py_request_id)
-        kv_cache.close()
+        if request.py_request_id in self.kv_cache_map:
+            kv_cache = self.kv_cache_map.pop(request.py_request_id)
+            kv_cache.close()
 
     def get_batch_cache_indices(
             self,
@@ -1798,6 +2029,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if data_role == Role.VALUE:
                 assert self.kv_cache_type != CacheTypeCpp.SELFKONLY, "SELFKONLY is the only supported cache type for value data role"
             kv_factor = 1
+            # kv_factor = 1 if self.kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         else:
             raise ValueError(f"Invalid data role: {data_role}")
 
@@ -1908,9 +2140,15 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache = self.kv_cache_map[req.py_request_id]
             if self.enable_block_reuse and not req.is_dummy_request:
                 if req.context_current_position > kv_cache.num_committed_tokens:
-                    kv_cache.commit(
-                        req.get_tokens(0)[kv_cache.num_committed_tokens:req.
-                                          context_current_position])
+                    try:
+                        kv_cache.commit(
+                            req.get_tokens(0)[kv_cache.num_committed_tokens:req.
+                                              context_current_position])
+                    except Exception as e:
+                        print(
+                            f"Error committing tokens for request {req.py_request_id if hasattr(req, 'py_request_id') else req.request_id}: {e}"
+                        )
+                        continue
                 kv_cache.stop_committing()
             else:
                 kv_cache.history_length = req.context_current_position
@@ -1931,9 +2169,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
         for pool_idx in range(self.num_pools):
             for req_id in request_ids:
-                batch_cache_indices.append(
-                    np.asarray(
-                        self.kv_cache_map[req_id].get_page_indices(pool_idx)))
+                try:
+                    batch_cache_indices.append(
+                        np.asarray(self.kv_cache_map[req_id].get_page_indices(
+                            pool_idx)))
+                except Exception as e:
+                    print(
+                        f"Error getting page indices for request {req_id} and pool {pool_idx}: {e}"
+                    )
 
         if len(batch_cache_indices) > 0:
             nvtx_mark("copy_batch_block_offsets_start")
