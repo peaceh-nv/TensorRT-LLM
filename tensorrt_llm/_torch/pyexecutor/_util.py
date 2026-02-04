@@ -11,12 +11,10 @@ from tensorrt_llm._torch.models.modeling_utils import \
 from tensorrt_llm._utils import (confidential_compute_enabled,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
-                                          EagleDecodingConfig, KvCacheConfig,
-                                          MTPDecodingConfig, PeftCacheConfig,
-                                          SamplerType, SchedulerConfig,
-                                          SparseAttentionConfig,
-                                          SpeculativeConfig, TorchLlmArgs)
+from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
+    KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
+    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -40,7 +38,8 @@ from .resource_manager import (KVCacheManager, KVCacheManagerV2,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        KVCacheV2DummyScheduler, SimpleScheduler,
+                        KVCacheV2DummyScheduler,
+                        KVCacheV2MaxUtilizationScheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
@@ -80,6 +79,7 @@ class KvCacheCreator:
         sparse_attention_config: SparseAttentionConfig,
         profiling_stage_data: Optional[dict],
         execution_stream: Optional[torch.cuda.Stream] = None,
+        scheduler_config: Optional[SchedulerConfig] = None,
     ):
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
@@ -98,6 +98,10 @@ class KvCacheCreator:
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
         self._profiling_stage_data = profiling_stage_data
+        self._scheduler_config = scheduler_config
+        self._capacity_scheduler_policy = (
+            scheduler_config.capacity_scheduler_policy if scheduler_config
+            is not None else CapacitySchedulerPolicy.GUARANTEED_NO_EVICT)
         self._kv_cache_manager_cls = get_kv_cache_manager_cls(
             model_engine.model.model_config)
         self._execution_stream = execution_stream
@@ -481,6 +485,7 @@ class KvCacheCreator:
             kv_connector_manager=self._kv_connector_manager,
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
+            capacity_scheduler_policy=self._capacity_scheduler_policy,
         )
 
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
@@ -534,20 +539,23 @@ class KvCacheCreator:
 
 
 def _create_kv_cache_manager(
-        model_engine: PyTorchModelEngine,
-        kv_cache_manager_cls,
-        mapping: Mapping,
-        kv_cache_config: KvCacheConfig,
-        tokens_per_block: int,
-        max_seq_len: int,
-        max_batch_size: int,
-        spec_config: Optional[SpeculativeConfig],
-        sparse_attn_config: Optional[SparseAttentionConfig],
-        max_num_tokens: int,
-        max_beam_width: int,
-        kv_connector_manager: Optional[KvCacheConnectorManager],
-        estimating_kv_cache: bool,
-        execution_stream: Optional[torch.cuda.Stream] = None) -> KVCacheManager:
+    model_engine: PyTorchModelEngine,
+    kv_cache_manager_cls,
+    mapping: Mapping,
+    kv_cache_config: KvCacheConfig,
+    tokens_per_block: int,
+    max_seq_len: int,
+    max_batch_size: int,
+    spec_config: Optional[SpeculativeConfig],
+    sparse_attn_config: Optional[SparseAttentionConfig],
+    max_num_tokens: int,
+    max_beam_width: int,
+    kv_connector_manager: Optional[KvCacheConnectorManager],
+    estimating_kv_cache: bool,
+    execution_stream: Optional[torch.cuda.Stream] = None,
+    capacity_scheduler_policy: CapacitySchedulerPolicy = (
+        CapacitySchedulerPolicy.GUARANTEED_NO_EVICT)
+) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model_engine
@@ -595,6 +603,7 @@ def _create_kv_cache_manager(
             sparse_attn_config=sparse_attn_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
+            capacity_scheduler_policy=capacity_scheduler_policy,
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:
@@ -719,6 +728,7 @@ def _create_kv_cache_manager(
             sparse_attn_config=sparse_attn_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
+            capacity_scheduler_policy=capacity_scheduler_policy,
         )
     return kv_cache_manager
 
@@ -876,9 +886,17 @@ def create_py_executor_instance(
             scheduler_capacity=scheduler_capacity)
     else:
         if isinstance(kv_cache_manager, KVCacheManagerV2):
-            capacity_scheduler = KVCacheV2DummyScheduler(
-                scheduler_capacity,
-                kv_cache_manager if kv_cache_manager is not None else None)
+            # Choose scheduler based on capacity_scheduler_policy
+            from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+            if scheduler_config.capacity_scheduler_policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
+                capacity_scheduler = KVCacheV2MaxUtilizationScheduler(
+                    scheduler_capacity,
+                    kv_cache_manager if kv_cache_manager is not None else None)
+            else:
+                # Default to GUARANTEED_NO_EVICT
+                capacity_scheduler = KVCacheV2DummyScheduler(
+                    scheduler_capacity,
+                    kv_cache_manager if kv_cache_manager is not None else None)
         else:
             capacity_scheduler = BindCapacityScheduler(
                 scheduler_capacity,

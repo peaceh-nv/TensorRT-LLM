@@ -17,7 +17,8 @@ from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper, copy_batch_block_offsets_to_device)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
-from tensorrt_llm.llmapi.llm_args import (KvCacheConfig, PeftCacheConfig,
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                          KvCacheConfig, PeftCacheConfig,
                                           PybindMirror)
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
@@ -1390,10 +1391,13 @@ class KVCacheManagerV2(BaseResourceManager):
         max_beam_width: int = 1,
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+        capacity_scheduler_policy:
+        CapacitySchedulerPolicy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
+        self.capacity_scheduler_policy = capacity_scheduler_policy
 
         assert self.dtype != DataType.NVFP4, "NVFP4 is not supported for KVCacheManagerV2"
         assert kv_connector_manager is None, "kv_connector_manager is not supported for KVCacheManagerV2"
@@ -1687,6 +1691,16 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        if self.capacity_scheduler_policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
+            # MAX_UTILIZATION: resource preparation is handled by the scheduler
+            pass
+        else:
+            # Default to GUARANTEED_NO_EVICT
+            self._prepare_resources_guaranteed_no_evict(scheduled_batch)
+
+    def _prepare_resources_guaranteed_no_evict(
+            self, scheduled_batch: ScheduledRequests):
+        """Prepare resources for GUARANTEED_NO_EVICT scheduling policy."""
         with request_context(self.is_draft, scheduled_batch):
             context_batch = scheduled_batch.context_requests
             generation_batch = scheduled_batch.generation_requests
