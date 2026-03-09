@@ -2256,6 +2256,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
+<<<<<<< HEAD
     @skip_pre_blackwell
     @parametrize_with_ids("cuda_graph", [False, True])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4)],

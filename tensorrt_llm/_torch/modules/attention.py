@@ -2502,6 +2502,12 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
             # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
             # The output of bmm is written directly into fused_q
+            if self.use_cute_dsl_bf16_bmm and is_sm_100f():
+                bmm_fn = lambda: torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell(
+                    q_nope_t, self.k_b_proj_trans, q_nope_out)
+            else:
+                bmm_fn = lambda: torch.ops.trtllm.bmm_out(
+                    q_nope_t, self.k_b_proj_trans.transpose(1, 2), q_nope_out)
             maybe_execute_in_parallel(
                 lambda: self._bmm_bf16_out(q_nope_t, self.k_b_proj_trans,
                                            self.k_b_proj_trans.transpose(1, 2),
