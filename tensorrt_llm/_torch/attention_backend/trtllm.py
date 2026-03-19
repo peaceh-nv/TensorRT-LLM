@@ -760,6 +760,7 @@ class TrtllmAttentionWrapper:
 
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
+
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
 
@@ -1136,6 +1137,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_cache_manager.copy_batch_block_offsets(
                 self.kv_cache_block_offsets, self.request_ids, self.beam_width,
                 self.num_contexts, self.num_seqs)
+            # Clamp negative block indices to 0 after copy.
+            # The KV cache manager uses -1 (BAD_PAGE_INDEX) for unallocated blocks,
+            # but the MLA kernel may read these indices and cause illegal memory access.
+            # Clamping to 0 makes them point to a valid (though unused) block.
+            self.kv_cache_block_offsets[:, :self.num_seqs].clamp_(min=0)
 
             error_message = (
                 f"The max KV cache length of input sequences ({self.kv_lens[:self.num_seqs].max()}) "
@@ -1151,6 +1157,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.draft_kv_cache_manager.copy_batch_block_offsets(
                     self.draft_kv_cache_block_offsets, self.request_ids,
                     self.beam_width, self.num_contexts, self.num_seqs)
+                # Clamp negative block indices to 0 (same as main KV cache above)
+                self.draft_kv_cache_block_offsets[:, :self.num_seqs].clamp_(
+                    min=0)
 
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
         # Don't use self.kv_lens here because it includes extra tokens.
