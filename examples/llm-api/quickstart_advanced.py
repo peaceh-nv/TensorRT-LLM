@@ -212,6 +212,10 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true',
                         help='Use CuTe DSL bf16 persistent GEMM for BMM on Blackwell.')
+    parser.add_argument('--use_cute_dsl_bf16_gemm',
+                        default=False,
+                        action='store_true',
+                        help='Use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell.')
 
     # HF
     parser.add_argument('--trust_remote_code',
