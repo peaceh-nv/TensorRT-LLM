@@ -4081,6 +4081,12 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell.",
         status="prototype",
     )
+    use_cute_dsl_bf16_bmm_nvfp4_epilogue: bool = Field(
+        default=False,
+        description=
+        "If true, use CuTe DSL BF16 BMM with NVFP4 quantization epilogue for Blackwell MLA v_b_proj.",
+        status="prototype",
+    )
 
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)

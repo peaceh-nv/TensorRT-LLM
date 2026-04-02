@@ -295,6 +295,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      use_cute_dsl_bf16_bmm_nvfp4_epilogue:
+        annotation: bool
+        default: False
+        status: prototype
     return_annotation: None
   generate:
     parameters:

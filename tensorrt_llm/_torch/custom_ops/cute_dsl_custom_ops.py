@@ -342,6 +342,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel
     from ..cute_dsl_kernels.blackwell.dense_gemm_persistent import \
         PersistentDenseGemmKernel
+    from ..cute_dsl_kernels.blackwell.dense_gemm_persistent_nvfp4_epilogue import \
+        PersistentDenseGemmNvfp4EpilogueKernel
     from ..cute_dsl_kernels.blackwell.moe_as_dense_gemm.fc1 import \
         Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmSwigluKernel
     from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
@@ -6493,6 +6495,317 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.dtype == torch.bfloat16, "CuTe DSL bf16 bmm output dtype must be bf16"
         assert output.shape == (
             batch_size, m, n), "CuTe DSL bf16 bmm output shape is incorrect"
+
+    # ======================================================================
+    # BF16 Dense Persistent BMM with NVFP4 Epilogue (CuTe DSL) for Blackwell
+    # ======================================================================
+
+    class CuteDSLBf16BmmNvfp4EpilogueRunner(TunableRunner):
+        """BF16 BMM with NVFP4 quantization in epilogue for Blackwell MLA v_b_proj.
+
+        Input: A [B, M, K] BF16, B_weight [B, N, K] BF16
+        Output: C [M, N_total] Float4E2M1FN (packed), SFC [M, ceil(N_total/16)] Float8E4M3FN
+        where N_total = B * N (heads collapsed into N dimension).
+        SFC uses Float8E4M3FN format to match fp4_quantize and nvfp4_gemm.
+        """
+        kernel_class = PersistentDenseGemmNvfp4EpilogueKernel
+        kernel_cache = dict()
+
+        tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 1, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ), )
+
+        def __init__(self, use_tvm_ffi: bool = True):
+            super().__init__()
+            self.use_tvm_ffi = use_tvm_ffi
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[int]:
+
+            if not is_sm_100f():
+                logger.debug(
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                    f"CuteDSL BF16 BMM NVFP4 epilogue only supports SM 100 family. "
+                    f"Skipping all tactics.")
+                return []
+            # [b, m, k]
+            batch_size, m, k = inputs[0].shape[0], inputs[0].shape[1], inputs[
+                0].shape[2]
+            # [b, n, k]
+            n = inputs[1].shape[1]
+            a_major = "k"
+            b_major = "k"
+            c_major = "n"
+
+            use_2cta_instrs_candi = [False, True]
+            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            cluster_shape_mn_candi = [
+                (1, 1),
+                (1, 2),
+                (1, 4),
+                (2, 1),
+                (2, 2),
+                (2, 4),
+                (4, 1),
+                (4, 2),
+                (4, 4),
+            ]
+            return [
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                for use_2cta_instrs in use_2cta_instrs_candi
+                for mma_tiler_mn in mma_tiler_mn_candi
+                for cluster_shape_mn in cluster_shape_mn_candi
+                if self.__class__.kernel_class.can_implement(
+                    cutlass.BFloat16,  # ab_dtype
+                    cutlass.Float32,  # acc_dtype
+                    cutlass.Float4E2M1FN,  # c_dtype
+                    use_2cta_instrs,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_major,
+                    b_major,
+                    c_major,
+                )
+            ]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+        ) -> None:
+            """
+            Performs bf16 BMM with NVFP4 quantization epilogue.
+
+            Args:
+                inputs (List[torch.Tensor]):
+                    inputs[0]: Input tensor of shape (batch_size, m, k), dtype: bf16.
+                    inputs[1]: Weight tensor of shape (batch_size, n, k), dtype: bf16.
+                    inputs[2]: Output FP4 tensor of shape (m, n_total), dtype: uint8 (packed FP4).
+                    inputs[3]: Output SFC tensor of shape (m, ceil(n_total/sf_vec_size)), dtype: uint8.
+                    inputs[4]: Norm const scalar tensor, dtype: float32.
+                tactic: Tiling and cluster strategy.
+            """
+            if isinstance(tactic, tuple):
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
+                    False,
+                    (128, 128),
+                    (1, 1),
+                ]
+
+            a_tensor, b_tensor, c_fp4_tensor, sfc_tensor, norm_const_tensor = inputs
+
+            batch_size = a_tensor.shape[0]
+            m = a_tensor.shape[1]
+            k = a_tensor.shape[2]
+            n = b_tensor.shape[1]
+
+            # Compute A strides for non-contiguous views
+            a_stride_m = a_tensor.stride(1)
+            a_stride_batch = a_tensor.stride(0)
+
+            if not self.use_tvm_ffi:
+                a_ptr = make_ptr(
+                    cutlass.BFloat16,
+                    a_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                b_ptr = make_ptr(
+                    cutlass.BFloat16,
+                    b_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                # Use typed pointers for FP4/SFC so the kernel sees the
+                # correct element types (Float4E2M1FN / Float8E4M3FN)
+                # instead of UInt8 from from_dlpack on torch.uint8.
+                # SFC must be Float8E4M3FN (not E8M0) to match what
+                # fp4_quantize produces and nvfp4_gemm expects.
+                c_ptr = make_ptr(
+                    cutlass.Float4E2M1FN,
+                    c_fp4_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                sfc_ptr = make_ptr(
+                    cutlass.Float8E4M3FN,
+                    sfc_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                norm_const_cute = cute.runtime.from_dlpack(norm_const_tensor)
+                stream = cuda.CUstream(
+                    torch.cuda.current_stream().cuda_stream)
+
+            cache_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                self.use_tvm_ffi,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                if self.use_tvm_ffi:
+                    a_ptr = make_ptr(
+                        cutlass.BFloat16,
+                        a_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_ptr = make_ptr(
+                        cutlass.BFloat16,
+                        b_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    c_ptr = make_ptr(
+                        cutlass.Float4E2M1FN,
+                        c_fp4_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    sfc_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        sfc_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    norm_const_cute = cute.runtime.from_dlpack(
+                        norm_const_tensor)
+                    stream = cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+
+                gemm = self.__class__.kernel_class(
+                    cutlass.Float32,  # acc_dtype
+                    use_2cta_instrs=use_2cta_instrs,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                    sf_vec_size=16,
+                )
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                compiled_gemm = cute.compile(
+                    gemm.wrapper_strided,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    sfc_ptr,
+                    norm_const_cute,
+                    a_stride_m,
+                    a_stride_batch,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    if self.use_tvm_ffi else "--opt-level 2",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # launch gemm kernel
+            if self.use_tvm_ffi:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_tensor.data_ptr(),
+                    b_tensor.data_ptr(),
+                    c_fp4_tensor.data_ptr(),
+                    sfc_tensor.data_ptr(),
+                    norm_const_tensor,
+                    a_stride_m,
+                    a_stride_batch,
+                )
+            else:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    sfc_ptr,
+                    norm_const_cute,
+                    a_stride_m,
+                    a_stride_batch,
+                    stream=stream,
+                )
+
+    # a/b: bf16, output: fp4 + sfc
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_bf16_bmm_nvfp4_out_blackwell",
+        mutates_args=("output_fp4", "output_sf"),
+        device_types="cuda")
+    def cute_dsl_bf16_bmm_nvfp4_out_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        output_fp4: torch.Tensor,
+        output_sf: torch.Tensor,
+        norm_const: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        """BF16 BMM with NVFP4 quantization in epilogue.
+
+        Args:
+            input: [B, M, K] BF16 - attention output latent
+            weight: [B, N, K] BF16 - v_b_proj weight
+            output_fp4: [M, B*N] uint8 - packed FP4 output (mutated)
+            output_sf: [M, ceil(B*N/16)] uint8 - scale factors (mutated)
+            norm_const: scalar float32 tensor - normalization constant
+            use_tvm_ffi: whether to use TVM FFI
+        """
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL BF16 BMM NVFP4 only supports SM 100 family.")
+
+        tuner = AutoTuner.get()
+
+        runner = CuteDSLBf16BmmNvfp4EpilogueRunner(use_tvm_ffi=use_tvm_ffi)
+
+        inputs = [input, weight, output_fp4, output_sf, norm_const]
+
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_bf16_bmm_nvfp4_out_blackwell::gemm",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_bf16_bmm_nvfp4_out_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        output_fp4: torch.Tensor,
+        output_sf: torch.Tensor,
+        norm_const: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        batch_size, m, k = mat_a.shape[0], mat_a.shape[1], mat_a.shape[2]
+        n = mat_b.shape[1]
+        assert output_fp4.dtype == torch.uint8, \
+            "CuTe DSL bf16 bmm nvfp4 output dtype must be uint8 (packed FP4)"
+        assert output_sf.dtype == torch.uint8, \
+            "CuTe DSL bf16 bmm nvfp4 sfc dtype must be uint8"
 
     # ======================================================================
     # BF16 Dense Persistent GEMM (CuTe DSL) for Blackwell - Linear layers
