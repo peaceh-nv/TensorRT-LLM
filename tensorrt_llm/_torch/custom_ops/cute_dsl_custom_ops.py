@@ -344,6 +344,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         PersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_gemm_persistent_nvfp4_epilogue import \
         PersistentDenseGemmNvfp4EpilogueKernel
+    from ..cute_dsl_kernels.blackwell.dense_gemm_persistent_rope_epilogue import \
+        PersistentDenseGemmRopeEpilogueKernel
     from ..cute_dsl_kernels.blackwell.moe_as_dense_gemm.fc1 import \
         Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmSwigluKernel
     from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
@@ -7371,3 +7373,341 @@ if IS_CUTLASS_DSL_AVAILABLE:
                            max_context_len,
                            dtype=output_dtype,
                            device=q.device)
+    # ======================================================================
+    # BF16 Dense Persistent GEMM with RoPE Epilogue (CuTe DSL) for Blackwell
+    # ======================================================================
+
+    class CuteDSLBf16GemmRopeEpilogueRunner(TunableRunner):
+        """BF16 GEMM with RoPE epilogue for Blackwell MLA context q_b_proj.
+
+        Fuses q_b_proj GEMM and RoPE application into a single kernel.
+        Input: A [M, K] BF16, B_weight [N, K] BF16
+        Output: C [M, N] BF16 with RoPE applied on rope portion of each head.
+
+        Additional inputs: cos_sin_cache [max_seq_len, qk_rope_head_dim],
+        position_ids [M] int32.
+        """
+        kernel_class = PersistentDenseGemmRopeEpilogueKernel
+        kernel_cache = dict()
+
+        tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ), )
+
+        def __init__(self,
+                     qk_nope_head_dim: int,
+                     qk_rope_head_dim: int,
+                     use_tvm_ffi: bool = True):
+            super().__init__()
+            self.qk_nope_head_dim = qk_nope_head_dim
+            self.qk_rope_head_dim = qk_rope_head_dim
+            self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+            self.use_tvm_ffi = use_tvm_ffi
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[int]:
+
+            if not is_sm_100f():
+                logger.debug(
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                    f"CuteDSL BF16 GEMM RoPE only supports SM 100 family. "
+                    f"Skipping all tactics.")
+                return []
+
+            # input: [M, K], weight: [N, K], output: [M, N]
+            m, k = inputs[0].shape[0], inputs[0].shape[1]
+            n = inputs[1].shape[0]
+            a_major = "k"
+            b_major = "k"
+            c_major = "n"
+
+            qk_head_dim = self.qk_head_dim
+
+            # For RoPE epilogue, mma_tiler N must be multiple of qk_head_dim
+            # so subtiles align to head boundaries. qk_head_dim=192 for
+            # DeepSeek-R1, so we use mma_tiler_N=192 only.
+            use_2cta_instrs_candi = [False, True]
+            mma_tiler_mn_candi = [
+                (mma_m, mma_n)
+                for mma_m in [64, 128, 256]
+                for mma_n in [qk_head_dim]
+                if mma_n in range(32, 257, 32)
+            ]
+            cluster_shape_mn_candi = [
+                (1, 1),
+                (1, 2),
+                (1, 4),
+                (2, 1),
+                (2, 2),
+                (2, 4),
+                (4, 1),
+                (4, 2),
+                (4, 4),
+            ]
+            return [
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                for use_2cta_instrs in use_2cta_instrs_candi
+                for mma_tiler_mn in mma_tiler_mn_candi
+                for cluster_shape_mn in cluster_shape_mn_candi
+                if self.__class__.kernel_class.can_implement(
+                    cutlass.BFloat16,  # ab_dtype
+                    cutlass.Float32,  # acc_dtype
+                    cutlass.BFloat16,  # c_dtype
+                    use_2cta_instrs,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    m,
+                    n,
+                    k,
+                    a_major,
+                    b_major,
+                    c_major,
+                    qk_head_dim,
+                    self.qk_rope_head_dim,
+                )
+            ]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+        ) -> None:
+            """
+            Performs bf16 GEMM with RoPE epilogue.
+
+            Args:
+                inputs (List[torch.Tensor]):
+                    inputs[0]: Input tensor of shape (m, k), dtype: bf16.
+                    inputs[1]: Weight tensor of shape (n, k), dtype: bf16.
+                    inputs[2]: Output tensor of shape (m, n), dtype: bf16.
+                    inputs[3]: cos_sin_cache of shape (max_seq_len, rope_dim), dtype: float32.
+                    inputs[4]: position_ids of shape (m,), dtype: int32.
+                tactic: Tiling and cluster strategy.
+            """
+            if isinstance(tactic, tuple):
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
+                    False,
+                    (128, self.qk_head_dim),
+                    (1, 1),
+                ]
+
+            a_tensor, b_tensor, c_tensor, cos_sin_cache, position_ids = inputs
+
+            m, k = a_tensor.shape[0], a_tensor.shape[1]
+            n = b_tensor.shape[0]
+
+            # Ensure inputs are contiguous
+            a_tensor = a_tensor.contiguous()
+            b_tensor = b_tensor.contiguous()
+
+            c_needs_copy = not c_tensor.is_contiguous()
+            if c_needs_copy:
+                c_buf = torch.empty_like(c_tensor)
+            else:
+                c_buf = c_tensor
+
+            if not self.use_tvm_ffi:
+                a_ptr = make_ptr(
+                    cutlass.BFloat16,
+                    a_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                b_ptr = make_ptr(
+                    cutlass.BFloat16,
+                    b_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                c_ptr = make_ptr(
+                    cutlass.BFloat16,
+                    c_buf.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                cos_sin_cute = cute.runtime.from_dlpack(cos_sin_cache)
+                pos_ids_ptr = make_ptr(
+                    cutlass.Int32,
+                    position_ids.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                stream = cuda.CUstream(
+                    torch.cuda.current_stream().cuda_stream)
+
+            cache_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                self.use_tvm_ffi,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                if self.use_tvm_ffi:
+                    a_ptr = make_ptr(
+                        cutlass.BFloat16,
+                        a_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_ptr = make_ptr(
+                        cutlass.BFloat16,
+                        b_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    c_ptr = make_ptr(
+                        cutlass.BFloat16,
+                        c_buf.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    # cos_sin_cache passed as cute.Tensor (not pointer) so
+                    # TVM FFI can detect a GPU tensor for stream extraction.
+                    cos_sin_cute = cute.runtime.from_dlpack(cos_sin_cache)
+                    pos_ids_ptr = make_ptr(
+                        cutlass.Int32,
+                        position_ids.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    stream = cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+
+                gemm = self.__class__.kernel_class(
+                    cutlass.Float32,  # acc_dtype
+                    use_2cta_instrs=use_2cta_instrs,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                    qk_nope_head_dim=self.qk_nope_head_dim,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                )
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                compiled_gemm = cute.compile(
+                    gemm.wrapper,
+                    m,
+                    n,
+                    k,
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    cos_sin_cute,
+                    pos_ids_ptr,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    if self.use_tvm_ffi else "--opt-level 2",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # launch gemm kernel
+            if self.use_tvm_ffi:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    a_tensor.data_ptr(),
+                    b_tensor.data_ptr(),
+                    c_buf.data_ptr(),
+                    cos_sin_cache,
+                    position_ids.data_ptr(),
+                )
+            else:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    cos_sin_cute,
+                    pos_ids_ptr,
+                    stream=stream,
+                )
+
+            if c_needs_copy:
+                c_tensor.copy_(c_buf)
+
+    # input: [M, K], weight: [N, K], output: [M, N] with RoPE on rope portion
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_bf16_gemm_rope_blackwell",
+        mutates_args=("output", ),
+        device_types="cuda")
+    def cute_dsl_bf16_gemm_rope_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        output: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        position_ids: torch.Tensor,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        """BF16 GEMM with RoPE epilogue for MLA context q_b_proj.
+
+        Fuses q_b_proj GEMM and half-rotation RoPE into a single kernel.
+
+        Args:
+            input: [M, K] BF16 - q after layernorm
+            weight: [N, K] BF16 - q_b_proj weight
+            output: [M, N] BF16 - Q with RoPE applied on rope portion (mutated)
+            cos_sin_cache: [max_seq_len, qk_rope_head_dim] float32 -
+                           interleaved [cos0, sin0, cos1, sin1, ...]
+            position_ids: [M] int32 - per-token position indices
+            qk_nope_head_dim: nope dimension per head (e.g. 128)
+            qk_rope_head_dim: rope dimension per head (e.g. 64)
+            use_tvm_ffi: whether to use TVM FFI
+        """
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL BF16 GEMM RoPE only supports SM 100 family.")
+
+        tuner = AutoTuner.get()
+
+        runner = CuteDSLBf16GemmRopeEpilogueRunner(
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            use_tvm_ffi=use_tvm_ffi,
+        )
+
+        inputs = [input, weight, output, cos_sin_cache, position_ids]
+
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_bf16_gemm_rope_blackwell::gemm",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_bf16_gemm_rope_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        output: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        position_ids: torch.Tensor,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        m, k = mat_a.shape[0], mat_a.shape[1]
+        n = mat_b.shape[0]
+        assert output.dtype == torch.bfloat16, \
+            "CuTe DSL bf16 gemm rope output dtype must be bf16"
+        assert output.shape == (
+            m, n), "CuTe DSL bf16 gemm rope output shape is incorrect"

@@ -299,6 +299,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      use_cute_dsl_context_gemm_rope:
+        annotation: bool
+        default: False
+        status: prototype
     return_annotation: None
   generate:
     parameters:

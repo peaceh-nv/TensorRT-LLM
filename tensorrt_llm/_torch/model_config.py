@@ -157,6 +157,7 @@ class ModelConfig(Generic[TConfig]):
     use_cute_dsl_bf16_bmm: bool = False
     use_cute_dsl_bf16_gemm: bool = False
     use_cute_dsl_bf16_bmm_nvfp4_epilogue: bool = False
+    use_cute_dsl_context_gemm_rope: bool = False
 
     _frozen: bool = field(default=False, init=False, repr=False)
 

@@ -4087,6 +4087,12 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, use CuTe DSL BF16 BMM with NVFP4 quantization epilogue for Blackwell MLA v_b_proj.",
         status="prototype",
     )
+    use_cute_dsl_context_gemm_rope: bool = Field(
+        default=False,
+        description=
+        "If true, use CuTe DSL fused q_b_proj GEMM + RoPE epilogue kernel for Blackwell MLA context phase.",
+        status="prototype",
+    )
 
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)

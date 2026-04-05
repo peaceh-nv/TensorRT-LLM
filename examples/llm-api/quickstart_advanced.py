@@ -220,6 +220,10 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true',
                         help='Use CuTe DSL BF16 BMM with NVFP4 quantization epilogue for Blackwell MLA v_b_proj.')
+    parser.add_argument('--use_cute_dsl_context_gemm_rope',
+                        default=False,
+                        action='store_true',
+                        help='Use CuTe DSL fused q_b_proj GEMM + RoPE epilogue for Blackwell MLA context phase.')
 
     # HF
     parser.add_argument('--trust_remote_code',
@@ -380,6 +384,7 @@ def setup_llm(args, **kwargs):
         use_cute_dsl_bf16_bmm=args.use_cute_dsl_bf16_bmm,
         use_cute_dsl_bf16_gemm=args.use_cute_dsl_bf16_gemm,
         use_cute_dsl_bf16_bmm_nvfp4_epilogue=args.use_cute_dsl_bf16_bmm_nvfp4_epilogue,
+        use_cute_dsl_context_gemm_rope=args.use_cute_dsl_context_gemm_rope,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1

@@ -549,6 +549,8 @@ class ModelLoader:
             use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
             use_cute_dsl_bf16_bmm_nvfp4_epilogue=self.llm_args.
             use_cute_dsl_bf16_bmm_nvfp4_epilogue,
+            use_cute_dsl_context_gemm_rope=self.llm_args.
+            use_cute_dsl_context_gemm_rope,
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)

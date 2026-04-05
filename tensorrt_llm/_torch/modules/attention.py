@@ -1310,6 +1310,9 @@ class MLA(nn.Module):
         self.use_cute_dsl_bf16_gemm = config.use_cute_dsl_bf16_gemm
         self.use_cute_dsl_bf16_bmm_nvfp4_epilogue = config.use_cute_dsl_bf16_bmm_nvfp4_epilogue
         self._fuse_nvfp4_epilogue = False  # Set per-call in forward()
+        self.use_cute_dsl_context_gemm_rope = config.use_cute_dsl_context_gemm_rope
+        self._fuse_context_gemm_rope = False  # Set per-call in forward()
+        self._rope_cos_sin_cache_interleaved = None  # Lazy-initialized
 
         if not self.is_lite:
             self.kv_a_proj_with_mqa = Linear(
@@ -1625,6 +1628,86 @@ class MLA(nn.Module):
                                                    self.qk_rope_head_dim)
         return k_pe
 
+    def _get_rope_cos_sin_cache_interleaved(self) -> torch.Tensor:
+        """Get or create interleaved cos_sin_cache for fused GEMM+RoPE kernel.
+
+        Returns:
+            Tensor of shape [max_positions, qk_rope_head_dim] float32
+            with layout [cos_0, sin_0, cos_1, sin_1, ...] per position.
+        """
+        if self._rope_cos_sin_cache_interleaved is None:
+            # rotary_emb.rotary_cos_sin has shape [max_positions, 2, rope_dim//2]
+            # where [:, 0, :] = cos, [:, 1, :] = sin
+            cos_sin = self.rotary_emb.rotary_cos_sin  # [max_pos, 2, half_dim]
+            cos = cos_sin[:, 0, :]  # [max_pos, half_dim]
+            sin = cos_sin[:, 1, :]  # [max_pos, half_dim]
+            # Interleave: [cos0, sin0, cos1, sin1, ...]
+            interleaved = torch.stack([cos, sin], dim=-1)  # [max_pos, half_dim, 2]
+            self._rope_cos_sin_cache_interleaved = interleaved.reshape(
+                cos_sin.shape[0], -1).contiguous().float()
+        return self._rope_cos_sin_cache_interleaved
+
+    def _q_b_proj_with_rope_fused(
+        self,
+        q_input: torch.Tensor,
+        position_ids: torch.Tensor,
+        num_ctx_tokens: int,
+    ) -> torch.Tensor:
+        """Fused q_b_proj GEMM + RoPE on q_pe via CuTe DSL kernel.
+
+        Replaces self.q_b_proj(q) + apply_rope(q, ...) for context tokens.
+        The fused kernel applies RoPE on the q_pe portion of each head in the
+        GEMM epilogue, avoiding a separate RoPE kernel and GMEM round-trip.
+
+        Only called when apply_rotary_emb=True (Python-based RoPE path),
+        ensuring the C++ attention kernel does not re-apply RoPE to Q.
+
+        Args:
+            q_input: [num_tokens, q_lora_rank] BF16 - input to q_b_proj
+            position_ids: [num_tokens] int32 - per-token position indices
+            num_ctx_tokens: number of context tokens
+
+        Returns:
+            q: [num_tokens, num_heads_tp * qk_head_dim] BF16 with RoPE applied
+               on q_pe portions for context tokens. Generation tokens (if any)
+               use plain q_b_proj without RoPE.
+        """
+        num_tokens = q_input.shape[0]
+        n = self.num_heads_tp * self.qk_head_dim
+
+        # Get q_b_proj weight: shape [N, K] BF16
+        weight = self.q_b_proj.weight
+
+        # Allocate output
+        output = torch.empty([num_tokens, n],
+                             dtype=torch.bfloat16,
+                             device=q_input.device)
+
+        # Get interleaved cos_sin_cache
+        cos_sin_cache = self._get_rope_cos_sin_cache_interleaved()
+
+        # Prepare position_ids as int32
+        pos_ids = position_ids[..., :num_tokens].view(-1).to(torch.int32)
+
+        if num_ctx_tokens < num_tokens:
+            # Mixed batch: fused GEMM+RoPE for context, plain GEMM for gen
+            ctx_output = output[:num_ctx_tokens]
+            torch.ops.trtllm.cute_dsl_bf16_gemm_rope_blackwell(
+                q_input[:num_ctx_tokens], weight, ctx_output, cos_sin_cache,
+                pos_ids[:num_ctx_tokens], self.qk_nope_head_dim,
+                self.qk_rope_head_dim)
+
+            # Plain GEMM for generation tokens
+            gen_output = self.q_b_proj(q_input[num_ctx_tokens:])
+            output[num_ctx_tokens:] = gen_output
+        else:
+            # All context tokens: fused GEMM+RoPE
+            torch.ops.trtllm.cute_dsl_bf16_gemm_rope_blackwell(
+                q_input, weight, output, cos_sin_cache, pos_ids,
+                self.qk_nope_head_dim, self.qk_rope_head_dim)
+
+        return output
+
     def _attn_forward_gen(self, attn_backend: AttentionBackend, q: torch.Tensor,
                           k: torch.Tensor, v: torch.Tensor,
                           position_ids: Optional[torch.Tensor],
@@ -1728,13 +1811,26 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
-        q, latent_cache = maybe_execute_in_parallel(
-            lambda: self.q_b_proj(q),
-            lambda: torch.concat([compressed_kv, k_pe], dim=-1),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        if self._fuse_context_gemm_rope and num_contexts > 0:
+            # Fused GEMM+RoPE path: the fused kernel applies RoPE to Q's q_pe
+            # in the GEMM epilogue, saving a separate RoPE kernel + GMEM
+            # round-trip. K's RoPE is handled separately below.
+            q, latent_cache = maybe_execute_in_parallel(
+                lambda: self._q_b_proj_with_rope_fused(q, position_ids,
+                                                       num_ctx_tokens),
+                lambda: torch.concat([compressed_kv, k_pe], dim=-1),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+        else:
+            q, latent_cache = maybe_execute_in_parallel(
+                lambda: self.q_b_proj(q),
+                lambda: torch.concat([compressed_kv, k_pe], dim=-1),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
 
         assert q.shape[
             0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
@@ -1746,7 +1842,12 @@ class MLA(nn.Module):
             compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
             latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
-            if self.apply_rotary_emb:
+            if self._fuse_context_gemm_rope:
+                # Q's RoPE was applied in the fused GEMM+RoPE kernel above.
+                # Apply RoPE to k_pe only.
+                assert position_ids is not None
+                k_pe_ctx = self.rotary_emb(position_ids, [k_pe_ctx])[0]
+            elif self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
 
@@ -2998,6 +3099,15 @@ class MLA(nn.Module):
             and self.v_b_proj.dtype == torch.bfloat16
             and is_sm_100f()
             and attn_metadata.num_contexts == 0)
+
+        # Determine if fused q_b_proj GEMM+RoPE epilogue should be used.
+        # Only when RoPE is handled in Python (apply_rotary_emb=True), so
+        # the C++ attention kernel does not re-apply RoPE to Q.
+        self._fuse_context_gemm_rope = (
+            self.use_cute_dsl_context_gemm_rope
+            and self.apply_rotary_emb and self.rotary_emb is not None
+            and self.dtype == torch.bfloat16 and is_sm_100f()
+            and attn_metadata.num_contexts > 0)
 
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
