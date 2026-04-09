@@ -1617,6 +1617,8 @@ def trtllm_gen_attention(
     mla_bmm1_scale: Optional[torch.Tensor],
     mla_bmm2_scale: Optional[torch.Tensor],
     quant_q_buffer: Optional[torch.Tensor],
+    quant_k_buffer: Optional[torch.Tensor],
+    quant_v_buffer: Optional[torch.Tensor],
     quant_config: Optional[QuantConfig],
     kv_cache_manager: Optional[KVCacheManager],
     num_contexts: int,

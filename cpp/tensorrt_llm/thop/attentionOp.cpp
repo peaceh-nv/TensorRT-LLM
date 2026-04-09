@@ -95,6 +95,7 @@ public:
         std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
         std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
+        std::optional<torch::Tensor> quant_k_buffer, std::optional<torch::Tensor> quant_v_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits,
         std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt) const
@@ -158,6 +159,7 @@ public:
         std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
         std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
+        std::optional<torch::Tensor> quant_k_buffer, std::optional<torch::Tensor> quant_v_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits,
         std::optional<int64_t> compressed_kv_cache_pool_ptr) const override
@@ -187,7 +189,7 @@ public:
         }
 
         void* workspace_ptr = workspace.data_ptr();
-        [[maybe_unused]] MlaParams<T> mla_params;
+        [[maybe_unused]] MlaParams<T> mla_params{};
         if (op.isMLAEnabled())
         {
             TORCH_CHECK(helix_tensor_params.size() == 2,
@@ -233,6 +235,26 @@ public:
                 v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());
                 mla_params.k_buf = k_ptr;
                 mla_params.v_buf = v_ptr;
+
+                // Pre-quantized FP8 context MLA: Python provides FP8 Q/K/V +
+                // cu_seqlens + BMM scales so C++ can skip invokeBuildDecoderInfo
+                // and invokeMLAContextFp8Quantize.
+                mla_params.quant_q_buf
+                    = quant_q_buffer.has_value() ? reinterpret_cast<void*>(quant_q_buffer.value().data_ptr()) : nullptr;
+                mla_params.quant_k_buf
+                    = quant_k_buffer.has_value() ? reinterpret_cast<void*>(quant_k_buffer.value().data_ptr()) : nullptr;
+                mla_params.quant_v_buf
+                    = quant_v_buffer.has_value() ? reinterpret_cast<void*>(quant_v_buffer.value().data_ptr()) : nullptr;
+                mla_params.seqQOffset
+                    = cu_q_seqlens.has_value() ? reinterpret_cast<int*>(cu_q_seqlens.value().data_ptr()) : nullptr;
+                mla_params.cu_kv_seqlens
+                    = cu_kv_seqlens.has_value() ? reinterpret_cast<int*>(cu_kv_seqlens.value().data_ptr()) : nullptr;
+                mla_params.bmm1_scale = mla_bmm1_scale.has_value()
+                    ? reinterpret_cast<float*>(mla_bmm1_scale.value().data_ptr())
+                    : nullptr;
+                mla_params.bmm2_scale = mla_bmm2_scale.has_value()
+                    ? reinterpret_cast<float*>(mla_bmm2_scale.value().data_ptr())
+                    : nullptr;
 
                 // For generation, helix position is in ropeOp
                 auto const& helix_position_offsets = helix_tensor_params[0];
@@ -668,6 +690,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
+    std::optional<torch::Tensor> quant_k_buffer, std::optional<torch::Tensor> quant_v_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
     bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens,
@@ -953,6 +976,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
             sparse_attn_offsets, sparse_attn_indices_block_size, num_sparse_topk_value, sparse_mla_topk_lens,
             cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer,
+            quant_k_buffer, quant_v_buffer,
             flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr);
     }
 
@@ -972,6 +996,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
             sparse_attn_offsets, sparse_attn_indices_block_size, num_sparse_topk_value, sparse_mla_topk_lens,
             cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer,
+            quant_k_buffer, quant_v_buffer,
             flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr);
     }
 

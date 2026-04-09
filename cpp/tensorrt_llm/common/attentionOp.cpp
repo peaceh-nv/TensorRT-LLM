@@ -1659,7 +1659,27 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     decoder_params.rotaryEmbeddingInvFreqCache = params.rotary_inv_freq;
     decoder_params.rotaryEmbeddingMaxPositions = mRotaryEmbeddingMaxPositions;
 
-    invokeBuildDecoderInfo(decoder_params, stream);
+    // Check if Python has already provided pre-quantized FP8 Q/K/V + cu_seqlens
+    // for MLA context.  When true, invokeBuildDecoderInfo is not needed because
+    // its outputs (cu_seqlens, BMM scales, tile counter) are all supplied from
+    // Python.  We only need to zero the tile counter for persistent FMHA.
+    bool const mla_python_prequantized = mIsMLAEnabled && params.mla_param != nullptr
+        && params.mla_param->quant_q_buf != nullptr && params.mla_param->quant_k_buf != nullptr
+        && params.mla_param->quant_v_buf != nullptr && params.mla_param->seqQOffset != nullptr;
+
+    if (mla_python_prequantized)
+    {
+        // Zero tile counter for persistent FMHA (the only side-effect we need
+        // from invokeBuildDecoderInfo for this path).
+        if (fmha_tile_counter_ptr != nullptr)
+        {
+            TLLM_CUDA_CHECK(cudaMemsetAsync(fmha_tile_counter_ptr, 0, sizeof(uint32_t), stream));
+        }
+    }
+    else
+    {
+        invokeBuildDecoderInfo(decoder_params, stream);
+    }
     sync_check_cuda_error(stream);
 
     // In cross attention context phase, the attention mask should be a matrix of all ones.
@@ -1819,29 +1839,48 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             TLLM_CHECK_WITH_INFO(params.mla_param != nullptr, "MLA param is nullptr");
             params.mla_param->cache_type = cache_type;
-            params.mla_param->cu_q_seqlens = cu_q_seqlens;
-            params.mla_param->quant_scale_kv = params.kv_scale_orig_quant;
-            // Set BMM scales for FP8 context computation
-            params.mla_param->bmm1_scale = fmha_bmm1_scale_ptr;
-            params.mla_param->bmm2_scale = fmha_bmm2_scale_ptr;
-            params.mla_param->quant_q_buf = mFP8ContextMLA ? fp8_q_buf : nullptr;
-            params.mla_param->quant_k_buf = mFP8ContextMLA ? fp8_k_buf : nullptr;
-            params.mla_param->quant_v_buf = mFP8ContextMLA ? fp8_v_buf : nullptr;
-            // Set additional scales for context phase
-            params.mla_param->quant_scale_o = params.attention_output_orig_quant;
-            params.mla_param->quant_scale_q = params.kv_scale_orig_quant;
-            params.mla_param->quant_scale_kv = params.kv_scale_orig_quant;
-            params.mla_param->dequant_scale_q = params.kv_scale_quant_orig;
-            params.mla_param->dequant_scale_kv = params.kv_scale_quant_orig;
-            params.mla_param->host_bmm1_scale
-                = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
+
+            if (mla_python_prequantized)
+            {
+                // Python provided everything: cu_seqlens, BMM scales, FP8 Q/K/V.
+                // Use Python-provided cu_q_seqlens for FMHA (override workspace pointer).
+                cu_q_seqlens = params.mla_param->seqQOffset;
+                cu_kv_seqlens = params.mla_param->cu_kv_seqlens;
+                // Use Python-provided FP8 buffers for FMHA.
+                fp8_q_buf = reinterpret_cast<__nv_fp8_e4m3*>(params.mla_param->quant_q_buf);
+                fp8_k_buf = reinterpret_cast<__nv_fp8_e4m3*>(params.mla_param->quant_k_buf);
+                fp8_v_buf = reinterpret_cast<__nv_fp8_e4m3*>(params.mla_param->quant_v_buf);
+                // Use Python-provided BMM scales for FMHA.
+                fmha_bmm1_scale_ptr = params.mla_param->bmm1_scale;
+                fmha_bmm2_scale_ptr = params.mla_param->bmm2_scale;
+            }
+            else
+            {
+                // Standard C++ path: set workspace pointers.
+                params.mla_param->cu_q_seqlens = cu_q_seqlens;
+                params.mla_param->quant_scale_kv = params.kv_scale_orig_quant;
+                // Set BMM scales for FP8 context computation
+                params.mla_param->bmm1_scale = fmha_bmm1_scale_ptr;
+                params.mla_param->bmm2_scale = fmha_bmm2_scale_ptr;
+                params.mla_param->quant_q_buf = mFP8ContextMLA ? fp8_q_buf : nullptr;
+                params.mla_param->quant_k_buf = mFP8ContextMLA ? fp8_k_buf : nullptr;
+                params.mla_param->quant_v_buf = mFP8ContextMLA ? fp8_v_buf : nullptr;
+                // Set additional scales for context phase
+                params.mla_param->quant_scale_o = params.attention_output_orig_quant;
+                params.mla_param->quant_scale_q = params.kv_scale_orig_quant;
+                params.mla_param->quant_scale_kv = params.kv_scale_orig_quant;
+                params.mla_param->dequant_scale_q = params.kv_scale_quant_orig;
+                params.mla_param->dequant_scale_kv = params.kv_scale_quant_orig;
+                params.mla_param->host_bmm1_scale
+                    = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
+            }
             // The sparse MLA is in the absorption mode for the context phase.
             params.mla_param->absorption_mode = useSparseMLA();
             if (params.mla_param->latent_cache != nullptr)
             {
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
             }
-            if (mFP8ContextMLA)
+            if (mFP8ContextMLA && !mla_python_prequantized)
             {
                 invokeMLAContextFp8Quantize(*params.mla_param, params.total_kv_len, stream);
             }
