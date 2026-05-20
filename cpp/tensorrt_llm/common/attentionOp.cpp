@@ -1659,15 +1659,16 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     decoder_params.rotaryEmbeddingInvFreqCache = params.rotary_inv_freq;
     decoder_params.rotaryEmbeddingMaxPositions = mRotaryEmbeddingMaxPositions;
 
-    // Check if Python has already provided pre-quantized FP8 Q/K/V + cu_seqlens
-    // for MLA context.  When true, invokeBuildDecoderInfo is not needed because
-    // its outputs (cu_seqlens, BMM scales, tile counter) are all supplied from
-    // Python.  We only need to zero the tile counter for persistent FMHA.
-    bool const mla_python_prequantized = mIsMLAEnabled && params.mla_param != nullptr
+    // Check if Python has already provided pre-quantized FP8 Q/K/V for MLA
+    // context.  cu_seqlens may still be built by invokeBuildDecoderInfo; when
+    // Python also provides seq offsets, that decoder-info work can be skipped.
+    bool const mla_python_prequantized_qkv = mIsMLAEnabled && params.mla_param != nullptr
         && params.mla_param->quant_q_buf != nullptr && params.mla_param->quant_k_buf != nullptr
-        && params.mla_param->quant_v_buf != nullptr && params.mla_param->seqQOffset != nullptr;
+        && params.mla_param->quant_v_buf != nullptr;
+    bool const mla_python_precomputed_decoder_info
+        = mla_python_prequantized_qkv && params.mla_param->seqQOffset != nullptr;
 
-    if (mla_python_prequantized)
+    if (mla_python_precomputed_decoder_info)
     {
         // Zero tile counter for persistent FMHA (the only side-effect we need
         // from invokeBuildDecoderInfo for this path).
@@ -1840,19 +1841,23 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             TLLM_CHECK_WITH_INFO(params.mla_param != nullptr, "MLA param is nullptr");
             params.mla_param->cache_type = cache_type;
 
-            if (mla_python_prequantized)
+            if (mla_python_prequantized_qkv)
             {
-                // Python provided everything: cu_seqlens, BMM scales, FP8 Q/K/V.
-                // Use Python-provided cu_q_seqlens for FMHA (override workspace pointer).
-                cu_q_seqlens = params.mla_param->seqQOffset;
-                cu_kv_seqlens = params.mla_param->cu_kv_seqlens;
+                if (mla_python_precomputed_decoder_info)
+                {
+                    // Python-provided cu_seqlens override workspace pointers.
+                    cu_q_seqlens = params.mla_param->seqQOffset;
+                    cu_kv_seqlens = params.mla_param->cu_kv_seqlens;
+                }
                 // Use Python-provided FP8 buffers for FMHA.
                 fp8_q_buf = reinterpret_cast<__nv_fp8_e4m3*>(params.mla_param->quant_q_buf);
                 fp8_k_buf = reinterpret_cast<__nv_fp8_e4m3*>(params.mla_param->quant_k_buf);
                 fp8_v_buf = reinterpret_cast<__nv_fp8_e4m3*>(params.mla_param->quant_v_buf);
-                // Use Python-provided BMM scales for FMHA.
-                fmha_bmm1_scale_ptr = params.mla_param->bmm1_scale;
-                fmha_bmm2_scale_ptr = params.mla_param->bmm2_scale;
+                // Use Python-provided BMM scales when supplied.
+                fmha_bmm1_scale_ptr
+                    = params.mla_param->bmm1_scale != nullptr ? params.mla_param->bmm1_scale : fmha_bmm1_scale_ptr;
+                fmha_bmm2_scale_ptr
+                    = params.mla_param->bmm2_scale != nullptr ? params.mla_param->bmm2_scale : fmha_bmm2_scale_ptr;
             }
             else
             {
@@ -1880,7 +1885,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             {
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
             }
-            if (mFP8ContextMLA && !mla_python_prequantized)
+            if (mFP8ContextMLA && !mla_python_prequantized_qkv)
             {
                 invokeMLAContextFp8Quantize(*params.mla_param, params.total_kv_len, stream);
             }

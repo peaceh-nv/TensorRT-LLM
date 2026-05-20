@@ -6545,18 +6545,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             b_major = "k"
             c_major = "n"
 
+            # Reduced tactic search space to avoid long autotuner
+            # compilation times.  CuTe DSL JIT compilation takes seconds
+            # per tactic; a full Cartesian product causes the autotuner
+            # warmup to take an impractical amount of time.
             use_2cta_instrs_candi = [False, True]
-            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            mma_tiler_mn_candi = [(128, 128), (256, 128)]
             cluster_shape_mn_candi = [
                 (1, 1),
-                (1, 2),
-                (1, 4),
                 (2, 1),
-                (2, 2),
-                (2, 4),
-                (4, 1),
-                (4, 2),
-                (4, 4),
             ]
             return [
                 (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
@@ -7430,25 +7427,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             qk_head_dim = self.qk_head_dim
 
             # For RoPE epilogue, mma_tiler N must be multiple of qk_head_dim
-            # so subtiles align to head boundaries. qk_head_dim=192 for
-            # DeepSeek-R1, so we use mma_tiler_N=192 only.
+            # so subtiles align to head boundaries. Keep the search space
+            # small because each CuTe DSL tactic can take seconds to compile.
             use_2cta_instrs_candi = [False, True]
             mma_tiler_mn_candi = [
                 (mma_m, mma_n)
-                for mma_m in [64, 128, 256]
+                for mma_m in [128, 256]
                 for mma_n in [qk_head_dim]
                 if mma_n in range(32, 257, 32)
             ]
             cluster_shape_mn_candi = [
                 (1, 1),
-                (1, 2),
-                (1, 4),
                 (2, 1),
-                (2, 2),
-                (2, 4),
-                (4, 1),
-                (4, 2),
-                (4, 4),
             ]
             return [
                 (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
@@ -7550,6 +7540,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.use_tvm_ffi,
                 self.qk_nope_head_dim,
                 self.qk_rope_head_dim,
+                m,
+                n,
+                k,
             )
             if cache_key not in self.__class__.kernel_cache:
                 if self.use_tvm_ffi:
@@ -7659,7 +7652,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         """BF16 GEMM with RoPE epilogue for MLA context q_b_proj.
 
-        Fuses q_b_proj GEMM and half-rotation RoPE into a single kernel.
+        Fuses q_b_proj GEMM and interleaved RoPE into a single kernel.
 
         Args:
             input: [M, K] BF16 - q after layernorm
@@ -7773,25 +7766,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
             b_major = "k"
             c_major = "n"
 
+            # Reduced tactic search space to avoid extremely long
+            # autotuner compilation times.  CuTe DSL JIT compilation
+            # takes seconds per tactic; with the full Cartesian product
+            # (2 * 18 * 9 = 324 tactics * 15 M-buckets) the autotuner
+            # warmup would take hours.  We keep only the most promising
+            # configurations for BF16 kv_b_proj (K=512, N~3072).
             use_2cta_instrs_candi = [False, True]
             mma_tiler_mn_candi = [
                 (mma_m, mma_n)
-                for mma_m in [64, 128, 256]
-                for mma_n in range(32, 257, 32)
-                # N must be divisible by mma_tiler_N to avoid CuTe DSL
-                # flat_divide errors in the TMA epilogue tiling.
+                for mma_m in [128, 256]
+                for mma_n in [128, 256]
                 if n % mma_n == 0
             ]
             cluster_shape_mn_candi = [
                 (1, 1),
-                (1, 2),
-                (1, 4),
                 (2, 1),
-                (2, 2),
-                (2, 4),
-                (4, 1),
-                (4, 2),
-                (4, 4),
             ]
             return [
                 (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
@@ -7961,6 +7951,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.v_head_dim,
                 self.num_heads,
                 self.do_fp8_quant,
+                m,
+                n,
+                k,
             )
             if cache_key not in self.__class__.kernel_cache:
                 if self.use_tvm_ffi:
@@ -8117,8 +8110,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # k_output: optional [M, H*qk_head_dim] k concat output
     @torch.library.custom_op(
         "trtllm::cute_dsl_bf16_gemm_kv_rope_blackwell",
-        mutates_args=("output", "k_pe_out", "k_output",
-                       "fp8_k_output", "fp8_v_output"),
+        mutates_args=("output", "k_pe_out"),
         device_types="cuda")
     def cute_dsl_bf16_gemm_kv_rope_blackwell(
         input: torch.Tensor,

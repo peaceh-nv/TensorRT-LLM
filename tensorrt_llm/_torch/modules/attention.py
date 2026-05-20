@@ -1659,8 +1659,8 @@ class MLA(nn.Module):
         The fused kernel applies RoPE on the q_pe portion of each head in the
         GEMM epilogue, avoiding a separate RoPE kernel and GMEM round-trip.
 
-        Only called when apply_rotary_emb=True (Python-based RoPE path),
-        ensuring the C++ attention kernel does not re-apply RoPE to Q.
+        In the fused context path, the KV-cache append kernel is told to skip
+        Q RoPE so it does not re-apply RoPE to this output.
 
         Args:
             q_input: [num_tokens, q_lora_rank] BF16 - input to q_b_proj
@@ -1911,13 +1911,24 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
-        q, latent_cache = maybe_execute_in_parallel(
-            lambda: self.q_b_proj(q),
-            lambda: torch.concat([compressed_kv, k_pe], dim=-1),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        disable_q_context_gemm_rope = os.environ.get(
+            "TRTLLM_CONTEXT_GEMM_ROPE_DISABLE_Q_FUSION") == "1"
+
+        if self._fuse_context_kv_gemm_rope and not disable_q_context_gemm_rope:
+            assert position_ids is not None
+            # Fused path: skip torch.concat for latent_cache; pass
+            # compressed_kv and k_pe separately to forward_context.
+            q = self._q_b_proj_with_rope_fused(
+                q, position_ids, num_ctx_tokens)
+            latent_cache = None
+        else:
+            q, latent_cache = maybe_execute_in_parallel(
+                lambda: self.q_b_proj(q),
+                lambda: torch.concat([compressed_kv, k_pe], dim=-1),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
 
         assert q.shape[
             0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
@@ -1928,14 +1939,35 @@ class MLA(nn.Module):
             q_ctx = q[:num_ctx_tokens, ...]
             compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
-            latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
+            latent_cache_ctx = latent_cache[:num_ctx_tokens, ...] if latent_cache is not None else None
             if self._fuse_context_kv_gemm_rope:
-                # Fused kv_b_proj + k_pe RoPE + Q RoPE + KV cache: k_pe RoPE
-                # is handled by the CuTe DSL kernel, Q RoPE + KV cache by
-                # mla_rope_append_paged_kv_assign_q.  Guard requires
-                # apply_rotary_emb=False so Python RoPE is skipped here.
+                # Fused q_b_proj + Q RoPE, kv_b_proj + k_pe RoPE, and KV
+                # cache append.  Python RoPE is skipped here.
                 # k_pe_ctx remains un-RoPE'd for the fused kernel.
-                pass
+
+                # Pre-compute context indptr metadata once per forward
+                # pass so all 61 layers reuse it.
+                trtllm_md = cast(TrtllmAttentionMetadata, attn_metadata)
+                if (not trtllm_md.enable_context_mla_with_cached_kv
+                        and not getattr(trtllm_md,
+                                        '_fused_ctx_indptr_ready', False)):
+                    nc = trtllm_md.num_contexts
+                    prompt_lens_ctx = (
+                        trtllm_md.prompt_lens_cuda_runtime[:nc])
+                    prompt_lens_ctx_host = (
+                        trtllm_md.prompt_lens_cpu_runtime[:nc])
+                    trtllm_md.ctx_cached_token_indptr = torch.zeros(
+                        nc + 1, dtype=torch.int64,
+                        device=compressed_kv_ctx.device)
+                    trtllm_md.ctx_kv_indptr = torch.zeros(
+                        nc + 1, dtype=torch.int64,
+                        device=compressed_kv_ctx.device)
+                    torch.cumsum(
+                        prompt_lens_ctx, dim=0, dtype=torch.int64,
+                        out=trtllm_md.ctx_kv_indptr[1:])
+                    trtllm_md.max_ctx_seq_len = int(
+                        prompt_lens_ctx_host.max().item())
+                    trtllm_md._fused_ctx_indptr_ready = True
             elif self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
@@ -1959,7 +1991,11 @@ class MLA(nn.Module):
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             if latent_cache_gen is None:
-                latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
+                if latent_cache is not None:
+                    latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
+                else:
+                    latent_cache_gen = torch.concat(
+                        [compressed_kv_gen, k_pe_gen], dim=-1)
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
@@ -2186,138 +2222,165 @@ class MLA(nn.Module):
         Used by non-DSA models and as the short-seq MHA fallback for DSA models.
         """
         if self._fuse_context_kv_gemm_rope:
-            # Fused path: kv_b_proj GEMM + k_pe RoPE + k concat + optional
-            # FP8 K/V quantization in a single CuTe DSL kernel, plus Q RoPE
-            # + KV cache append via mla_rope_append_paged_kv_assign_q,
-            # plus optional FP8 Q quantization + cu_seqlens + BMM scales
-            # computed in Python.
+            # Fused path: q_b_proj GEMM + Q RoPE and kv_b_proj GEMM + k_pe
+            # RoPE run in CuTe DSL kernels.  KV-cache append uses
+            # mla_rope_append_paged_kv_assign_q with Q RoPE disabled.
             #
             # The k_pe arriving here is UN-RoPE'd; the fused kernel applies
-            # RoPE to k_pe in the GEMM epilogue and builds
-            # k = [k_nope, k_pe_roped] per head, eliminating cublas GEMM +
-            # 2 k concat copy kernels.
+            # RoPE to k_pe in the GEMM epilogue.  The K tensor is assembled
+            # after the kernel because k concat needs the full GEMM N range.
             #
-            # When FP8 context MLA is active, the kernel also quantizes K/V
-            # to FP8 E4M3 in the epilogue, and Python computes cu_seqlens +
-            # BMM scales, eliminating invokeBuildDecoderInfo +
-            # invokeMLAContextFp8Quantize from the C++ path.
-            #
-            # Then mla_rope_append_paged_kv_assign_q handles Q RoPE and
-            # scatters latent_cache to paged KV cache in one kernel.
+            # Then mla_rope_append_paged_kv_assign_q scatters latent_cache to
+            # paged KV cache in one kernel.
             # Finally, mha.forward with latent_cache=None skips C++
-            # invokeMLARopeContext (Q RoPE + KV cache already done above).
+            # invokeMLARopeContext (RoPE + KV cache already done above).
+            # FP8 context quantization uses a C++ helper that assembles the
+            # split K layout while writing FP8 Q/K/V.
             trtllm_attention = cast(TrtllmAttention, self.mha)
             trtllm_md = cast(TrtllmAttentionMetadata, attn_metadata)
 
-            # Detect FP8 context MLA: mirrors C++ mFP8ContextMLA which requires
-            # FP8 KV cache + SM90/100/103/120.  When active, fuse FP8 K/V quant
-            # into the CuTe DSL epilogue and compute cu_seqlens + BMM scales
-            # in Python to skip C++ invokeBuildDecoderInfo +
-            # invokeMLAContextFp8Quantize.
-            wrapper = trtllm_attention.wrapper
+            num_ctx_tokens = compressed_kv.shape[0]
             do_fp8_context = (trtllm_attention.has_fp8_kv_cache
                               and not trtllm_md.enable_context_mla_with_cached_kv)
-            quant_scale_tensor = wrapper.kv_scale_orig_quant if do_fp8_context else None
-
-            num_ctx_tokens = compressed_kv.shape[0]
+            # Python-side FP8 quantization with mla_context_fp8_quantize_kv_split
+            # eliminates the separate packKFromKVRopeKernel call by fusing k
+            # assembly + FP8 quant.  We must compute cu_seqlens from
+            # kv_lens_cuda_runtime (not prompt_lens) to match kvSeqLenPtr in C++.
+            do_split_fp8_quant = (do_fp8_context and os.environ.get(
+                "TRTLLM_CONTEXT_GEMM_ROPE_DISABLE_SPLIT_FP8_QUANT") != "1")
+            apply_q_rope_in_append = os.environ.get(
+                "TRTLLM_CONTEXT_GEMM_ROPE_DISABLE_Q_FUSION") == "1"
+            # Note: FP8 K/V quant and k concat are NOT fused into the
+            # CuTe DSL epilogue.  The GEMM tiles the N dimension across
+            # CTAs, so each CTA only writes its own N-range to c_raw;
+            # a cross-CTA k concat that reads the full N dimension would
+            # race with other CTAs' TMA stores.  For BF16 context we build
+            # k = [k_nope, k_pe_roped] after the kernel returns.  For FP8
+            # context we fold that assembly into the FP8 quantization kernel.
             results = self._kv_b_proj_with_rope_fused(
                 compressed_kv, k_pe, position_ids, num_ctx_tokens,
-                fuse_k_concat=True,
-                fuse_fp8_quant=do_fp8_context,
-                quant_scale=quant_scale_tensor)
+                fuse_k_concat=False,
+                fuse_fp8_quant=False,
+                quant_scale=None)
 
-            kv, k_pe_roped, k = results[0], results[1], results[2]
-            fp8_k = results[3] if do_fp8_context else None
-            fp8_v = results[4] if do_fp8_context else None
+            kv, k_pe_roped = results[0], results[1]
 
-            # v is a non-contiguous view into kv (stride = N) — required
-            # by C++ FP8 quantizer which hardcodes
-            # src_v_token_stride = (nope + v) * num_heads.
-            _, v = kv.split(
-                [
-                    self.num_heads_tp * self.qk_nope_head_dim,
-                    self.num_heads_tp * self.v_head_dim
-                ],
-                -1,
-            )
-
-            # Q RoPE + KV cache append: use the same pattern as
-            # forward_context_with_cached_kv.  For the default context path
-            # (no cache reuse / chunked prefill), the indptr metadata is not
-            # pre-allocated so we construct it on-the-fly from prompt_lens.
-            nc = trtllm_md.num_contexts
-
-            # Construct indptr tensors for mla_rope_append_paged_kv_assign_q.
-            # No cached tokens in default context → ctx_cached_token_indptr
-            # is all zeros.  ctx_kv_indptr = cumsum(prompt_lens[:nc]).
-            if trtllm_md.enable_context_mla_with_cached_kv:
-                # Indptr already populated by prepare_context_mla_with_cached_kv.
-                ctx_cached_token_indptr = trtllm_md.ctx_cached_token_indptr
-                ctx_kv_indptr = trtllm_md.ctx_kv_indptr
-                max_ctx_seq_len = trtllm_md.max_ctx_seq_len
-            else:
-                prompt_lens_ctx = trtllm_md.prompt_lens_cuda_runtime[:nc]
-                ctx_cached_token_indptr = torch.zeros(
-                    nc + 1, dtype=torch.int64,
-                    device=compressed_kv.device)
-                ctx_kv_indptr = torch.zeros(
-                    nc + 1, dtype=torch.int64,
-                    device=compressed_kv.device)
-                torch.cumsum(prompt_lens_ctx, dim=0, dtype=torch.int64,
-                             out=ctx_kv_indptr[1:])
-                max_ctx_seq_len = prompt_lens_ctx.max().item()
-                # Temporarily patch metadata for the C++ op.
-                trtllm_md.ctx_cached_token_indptr = ctx_cached_token_indptr
-                trtllm_md.ctx_kv_indptr = ctx_kv_indptr
-                trtllm_md.max_ctx_seq_len = max_ctx_seq_len
-
-            trtllm_attention.mla_rope_append_paged_kv_assign_q(
-                q, latent_cache, trtllm_md)
-
-            # FP8 context MLA bypass: compute FP8 Q, cu_seqlens, BMM scales
-            # in Python to skip C++ invokeBuildDecoderInfo +
-            # invokeMLAContextFp8Quantize.
+            v_start = self.num_heads_tp * self.qk_nope_head_dim
+            v = kv[..., v_start:]
             cu_q_seqlens = None
             cu_kv_seqlens = None
             mla_bmm1_scale = None
             mla_bmm2_scale = None
             fp8_q = None
-            if do_fp8_context:
-                import math
-                # FP8 Q quantization: Q already has RoPE applied by
-                # mla_rope_append_paged_kv_assign_q.  Per-tensor scale.
-                quant_scale_val = wrapper.kv_scale_orig_quant.item()
-                fp8_q = (q.float() * quant_scale_val).to(
-                    torch.float8_e4m3fn)
+            fp8_k = None
+            fp8_v = None
 
-                # cu_seqlens: for default context (no cached tokens),
-                # cu_q_seqlens == cu_kv_seqlens == cumsum of prompt_lens.
-                # C++ expects int32.
-                cu_q_seqlens = ctx_kv_indptr.to(torch.int32)
-                cu_kv_seqlens = cu_q_seqlens
+            if do_split_fp8_quant:
+                # C++ attention only needs non-null K/V tensors for API
+                # plumbing when FP8 Q/K/V are supplied; the FMHA path consumes
+                # the quantized buffers below.
+                # Reuse cached FP8 buffers across layers when the token
+                # count is unchanged.  Scale tensors are shape-invariant
+                # and allocated once.
+                qk_dim = self.num_heads_tp * self.qk_head_dim
+                v_dim = self.num_heads_tp * self.v_head_dim
+                dev = compressed_kv.device
+                need_alloc = (not hasattr(self, '_ctx_fp8_q')
+                              or self._ctx_fp8_q.shape[0] != num_ctx_tokens)
+                if need_alloc:
+                    self._ctx_fp8_q = torch.empty(
+                        [num_ctx_tokens, qk_dim],
+                        dtype=torch.float8_e4m3fn, device=dev)
+                    self._ctx_fp8_k = torch.empty_like(self._ctx_fp8_q)
+                    self._ctx_fp8_v = torch.empty(
+                        [num_ctx_tokens, v_dim],
+                        dtype=torch.float8_e4m3fn, device=dev)
+                    self._ctx_k_placeholder = torch.empty(
+                        [num_ctx_tokens, 1], dtype=kv.dtype, device=dev)
+                if not hasattr(self, '_ctx_bmm1_scale'):
+                    self._ctx_bmm1_scale = torch.empty(
+                        2, dtype=torch.float32, device=dev)
+                    self._ctx_bmm2_scale = torch.empty(
+                        1, dtype=torch.float32, device=dev)
+                k = self._ctx_k_placeholder
+                fp8_q = self._ctx_fp8_q
+                fp8_k = self._ctx_fp8_k
+                fp8_v = self._ctx_fp8_v
+                mla_bmm1_scale = self._ctx_bmm1_scale
+                mla_bmm2_scale = self._ctx_bmm2_scale
+            else:
+                k = torch.empty(
+                    [num_ctx_tokens, self.num_heads_tp * self.qk_head_dim],
+                    dtype=kv.dtype,
+                    device=compressed_kv.device)
+                torch.ops.trtllm.mla_pack_k_from_kv_rope(
+                    kv, k_pe_roped, k, self.num_heads_tp,
+                    self.qk_nope_head_dim, self.qk_rope_head_dim,
+                    self.v_head_dim)
 
-                # BMM scales: mirror exact C++ formula from mlaKernels.cu
-                dequant_scale_val = wrapper.kv_scale_quant_orig.item()
-                kLog2e = 1.4426950408889634074
+            # KV cache append: use the same pattern as
+            # forward_context_with_cached_kv.  For the default context path
+            # (no cache reuse / chunked prefill), the indptr metadata is
+            # pre-computed once in forward_impl and reused across layers.
+            if not trtllm_md.enable_context_mla_with_cached_kv:
+                if not getattr(trtllm_md, '_fused_ctx_indptr_ready', False):
+                    # Fallback: compute on-the-fly if not pre-computed.
+                    nc = trtllm_md.num_contexts
+                    prompt_lens_ctx = (
+                        trtllm_md.prompt_lens_cuda_runtime[:nc])
+                    prompt_lens_ctx_host = (
+                        trtllm_md.prompt_lens_cpu_runtime[:nc])
+                    trtllm_md.ctx_cached_token_indptr = torch.zeros(
+                        nc + 1, dtype=torch.int64,
+                        device=compressed_kv.device)
+                    trtllm_md.ctx_kv_indptr = torch.zeros(
+                        nc + 1, dtype=torch.int64,
+                        device=compressed_kv.device)
+                    torch.cumsum(
+                        prompt_lens_ctx, dim=0, dtype=torch.int64,
+                        out=trtllm_md.ctx_kv_indptr[1:])
+                    trtllm_md.max_ctx_seq_len = int(
+                        prompt_lens_ctx_host.max().item())
+
+            if do_split_fp8_quant:
                 host_bmm1_scale = 1.0 / (
-                    wrapper.q_scaling * math.sqrt(
-                        self.qk_nope_head_dim + self.qk_rope_head_dim))
-                bmm1_val = (dequant_scale_val * dequant_scale_val
-                            * host_bmm1_scale)
-                mla_bmm1_scale = torch.tensor(
-                    [bmm1_val, bmm1_val * kLog2e],
-                    dtype=torch.float32,
-                    device=compressed_kv.device)
-                # quant_scale_o: attention_output_orig_quant
-                # For MLA context FP8, output is BF16 (out_scale=None),
-                # so quant_scale_o = 1.0.
-                quant_scale_o = 1.0
-                mla_bmm2_scale = torch.tensor(
-                    [quant_scale_o * dequant_scale_val],
-                    dtype=torch.float32,
-                    device=compressed_kv.device)
+                    trtllm_attention.wrapper.q_scaling *
+                    math.sqrt(self.qk_head_dim))
+                torch.ops.trtllm.mla_context_fp8_quantize_kv_split(
+                    q, kv, k_pe_roped, fp8_q, fp8_k, fp8_v,
+                    trtllm_attention.kv_scale_orig_quant, mla_bmm1_scale,
+                    mla_bmm2_scale, self.out_scale,
+                    trtllm_attention.kv_scale_quant_orig,
+                    trtllm_attention.kv_scale_quant_orig, host_bmm1_scale,
+                    self.num_heads_tp, self.qk_nope_head_dim,
+                    self.qk_rope_head_dim, self.v_head_dim)
+                # Compute cu_seqlens from kv_lens_cuda_runtime to match
+                # kvSeqLenPtr (= params.sequence_lengths) in C++ FMHA.
+                nc = trtllm_md.num_contexts
+                kv_lens_ctx = trtllm_md.kv_lens_cuda_runtime[:nc]
+                cu_kv_seqlens = torch.zeros(
+                    nc + 1, dtype=torch.int32, device=kv_lens_ctx.device)
+                torch.cumsum(kv_lens_ctx.to(torch.int32), dim=0,
+                             out=cu_kv_seqlens[1:])
+                cu_q_seqlens = cu_kv_seqlens
 
-            return self.mha.forward(
+            if latent_cache is None:
+                k_pe_contig = k_pe.contiguous()
+                latent_cache_local = torch.cat(
+                    [compressed_kv, k_pe_contig], dim=-1)
+                trtllm_attention.mla_rope_append_paged_kv_assign_q(
+                    q,
+                    latent_cache_local,
+                    trtllm_md,
+                    apply_q_rope=apply_q_rope_in_append)
+            else:
+                trtllm_attention.mla_rope_append_paged_kv_assign_q(
+                    q,
+                    latent_cache,
+                    trtllm_md,
+                    apply_q_rope=apply_q_rope_in_append)
+
+            fmha_result = self.mha.forward(
                 q,
                 k,
                 v,
@@ -2334,6 +2397,8 @@ class MLA(nn.Module):
                 quant_k_buffer=fp8_k,
                 quant_v_buffer=fp8_v,
             )
+
+            return fmha_result
 
         kv = self.kv_b_proj(compressed_kv)
         k_nope, v = kv.split(
@@ -2784,12 +2849,20 @@ class MLA(nn.Module):
                     q.dtype, q.device)
             if trtllm_attention.is_chunked_prefill_for_mla_context(
                     attn_metadata) and get_sm_version() >= 100:
+                # Reconstruct latent_cache if the fused path skipped concat.
+                if latent_cache is None:
+                    latent_cache = torch.concat(
+                        [compressed_kv, k_pe], dim=-1)
                 return self.forward_context_with_chunked_prefill(
                     q, compressed_kv, latent_cache, attn_metadata, output)
             elif trtllm_attention.has_cached_kv_for_mla_context(
                     attn_metadata
             ) or trtllm_attention.is_chunked_prefill_for_mla_context(
                     attn_metadata):
+                # Reconstruct latent_cache if the fused path skipped concat.
+                if latent_cache is None:
+                    latent_cache = torch.concat(
+                        [compressed_kv, k_pe], dim=-1)
                 return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)
         return self.forward_context_default(q, compressed_kv, k_pe,
@@ -3339,22 +3412,26 @@ class MLA(nn.Module):
             and is_sm_100f()
             and attn_metadata.num_contexts == 0)
 
-        # Determine if fused kv_b_proj GEMM + k_pe RoPE + k concat + Q RoPE
-        # + KV cache append should be used.  When active, forward_context_default
-        # uses a CuTe DSL kernel that performs kv_b_proj GEMM, applies RoPE to
-        # k_pe, and builds k = [k_nope, k_pe_roped] per head (eliminating cublas
-        # GEMM + 2 k concat copy kernels).  Then mla_rope_append_paged_kv_assign_q
-        # applies Q RoPE + scatters latent_cache to paged KV cache (eliminating
-        # C++ invokeMLARopeContext).  C++ only runs FP8 quant + FMHA.
+        # Determine if fused q_b_proj GEMM + Q RoPE, kv_b_proj GEMM + k_pe
+        # RoPE, K pack, and KV cache append should be used.  When active,
+        # forward_impl fuses q_b_proj + Q RoPE, forward_context_default fuses
+        # kv_b_proj + k_pe RoPE and packs k = [k_nope, k_pe_roped] per head,
+        # and mla_rope_append_paged_kv_assign_q only scatters latent_cache to
+        # paged KV cache.
         #
         # Requires TrtllmAttention for mla_rope_append_paged_kv_assign_q API,
-        # and apply_rotary_emb=False to avoid double Q RoPE.
+        # and apply_rotary_emb=False so Python RoPE stays out of the context
+        # fused path.
         self._fuse_context_kv_gemm_rope = (
             self.use_cute_dsl_context_gemm_rope
             and self.rotary_emb is not None
             and not self.apply_rotary_emb
             and self.dtype == torch.bfloat16 and is_sm_100f()
             and attn_metadata.num_contexts > 0
+            and attn_metadata.num_ctx_tokens >= 128
+            and not self.q_b_proj.has_bias
+            and not self.kv_b_proj.has_bias
+            and self.q_b_proj.weight.dtype == torch.bfloat16
             and self.kv_b_proj.weight.dtype == torch.bfloat16
             and isinstance(self.mha, TrtllmAttention))
 

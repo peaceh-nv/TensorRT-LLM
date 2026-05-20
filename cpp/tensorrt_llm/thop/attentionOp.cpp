@@ -900,8 +900,12 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
     auto cache_key = std::make_tuple(op->data(), runner->data());
     using CacheKey = decltype(cache_key);
-    static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, hash<CacheKey>> op_cache;
-    if (auto it = op_cache.find(cache_key); it != op_cache.end())
+    // Intentionally leak the cache to avoid static destruction order issues:
+    // at process exit, CUDA/cublas may already be torn down before C++ static
+    // destructors run, causing double-free in cublasDestroy_v2.
+    static auto* op_cache
+        = new std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, hash<CacheKey>>();
+    if (auto it = op_cache->find(cache_key); it != op_cache->end())
     {
         TLLM_LOG_TRACE("Attention op for layer %d is cached", layer_idx);
         op = it->second;
@@ -912,7 +916,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             "Preparing new attention op for layer %d with cache key: %s", layer_idx, to_string(cache_key).c_str());
         op->initialize();
         runner->prepare(*op);
-        op_cache[cache_key] = op;
+        (*op_cache)[cache_key] = op;
     }
 
     int32_t const num_seqs = host_context_lengths.size(0);

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -43,7 +43,7 @@
 
 # Forked from dense_gemm_persistent.py with RoPE epilogue.
 #
-# Computes q_b_proj GEMM and applies half-rotation RoPE to the q_pe
+# Computes q_b_proj GEMM and applies interleaved RoPE to the q_pe
 # portion of the output in the epilogue, fusing the two operations for
 # the MLA context phase.
 #
@@ -51,9 +51,9 @@
 # Within each head, the first qk_nope_head_dim elements pass through
 # unchanged, and the last qk_rope_head_dim elements have RoPE applied.
 #
-# RoPE half-rotation: for rope dimension i (0 <= i < rope_dim/2):
-#   out[i]              = val[i] * cos - val[i + rope_dim/2] * sin
-#   out[i + rope_dim/2] = val[i] * sin + val[i + rope_dim/2] * cos
+# Interleaved RoPE: for rope pair i (0 <= i < rope_dim/2):
+#   out[2*i]     = val[2*i] * cos - val[2*i + 1] * sin
+#   out[2*i + 1] = val[2*i + 1] * cos + val[2*i] * sin
 # where cos, sin are looked up from cos_sin_cache[position_id, i].
 
 from typing import Literal, Optional, Tuple, Type, Union
@@ -117,19 +117,28 @@ def _compute_stages(
 class PersistentDenseGemmRopeEpilogueKernel:
     """Persistent dense GEMM (C = A x B) for Blackwell SM100 with RoPE epilogue.
 
-    Computes q_b_proj GEMM and applies half-rotation RoPE to the q_pe
+    Computes q_b_proj GEMM and applies interleaved RoPE to the q_pe
     portion (last qk_rope_head_dim elements of each head) in the epilogue.
 
-    The RoPE is applied directly on GMEM after the GEMM epilogue stores
-    all subtiles via TMA SMEM->GMEM.  This avoids element-level access on
-    swizzled SMEM (which CuTe DSL does not support) and the complexity of
-    tracking per-register element coordinates in the TMEM->RMEM copy layout.
+    RoPE is applied in registers (RMEM) after the TMEM->RMEM copy and
+    before the RMEM->SMEM->GMEM store path.  This eliminates a GMEM
+    round-trip (read-modify-write) that the previous GMEM-based RoPE
+    approach required.
+
+    The Ld32x32b x N TMEM load with 4 epilogue warps maps each thread
+    to exactly one M row (epi_tid) and N columns equal to the subtile
+    width.  For subtiles whose N range falls within the rope portion of
+    a head (n_in_head >= qk_nope_head_dim), the register elements are
+    rotated in-place in F32 before conversion to BF16 and store.
 
     Requirements:
         - A and B must be BFloat16, accumulator Float32, output BFloat16.
         - mma_tiler_mn[1] must be a multiple of qk_head_dim so that CTA
           tiles align to head boundaries and each subtile's rope portion
           can be processed without cross-subtile dependencies.
+        - qk_rope_head_dim must be a multiple of the epilogue subtile
+          width (typically 64) so rope columns are fully contained in
+          one or more complete subtiles.
         - Batch dimension L=1 (GEMM, not BMM).
     """
 
@@ -354,7 +363,6 @@ class PersistentDenseGemmRopeEpilogueKernel:
             tma_tensor_b,
             tma_atom_c,
             tma_tensor_c if self.use_tma_store else c,
-            c,
             cos_sin_cache,
             position_ids,
             self.cluster_layout_vmnk,
@@ -384,7 +392,6 @@ class PersistentDenseGemmRopeEpilogueKernel:
         mB_nkl: cute.Tensor,
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: cute.Tensor,
-        c_raw: cute.Tensor,
         cos_sin_cache: cute.Tensor,
         position_ids: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
@@ -736,9 +743,7 @@ class PersistentDenseGemmRopeEpilogueKernel:
 
             # RoPE constants
             qk_nope_head_dim = self.qk_nope_head_dim
-            qk_rope_head_dim = self.qk_rope_head_dim
             qk_head_dim = self.qk_head_dim
-            rope_half = qk_rope_head_dim // 2
 
             # Epilogue thread index (within epilogue warps)
             epilog_threads = 32 * len(self.epilogue_warp_id)
@@ -768,18 +773,80 @@ class PersistentDenseGemmRopeEpilogueKernel:
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
 
-                # Global M and N offsets for this CTA tile
+                # Global M offset for this CTA tile
                 tile_m_offset = mma_tile_coord_mnl[0] * self.cta_tile_shape_mnk[0]
-                tile_n_offset = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
 
                 # Store accumulator to global memory in sub-tiles
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 num_prev_subtiles = (num_tiles_executed - 1) * subtile_cnt
 
+                # Number of N columns per subtile (= elements per thread
+                # in the Ld32x32b register layout).
+                epi_tile_n = cute.size(tTR_rAcc)
+                actual_m = cute.size(position_ids)
+
+                # This thread's M row within the CTA tile.  With
+                # Ld32x32b x N and 4 epilogue warps, epi_tid in
+                # [0, 128) maps 1:1 to M rows [0, cta_tile_M).
+                m_global_raw = tile_m_offset + epi_tid
+                m_in_bounds = epi_tid < self.cta_tile_shape_mnk[0]
+                m_valid = m_in_bounds and (m_global_raw < actual_m)
+
+                # Clamp to valid range for safe GMEM access; out-of-
+                # bounds threads will read pos from row 0 but skip
+                # the RoPE write-back via the m_valid guard.
+                m_global = m_global_raw if m_valid else cutlass.Int32(0)
+                pos = position_ids[m_global]
+
                 for subtile_idx in cutlass.range(subtile_cnt):
                     # Load accumulator from TMEM to RMEM
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+                    # ======================================================
+                    # RoPE in RMEM:  If this subtile's N range falls
+                    # within the rope portion of a head, rotate pairs
+                    # in F32 registers before the BF16 conversion.
+                    #
+                    # Subtile N start within the CTA tile:
+                    #   subtile_n_start = subtile_idx * epi_tile_n
+                    # N position within a head:
+                    #   n_in_head = subtile_n_start % qk_head_dim
+                    # Rope region check:
+                    #   n_in_head >= qk_nope_head_dim
+                    # ======================================================
+                    subtile_n_start = subtile_idx * epi_tile_n
+                    n_in_head = subtile_n_start % qk_head_dim
+                    if n_in_head >= qk_nope_head_dim:
+                        # This subtile is fully within the rope region.
+                        # rope_col_offset: offset of this subtile's
+                        # first column within the rope portion of the
+                        # head (0 when the subtile is the first rope
+                        # subtile).
+                        rope_col_offset = n_in_head - qk_nope_head_dim
+                        if m_valid:
+                            for j in cutlass.range_constexpr(
+                                0, cute.size(tTR_rAcc), 2
+                            ):
+                                v1 = tTR_rAcc[j, 0, 0]
+                                v2 = tTR_rAcc[j + 1, 0, 0]
+
+                                # rope pair index within the full
+                                # rope_dim/2 cos/sin table
+                                pair_idx = (rope_col_offset + j) // 2
+                                cos_val = cos_sin_cache[
+                                    pos, pair_idx * 2
+                                ].to(cutlass.Float32)
+                                sin_val = cos_sin_cache[
+                                    pos, pair_idx * 2 + 1
+                                ].to(cutlass.Float32)
+
+                                tTR_rAcc[j, 0, 0] = (
+                                    v1 * cos_val - v2 * sin_val
+                                )
+                                tTR_rAcc[j + 1, 0, 0] = (
+                                    v2 * cos_val + v1 * sin_val
+                                )
 
                     # Convert to output type and apply epilogue op
                     acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
@@ -809,45 +876,6 @@ class PersistentDenseGemmRopeEpilogueKernel:
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=epilog_threads,
                     )
-
-                # ======================================================
-                # RoPE on GMEM: after all subtiles of this CTA tile are
-                # written to GMEM, apply RoPE directly on GMEM.
-                # Each epilogue thread processes a subset of M rows.
-                # Bounds-check m_global against actual M to handle
-                # partial tiles at the boundary.
-                # ======================================================
-                actual_m = cute.size(position_ids)
-                for m_off in cutlass.range(0, self.cta_tile_shape_mnk[0], epilog_threads):
-                    m_local = m_off + epi_tid
-                    if m_local < self.cta_tile_shape_mnk[0]:
-                        m_global = tile_m_offset + m_local
-                        if m_global < actual_m:
-                            pos = position_ids[m_global]
-
-                            # For each head in this CTA tile's N range
-                            for n_local in cutlass.range(0, self.cta_tile_shape_mnk[1], 1):
-                                n_global = tile_n_offset + n_local
-                                dim_in_head = n_global % qk_head_dim
-
-                                # First half of rope portion
-                                if dim_in_head >= qk_nope_head_dim and dim_in_head < qk_nope_head_dim + rope_half:
-                                    rope_dim = dim_in_head - qk_nope_head_dim
-
-                                    # Read paired values from GMEM (C output)
-                                    v1 = c_raw[m_global, n_global, 0].to(cutlass.Float32)
-                                    v2 = c_raw[m_global, n_global + rope_half, 0].to(cutlass.Float32)
-
-                                    # Look up cos/sin from cache
-                                    cos_val = cos_sin_cache[pos, rope_dim * 2].to(cutlass.Float32)
-                                    sin_val = cos_sin_cache[pos, rope_dim * 2 + 1].to(cutlass.Float32)
-
-                                    # Half-rotation RoPE
-                                    result1 = v1 * cos_val - v2 * sin_val
-                                    result2 = v1 * sin_val + v2 * cos_val
-
-                                    c_raw[m_global, n_global, 0] = result1.to(self.c_dtype)
-                                    c_raw[m_global, n_global + rope_half, 0] = result2.to(self.c_dtype)
 
                 # Release accumulator buffer
                 with cute.arch.elect_one():
@@ -990,7 +1018,7 @@ class PersistentDenseGemmRopeEpilogueKernel:
         In addition to the standard GEMM constraints, requires:
         - N dimension is a multiple of qk_head_dim (head-aligned tiles)
         - mma_tiler_mn[1] is a multiple of qk_head_dim
-        - qk_rope_head_dim is even (for half-rotation)
+        - qk_rope_head_dim is even (for interleaved RoPE pairs)
         """
         if not PersistentDenseGemmRopeEpilogueKernel.check_supported_dtypes(
             ab_dtype, ab_dtype, acc_dtype, c_dtype

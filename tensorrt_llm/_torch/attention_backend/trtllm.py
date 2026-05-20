@@ -2547,6 +2547,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
+        apply_q_rope: bool = True,
         **kwargs,
     ) -> None:
         assert self.is_mla_enable and self.mla_params is not None
@@ -2582,6 +2583,52 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sink_token_length,
             beam_width,
             self.quant_mode,
+            apply_q_rope,
+        )
+
+    def mla_rope_append_paged_kv_split_input(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        metadata: 'TrtllmAttentionMetadata',
+        apply_q_rope: bool = True,
+        **kwargs,
+    ) -> None:
+        assert self.is_mla_enable and self.mla_params is not None
+        assert metadata.kv_cache_manager is not None
+
+        self.wrapper.ensure_rope_table_size(
+            metadata.kv_cache_manager.max_seq_len)
+
+        sink_token_length = 0
+        beam_width = 1
+
+        torch.ops.trtllm.mla_rope_append_paged_kv_split_input(
+            q,
+            compressed_kv,
+            k_pe,
+            metadata.num_contexts,
+            metadata.ctx_cached_token_indptr,
+            metadata.ctx_kv_indptr,
+            metadata.max_ctx_seq_len,
+            self.wrapper.rotary_cos_sin,
+            self.num_heads,
+            self.mla_params.qk_nope_head_dim,
+            self.mla_params.qk_rope_head_dim,
+            self.mla_params.kv_lora_rank,
+            metadata.kv_cache_block_offsets,
+            metadata.kv_cache_manager.kv_cache_pool_pointers,
+            metadata.kv_cache_manager.kv_cache_pool_mapping,
+            self.kv_scale_orig_quant,
+            self.kv_scale_quant_orig,
+            self.get_local_layer_idx(metadata),
+            metadata.kv_cache_manager.tokens_per_block,
+            metadata.kv_cache_manager.max_seq_len,
+            sink_token_length,
+            beam_width,
+            self.quant_mode,
+            apply_q_rope,
         )
 
     def merge_attention_for_mla(

@@ -2380,6 +2380,7 @@ class DSATrtllmAttention(TrtllmAttention):
         latent_cache: torch.Tensor,
         metadata: DSAtrtllmAttentionMetadata,
         is_generation: bool = False,
+        apply_q_rope: bool = True,
         **kwargs,
     ) -> None:
         """Apply RoPE, append latent cache to paged KV, and assign query for MLA."""
@@ -2425,6 +2426,7 @@ class DSATrtllmAttention(TrtllmAttention):
             sink_token_length,
             beam_width,
             self.quant_mode,
+            apply_q_rope,
         )
 
 
