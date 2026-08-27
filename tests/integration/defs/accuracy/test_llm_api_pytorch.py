@@ -38,6 +38,7 @@ from tensorrt_llm.llmapi import (
     SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
     TorchCompileConfig)
 # isort: on
+from tensorrt_llm.llmapi.llm_args import Nvfp4GemmConfig
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -46,7 +47,7 @@ from ..conftest import (check_device_contain, get_device_count,
                         parametrize_with_ids, skip_no_hopper,
                         skip_no_mxfp4_swizzle, skip_post_blackwell,
                         skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
-                        skip_pre_hopper, skip_ray, skip_x86)
+                        skip_pre_hopper, skip_pre_rubin, skip_ray, skip_x86)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2, assert_acceptance_length)
@@ -178,9 +179,46 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    def test_nvfp4(self):
+    def test_nvfp4(self, nvfp4_gemm_backend):
         model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
-        with LLM(model_path) as llm:
+        sm_version = get_sm_version()
+        if nvfp4_gemm_backend == "cutedsl" and sm_version not in (100, 103, 107):
+            pytest.skip(f"cutedsl nvfp4_gemm_backend supports SM 100, 103, 107 only")
+
+        llm_kwargs = {}
+        if nvfp4_gemm_backend is not None:
+            llm_kwargs["nvfp4_gemm_config"] = Nvfp4GemmConfig(
+                allowed_backends=[nvfp4_gemm_backend]
+            )
+
+        with LLM(model_path, **llm_kwargs) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_rubin
+    def test_cute_dsl_bf16_gemm_tunable_rubin_kernels(self):
+        with LLM(
+            self.MODEL_PATH,
+            enable_autotuner=True,
+            use_cute_dsl_bf16_gemm=True,
+            use_cute_dsl_bf16_bmm=True,
+        ) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_rubin
+    def test_nvfp4_cutedsl_mixed_cluster_tunable_rubin_kernels(self):
+        model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
+        with LLM(
+            model_path,
+            enable_autotuner=True,
+            nvfp4_gemm_config=Nvfp4GemmConfig(allowed_backends=["cutedsl"]),
+        ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
@@ -2424,12 +2462,18 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM", "CUTEDSL"])
     def test_nvfp4(self, fp8kv, attention_dp, cuda_graph, overlap_scheduler,
-                   torch_compile, mtp_nextn, moe_backend):
+                   torch_compile, mtp_nextn, moe_backend,
+                   nvfp4_gemm_backend):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
-        if moe_backend == "CUTEDSL" and sm_version not in (100, 103):
-            pytest.skip(f"{moe_backend} backend supports SM 100 and 103 only")
+        if moe_backend == "CUTEDSL" and sm_version not in (100, 103, 107):
+            pytest.skip(
+                f"{moe_backend} backend supports SM 100, 103, and 107 only")
+        if nvfp4_gemm_backend == "cutedsl" and sm_version not in (100, 103,
+                                                                  107):
+            pytest.skip(
+                "cutedsl nvfp4_gemm_backend supports SM 100, 103, 107 only")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
@@ -2438,6 +2482,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(backend=moe_backend))
+        if nvfp4_gemm_backend is not None:
+            pytorch_config["nvfp4_gemm_config"] = Nvfp4GemmConfig(
+                allowed_backends=[nvfp4_gemm_backend])
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
@@ -2626,8 +2673,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
-        if moe_backend == "CUTEDSL" and sm_version not in (100, 103):
-            pytest.skip(f"{moe_backend} backend supports SM 100 and 103 only")
+        if moe_backend == "CUTEDSL" and sm_version not in (100, 103, 107):
+            pytest.skip(
+                f"{moe_backend} backend supports SM 100, 103, and 107 only")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         # Picewise Cuda Graph cannot be enabled for nvfp4 attention dp.
@@ -2837,7 +2885,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,enable_lm_head_tp_in_adp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,enable_lm_head_tp_in_adp,cuda_graph,overlap_scheduler,max_batch_size,enable_locality_domains,moe_backend",
         [
             #  Use a larger batch_size to speed up the tests
             pytest.param(8,
@@ -2850,6 +2898,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          True,
                          True,
                          32,
+                         False,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
             pytest.param(8,
@@ -2862,6 +2911,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          True,
                          True,
                          32,
+                         False,
                          "TRTLLM",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
             pytest.param(8,
@@ -2874,6 +2924,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          True,
                          True,
                          32,
+                         False,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
             pytest.param(8,
@@ -2886,6 +2937,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          True,
                          True,
                          32,
+                         False,
                          "TRTLLM",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
             pytest.param(4,
@@ -2898,6 +2950,20 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          True,
                          True,
                          16,
+                         False,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
+            pytest.param(4,
+                         1,
+                         4,
+                         3,
+                         False,
+                         True,
+                         True,
+                         True,
+                         True,
+                         16,
+                         True,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(4)),
             pytest.param(8,
@@ -2910,6 +2976,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          True,
                          True,
                          32,
+                         False,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
             pytest.param(8,
@@ -2922,6 +2989,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          True,
                          True,
                          32,
+                         False,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
             pytest.param(4,
@@ -2934,6 +3002,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          True,
                          True,
                          16,
+                         False,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(4)),
             pytest.param(8,
@@ -2946,6 +3015,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          True,
                          True,
                          32,
+                         False,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
             pytest.param(8,
@@ -2958,6 +3028,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          True,
                          True,
                          8,
+                         False,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
             pytest.param(1,
@@ -2970,19 +3041,21 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          True,
                          True,
                          32,
+                         False,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(4)),
         ],
         ids=[
             "latency", "latency_trtllmgen", "latency_adp_lmtp",
-            "latency_trtllmgen_adp_lmtp", "latency_adp_lmtp_tp4", "throughput",
+            "latency_trtllmgen_adp_lmtp", "latency_adp_lmtp_tp4",
+            "latency_adp_lmtp_tp4_locality_domain", "throughput",
             "throughput_tp8", "throughput_tp4", "throughput_mtp",
             "throughput_bs8_mtp", "throughput_pp4_mtp"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, enable_lm_head_tp_in_adp,
                               cuda_graph, overlap_scheduler, max_batch_size,
-                              moe_backend):
+                              enable_locality_domains, moe_backend):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
@@ -2994,7 +3067,11 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         # ADP + LM-head-TP cases, whose draft sampling takes a dedicated path.
         check_acceptance = mtp_nextn > 0 and enable_lm_head_tp_in_adp
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
+        kv_cache_config_kwargs = dict(free_gpu_memory_fraction=0.70)
+        if enable_locality_domains:
+            kv_cache_config_kwargs.update(free_gpu_memory_fraction=0.80,
+                                          use_kv_cache_manager_v2=True)
+        kv_cache_config = KvCacheConfig(**kv_cache_config_kwargs)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -4963,18 +5040,24 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         [
             (1, 1, 1, False, "CUTLASS"),
             (1, 1, 1, False, "TRTLLM"),
+            (1, 1, 1, False, "CUTEDSL"),
             (4, 1, 4, True, "CUTLASS"),
             (4, 1, 4, True, "TRTLLM"),
+            (4, 1, 4, True, "CUTEDSL"),
             (4, 1, 4, False, "CUTLASS"),
             (4, 1, 4, False, "TRTLLM"),
+            (4, 1, 4, False, "CUTEDSL"),
         ],
         ids=[
             "latency_moe_cutlass",
             "latency_moe_trtllm",
+            "latency_moe_cutedsl",
             "dep4_latency_moe_cutlass",
             "dep4_latency_moe_trtllm",
+            "dep4_latency_moe_cutedsl",
             "tep4_latency_moe_cutlass",
             "tep4_latency_moe_trtllm",
+            "tep4_latency_moe_cutedsl",
         ],
     )
     def test_nvfp4(
@@ -4985,11 +5068,19 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         attention_dp,
         moe_backend,
         torch_compile,
+        nvfp4_gemm_backend,
     ):
 
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
+        if moe_backend == "CUTEDSL" and sm_version not in (100, 103, 107):
+            pytest.skip(
+                f"{moe_backend} backend supports SM 100, 103, and 107 only")
+        if nvfp4_gemm_backend == "cutedsl" and sm_version not in (100, 103,
+                                                                  107):
+            pytest.skip(
+                "cutedsl nvfp4_gemm_backend supports SM 100, 103, 107 only")
 
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
@@ -4998,6 +5089,9 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             moe_config=MoeConfig(backend=moe_backend),
             torch_compile_config=torch_compile_config,
         )
+        if nvfp4_gemm_backend is not None:
+            pytorch_config["nvfp4_gemm_config"] = Nvfp4GemmConfig(
+                allowed_backends=[nvfp4_gemm_backend])
 
         with LLM(
                 f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf",

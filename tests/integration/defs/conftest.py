@@ -1686,6 +1686,21 @@ def pytest_addoption(parser):
         "'Test terminated unexpectedly' record into a diagnosable hang stack. "
         "Only used with --periodic-junit.",
     )
+    parser.addoption(
+        "--nvfp4-gemm-backend",
+        action="store",
+        default=None,
+        help=(
+            "Override the NVFP4 GEMM backend for tests. Valid values: 'cutedsl', None. "
+            "When not specified, tests use their default behavior."
+        ),
+    )
+
+
+@pytest.fixture
+def nvfp4_gemm_backend(request):
+    """Provide the requested NVFP4 GEMM backend or the default."""
+    return request.config.getoption("--nvfp4-gemm-backend")
 
 
 @pytest.hookimpl(trylast=True)

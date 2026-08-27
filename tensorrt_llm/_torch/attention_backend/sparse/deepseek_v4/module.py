@@ -11,6 +11,10 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionInputType, AttentionMetadata
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_AVAILABLE,
+    IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.multi_stream_utils import (
     do_multi_stream,
@@ -19,7 +23,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import AuxStreamType
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version
 
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from ..params import SparseBackendForwardArgs
@@ -27,9 +31,6 @@ from ..params import SparseBackendForwardArgs
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed import AllReduceParams
     from tensorrt_llm._torch.modules.mla import MLA
-
-_q_b_proj_cute_dsl_import_ok: Optional[bool] = None
-
 
 # Module initialization and weight lifecycle for DeepSeek-V4 MLA.
 
@@ -149,7 +150,10 @@ def create_sparse_attn_weights(self) -> None:
             ),
             requires_grad=False,
         )
-        if is_sm_100f():
+        sm_version = get_sm_version()
+        if (sm_version in (100, 103) and IS_CUTLASS_DSL_AVAILABLE) or (
+            sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+        ):
             self.o_a_proj = nn.Parameter(
                 torch.empty(
                     (
@@ -207,13 +211,20 @@ def _run_dsv4_o_lora_bmms(
         phase_o_lora_output: torch.Tensor,
     ) -> None:
         attn_fp8, attn_scale = o_lora_bmm_input
-        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
+        sm_version = get_sm_version()
+        op_args = (
             attn_fp8,
             self.o_a_proj,
             attn_scale,
             self.o_a_proj_scale,
             phase_o_lora_output.transpose(0, 1),
         )
+        if sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            torch.ops.trtllm.cute_dsl_fp8_bmm_rubin(*op_args)
+        elif sm_version in (100, 103) and IS_CUTLASS_DSL_AVAILABLE:
+            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(*op_args)
+        else:
+            raise RuntimeError("DSv4 O-LoRA epilogue fusion requires a CuTe DSL FP8 BMM backend.")
 
     if context_o_lora_bmm_input is not None:
         run_o_lora_bmm(
@@ -227,6 +238,66 @@ def _run_dsv4_o_lora_bmms(
         )
 
 
+
+def _deepseek_v4_fp8_o_a_proj(
+    self: MLA,
+    attn_fp8: torch.Tensor,
+    attn_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Run native FP8 o_a_proj and feed its result to o_b_proj."""
+    num_tokens = attn_fp8.shape[1]
+    if (
+        get_sm_version() == 107
+        and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+        and self.o_b_proj.has_fp8_block_scales
+    ):
+        flat_n = self.n_local_groups * self.o_lora_rank
+        fp8_output = torch.empty(
+            (num_tokens, flat_n),
+            dtype=torch.float8_e4m3fn,
+            device=attn_fp8.device,
+        )
+        fp8_batched = fp8_output.view(num_tokens, self.n_local_groups, self.o_lora_rank).transpose(
+            0, 1
+        )
+        scale_numel = (num_tokens + 127) // 128 * 128 * (((flat_n + 31) // 32 + 3) // 4 * 4)
+        packed_scale = torch.empty(
+            (scale_numel,),
+            dtype=torch.uint8,
+            device=attn_fp8.device,
+        )
+        torch.ops.trtllm.cute_dsl_fp8_bmm_quantize_rubin_out(
+            attn_fp8,
+            self.o_a_proj,
+            attn_scale,
+            self.o_a_proj_scale,
+            fp8_batched,
+            packed_scale,
+        )
+        return self.o_b_proj((fp8_output, packed_scale))
+
+    o_lora = torch.empty(
+        [num_tokens, self.n_local_groups, self.o_lora_rank],
+        device=attn_fp8.device,
+        dtype=self.dtype,
+    )
+    op_args = (
+        attn_fp8,
+        self.o_a_proj,
+        attn_scale,
+        self.o_a_proj_scale,
+        o_lora.transpose(0, 1),
+    )
+    sm_version = get_sm_version()
+    if sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        torch.ops.trtllm.cute_dsl_fp8_bmm_rubin(*op_args)
+    elif sm_version in (100, 103) and IS_CUTLASS_DSL_AVAILABLE:
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(*op_args)
+    else:
+        raise RuntimeError("DSv4 O-LoRA projection requires a CuTe DSL FP8 BMM backend.")
+    return self.o_b_proj(o_lora.flatten(1))
+
+
 def prepare_sparse_attn_outputs(
     self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
 ) -> list[torch.Tensor]:
@@ -237,7 +308,11 @@ def prepare_sparse_attn_outputs(
             return False
         if num_contexts == 0 and num_generations == 0:
             return False
-        if self.mapping.has_cp_helix() or not is_sm_100f():
+        sm_version = get_sm_version()
+        uses_cute_dsl = (sm_version in (100, 103) and IS_CUTLASS_DSL_AVAILABLE) or (
+            sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+        )
+        if self.mapping.has_cp_helix() or not uses_cute_dsl:
             return False
         if not getattr(self.mapping, "enable_attention_dp", False):
             return False
@@ -289,7 +364,11 @@ def project_sparse_attn_output(
 
     # Fuse inverse RoPE with FP8 quantization to avoid a BF16 latent read/write.
     # This is independent of the K/V absorption BMM implementation.
-    fused_inv_rope_fp8 = self.o_a_proj.dtype == torch.float8_e4m3fn and is_sm_100f()
+    sm_version = get_sm_version()
+    uses_cute_dsl = (sm_version in (100, 103) and IS_CUTLASS_DSL_AVAILABLE) or (
+        sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+    )
+    fused_inv_rope_fp8 = self.o_a_proj.dtype == torch.float8_e4m3fn and uses_cute_dsl
     if fused_inv_rope_fp8:
         heads_per_group = self.num_heads_tp // self.n_local_groups
         attn_fp8, attn_scale = torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
@@ -303,20 +382,7 @@ def project_sparse_attn_output(
             128,
             self.inverse_rotary_emb.is_neox,
         )
-        o_lora = torch.empty(
-            [num_tokens, self.n_local_groups, self.o_lora_rank],
-            device=attn_output_tensor.device,
-            dtype=self.dtype,
-        )
-        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
-            attn_fp8,
-            self.o_a_proj,
-            attn_scale,
-            self.o_a_proj_scale,
-            o_lora.transpose(0, 1),
-        )
-        o_lora = o_lora.flatten(1)
-        return self.o_b_proj(o_lora)
+        return _deepseek_v4_fp8_o_a_proj(self, attn_fp8, attn_scale)
 
     # Restore the RoPE portion before output projection.
     torch.ops.trtllm.mla_rope_inplace(
@@ -421,6 +487,135 @@ def _is_fused_q_fp8_quant_enabled(
     if self.kv_cache_dtype == "fp8_ds_mla":
         return False
     return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
+
+
+
+
+def _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
+    self: MLA,
+    q: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    attn_metadata: AttentionMetadata,
+) -> bool:
+    """Whether q_b can use the SM107 GEMM + norm + RoPE fusion."""
+    if os.environ.get("TRTLLM_DISABLE_DSV4_Q_B_GEMM_NORM_ROPE_FUSION", "0") == "1":
+        return False
+    # The sparse hooks must consume the fused KV/Q buffers instead of the
+    # placeholder BF16 Q returned by this path.
+    if not getattr(self, "_fused_kv_norm_active", False):
+        return False
+    # The q_b fusion produces complete pre-rotated FP8 Q for a context-only or
+    # generation-only batch. Mixed batches retain their phase-specific path.
+    if attn_metadata.num_contexts > 0 and attn_metadata.num_generations > 0:
+        return False
+    if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        return False
+    if self.apply_rotary_emb or position_ids is None:
+        return False
+    if q.dtype != torch.bfloat16 or q.dim() != 2 or not q.is_contiguous():
+        return False
+    if q.shape != (attn_metadata.num_tokens, self.q_lora_rank):
+        return False
+    if position_ids.numel() != q.shape[0] or position_ids.device != q.device:
+        return False
+    if not hasattr(self.mqa, "_ensure_rope_table_size"):
+        return False
+    if getattr(self.mqa, "rotary_cos_sin", None) is None:
+        return False
+    if self.q_b_proj.bias is not None or self.q_b_proj.lora is not None:
+        return False
+    if getattr(self.q_b_proj, "_locality_domain_weight_shards", None) is not None:
+        return False
+    if not self.q_b_proj.has_fp8_block_scales:
+        return False
+    if not (self.q_b_proj.use_cute_dsl_blockscaling_mm or self.q_b_proj.disable_deep_gemm):
+        return False
+    if self.q_b_proj.weight.dtype != torch.float8_e4m3fn:
+        return False
+    if self.q_b_proj.weight_scale.dtype != torch.uint8:
+        return False
+    if self.q_b_proj.weight.shape != (
+        self.num_heads_tp * self.qk_head_dim,
+        self.q_lora_rank,
+    ):
+        return False
+    if self.q_lora_rank % 128 != 0:
+        return False
+
+    if attn_metadata.num_contexts > 0:
+        rope_specs = getattr(self, "_fused_q_rope_specs_cached", [])
+        if len(rope_specs) != 1:
+            return False
+        cu_q_seqlens = rope_specs[0][3]
+    else:
+        cu_q_seqlens = attn_metadata.cu_q_seqlens
+        if cu_q_seqlens is None:
+            generation_cu_seqlens = getattr(attn_metadata, "cu_seq_lens_cuda", None)
+            if generation_cu_seqlens is not None:
+                cu_q_seqlens = generation_cu_seqlens[: attn_metadata.num_generations + 1]
+    kv_cache_lengths = getattr(attn_metadata, "kv_lens_cuda_runtime", None)
+    if cu_q_seqlens is None or kv_cache_lengths is None:
+        return False
+    if cu_q_seqlens.numel() != kv_cache_lengths.numel() + 1:
+        return False
+    if cu_q_seqlens.dtype != torch.int32 or kv_cache_lengths.dtype != torch.int32:
+        return False
+    if cu_q_seqlens.device != q.device or kv_cache_lengths.device != q.device:
+        return False
+    return kv_cache_lengths.numel() <= 128
+
+
+def _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(
+    self: MLA,
+    q: torch.Tensor,
+    position_ids: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse the FP8 q_b GEMM, per-head RMSNorm, RoPE, and output quant."""
+    assert q.dim() == 2 and q.shape[1] == self.q_lora_rank
+    if getattr(self, "_quant_scale_qkv", None) is None:
+        self._quant_scale_qkv = torch.tensor([1.0], dtype=torch.float32, device=q.device)
+
+    q_fp8, q_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(q)
+    position_ids_i32 = position_ids.reshape(-1)
+    if position_ids_i32.dtype != torch.int32:
+        position_ids_i32 = position_ids_i32.to(torch.int32)
+
+    if attn_metadata.num_contexts > 0:
+        rope_specs = getattr(self, "_fused_q_rope_specs_cached", [])
+        assert len(rope_specs) == 1
+        cu_q_seqlens = rope_specs[0][3]
+    else:
+        cu_q_seqlens = attn_metadata.cu_q_seqlens
+        if cu_q_seqlens is None:
+            generation_cu_seqlens = getattr(attn_metadata, "cu_seq_lens_cuda", None)
+            assert generation_cu_seqlens is not None
+            cu_q_seqlens = generation_cu_seqlens[: attn_metadata.num_generations + 1]
+    assert cu_q_seqlens is not None
+    kv_cache_lengths = attn_metadata.kv_lens_cuda_runtime
+    assert kv_cache_lengths is not None
+
+    self.mqa._ensure_rope_table_size(attn_metadata.max_seq_len)
+    quant_q_buffer = torch.ops.trtllm.cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(
+        q_fp8,
+        self.q_b_proj.weight,
+        q_scale,
+        self.q_b_proj.weight_scale,
+        self.mqa.rotary_cos_sin,
+        cu_q_seqlens,
+        kv_cache_lengths,
+        position_ids_i32,
+        self._quant_scale_qkv,
+        float(self.q_b_layernorm.variance_epsilon),
+    )
+    placeholder_q = q.new_empty((q.shape[0], self.num_heads_tp * self.qk_head_dim))
+    # The coupled target paths never read Q RoPE: context's fused KV kernel
+    # returns before Q processing and generation runs KV-only. This view keeps
+    # the existing optional-tensor schemas satisfied without another allocation.
+    placeholder_q_pe = placeholder_q.view(q.shape[0], self.num_heads_tp, self.qk_head_dim)[
+        ..., self.qk_nope_head_dim :
+    ]
+    return placeholder_q, quant_q_buffer, placeholder_q_pe, self._quant_scale_qkv
 
 
 def _is_fused_prologue_active(
@@ -1004,15 +1199,11 @@ def forward_sparse_attn(
     )
 
     def _q_b_proj_cute_dsl_bf16(q: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        global _q_b_proj_cute_dsl_import_ok
-        if _q_b_proj_cute_dsl_import_ok is None:
-            try:
-                from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-
-                _q_b_proj_cute_dsl_import_ok = IS_CUTLASS_DSL_AVAILABLE
-            except ImportError:
-                _q_b_proj_cute_dsl_import_ok = False
-        if not _q_b_proj_cute_dsl_import_ok or not is_sm_100f():
+        sm_version = get_sm_version()
+        uses_cute_dsl_bf16 = (sm_version in (100, 103) and IS_CUTLASS_DSL_AVAILABLE) or (
+            sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+        )
+        if not uses_cute_dsl_bf16:
             return torch.nn.functional.linear(q, weight)
 
         assert q.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
@@ -1022,7 +1213,10 @@ def forward_sparse_attn(
         weight = weight.contiguous()
         m, n = q.shape[0], weight.shape[0]
         out = q.new_empty((m, n), dtype=torch.bfloat16)
-        torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(q, weight, out)
+        if sm_version == 107:
+            torch.ops.trtllm.cute_dsl_bf16_gemm_rubin(q, weight, out)
+        else:
+            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(q, weight, out)
         return out
 
     def _fused_q_fp8_quant_enabled() -> bool:
@@ -1054,6 +1248,14 @@ def forward_sparse_attn(
         )
 
     def _q_branch():
+        if _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(self, q, position_ids, attn_metadata):
+            placeholder_q, quant_q_buffer, q_pe, quant_scale_qkv = (
+                _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(self, q, position_ids, attn_metadata)
+            )
+            self._fused_quant_q_buffer = quant_q_buffer
+            self._fused_q_pe = q_pe
+            self._quant_scale_qkv = quant_scale_qkv
+            return placeholder_q
         if _use_q_b_cute:
             q_proj = _q_b_proj_cute_dsl_bf16(q, self.q_b_proj.weight)
             # The context path detects fusion from these buffers, so clear stale state.

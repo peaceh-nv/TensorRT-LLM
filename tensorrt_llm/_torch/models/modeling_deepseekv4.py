@@ -1637,6 +1637,7 @@ class DeepseekV4MoE(nn.Module):
             config=model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
+            use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             swiglu_limit=swiglu_limit,
         )
 
@@ -2304,6 +2305,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 dtype=config.torch_dtype,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             )
             self.h_proj = Linear(
                 config.hidden_size,
@@ -2312,6 +2314,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 dtype=config.torch_dtype,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             )
         else:
             self.e_proj = Linear(
@@ -2324,6 +2327,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 reduce_output=True,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             )
             self.h_proj = Linear(
                 config.hidden_size,
@@ -2335,6 +2339,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 reduce_output=True,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             )
 
         self.shared_head = DeepseekV4MTPHead(model_config)
@@ -2591,7 +2596,10 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
         }
         if llm_args is not None and llm_args.kv_cache_config.dtype == "fp8_ds_mla":
             kv_cache_defaults["tokens_per_block"] = 256
-        return {"kv_cache_config": kv_cache_defaults}
+        return {
+            "kv_cache_config": kv_cache_defaults,
+            "use_cute_dsl_blockscaling_mm": get_sm_version() == 107,
+        }
 
     @classmethod
     def get_preferred_kv_cache_manager_version(
