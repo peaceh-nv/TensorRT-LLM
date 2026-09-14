@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import atexit
 import contextlib
@@ -256,6 +259,7 @@ def get_llm_args(
         agent_percentage: float = 0.0,
         agent_types: Optional[str] = None,
         explicit_cli_keys: Optional[Set[str]] = None,
+        enable_locality_domains: bool = False,
         **llm_args_extra_dict: Any):
 
     explicit_cli_keys = explicit_cli_keys or set()
@@ -325,6 +329,8 @@ def get_llm_args(
         enable_chunked_prefill,
         "enable_attention_dp":
         enable_attention_dp,
+        "enable_locality_domains":
+        enable_locality_domains,
         "revision":
         revision,
         "reasoning_parser":
@@ -1211,6 +1217,12 @@ def launch_visual_gen_server(
                   default=False,
                   help="Enable attention data parallel.",
                   status="beta")
+@stability_option(
+    "--enable_locality_domains",
+    is_flag=True,
+    default=False,
+    help="Enable locality domain execution for supported PyTorch backend ops.",
+    status="prototype")
 @stability_option("--media_io_kwargs",
                   type=str,
                   default=None,
@@ -1305,32 +1317,59 @@ def launch_visual_gen_server(
     "launcher read the kernel-assigned port back instead of reserving one up "
     "front.",
     status="prototype")
-def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
-          post_processor_hook: Optional[str], host: str, port: int,
-          log_level: str, backend: str, generation_config: str,
-          max_beam_width: int, max_batch_size: int, max_num_tokens: int,
-          max_seq_len: int, tensor_parallel_size: int,
-          pipeline_parallel_size: int, context_parallel_size: int,
+def serve(model: str,
+          tokenizer: Optional[str],
+          custom_tokenizer: Optional[str],
+          post_processor_hook: Optional[str],
+          host: str,
+          port: int,
+          log_level: str,
+          backend: str,
+          generation_config: str,
+          max_beam_width: int,
+          max_batch_size: int,
+          max_num_tokens: int,
+          max_seq_len: int,
+          tensor_parallel_size: int,
+          pipeline_parallel_size: int,
+          context_parallel_size: int,
           moe_expert_parallel_size: Optional[int],
           moe_cluster_parallel_size: Optional[int],
-          gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
-          kv_cache_dtype: str, num_postprocess_workers: int,
-          num_serve_frontends: int, num_input_processor_workers: int,
-          num_media_load_workers: int, trust_remote_code: bool,
-          revision: Optional[str], extra_llm_api_options: Optional[str],
-          reasoning_parser: Optional[str], tool_parser: Optional[str],
+          gpus_per_node: Optional[int],
+          free_gpu_memory_fraction: float,
+          kv_cache_dtype: str,
+          num_postprocess_workers: int,
+          num_serve_frontends: int,
+          num_input_processor_workers: int,
+          num_media_load_workers: int,
+          trust_remote_code: bool,
+          revision: Optional[str],
+          extra_llm_api_options: Optional[str],
+          reasoning_parser: Optional[str],
+          tool_parser: Optional[str],
           metadata_server_config_file: Optional[str],
           server_role: Optional[str],
           fail_fast_on_attention_window_too_large: bool,
-          otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-          enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
-          media_io_kwargs: Optional[str], agent_percentage: float,
-          agent_types: Optional[str], video_pruning_rate: Optional[float],
-          telemetry: bool, custom_module_dirs: list[Path],
-          chat_template: Optional[str], allow_request_chat_template: bool,
-          middleware: tuple[str, ...], grpc: bool, grpc_protocol: str,
-          enable_visual_gen: bool, served_model_name: Optional[str],
-          visual_gen_args: Optional[str], report_addr: Optional[str]) -> None:
+          otlp_traces_endpoint: Optional[str],
+          enable_chunked_prefill: bool,
+          enable_attention_dp: bool,
+          disagg_cluster_uri: Optional[str],
+          media_io_kwargs: Optional[str],
+          agent_percentage: float,
+          agent_types: Optional[str],
+          video_pruning_rate: Optional[float],
+          telemetry: bool,
+          custom_module_dirs: list[Path],
+          chat_template: Optional[str],
+          allow_request_chat_template: bool,
+          middleware: tuple[str, ...],
+          grpc: bool,
+          grpc_protocol: str,
+          enable_visual_gen: bool,
+          served_model_name: Optional[str],
+          visual_gen_args: Optional[str],
+          report_addr: Optional[str],
+          enable_locality_domains: bool = False) -> None:
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -1432,6 +1471,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             otlp_traces_endpoint=otlp_traces_endpoint,
             enable_chunked_prefill=enable_chunked_prefill,
             enable_attention_dp=enable_attention_dp,
+            enable_locality_domains=enable_locality_domains,
             video_pruning_rate=video_pruning_rate,
             telemetry=telemetry,
             agent_percentage=agent_percentage,
