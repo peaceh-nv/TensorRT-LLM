@@ -39,6 +39,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cuda.bindings.driver import CUstream
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
@@ -158,7 +159,7 @@ class PersistentDenseGemmKernel(BlackwellPersistentDenseGemmKernel):
         a_major: str,
         b_major: str,
         c_major: str,
-    ) -> bool:
+    ) -> bool | cutlass.Boolean:
         """Rubin (SM107) feasibility: the inherited Blackwell checks plus an
         M-vs-cluster_m guard.
 
@@ -176,27 +177,27 @@ class PersistentDenseGemmKernel(BlackwellPersistentDenseGemmKernel):
         ``use_2cta_instrs`` -- otherwise valid 2-CTA tactics are pruned. Only
         the M axis is gated; the kernel tolerates N over-padding.
         """
-        if not BlackwellPersistentDenseGemmKernel.can_implement(
-            ab_dtype,
-            acc_dtype,
-            c_dtype,
-            use_2cta_instrs,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            m,
-            n,
-            k,
-            batch_size,
-            a_major,
-            b_major,
-            c_major,
+        if not BlackwellPersistentDenseGemmKernel.check_supported_dtypes(
+            ab_dtype, ab_dtype, acc_dtype, c_dtype
         ):
             return False
+        if not BlackwellPersistentDenseGemmKernel.is_valid_mma_tiler_and_cluster_shape(
+            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn
+        ):
+            return False
+
+        # Keep shape-dependent checks as predicates so dynamically shaped
+        # callers can assert the same feasibility result before launching.
+        ab_alignment = 16 * 8 // ab_dtype.width
+        c_alignment = 16 * 8 // c_dtype.width
+        aligned = (
+            ((m if a_major == "m" else k) % ab_alignment == 0)
+            & ((n if b_major == "n" else k) % ab_alignment == 0)
+            & ((m if c_major == "m" else n) % c_alignment == 0)
+        )
         cta_tile_m = mma_tiler_mn[0] // (2 if use_2cta_instrs else 1)
         ctas_m = (m + cta_tile_m - 1) // cta_tile_m
-        if ctas_m < cluster_shape_mn[0]:
-            return False
-        return True
+        return aligned & (ctas_m >= cluster_shape_mn[0])
 
 
 # Preferred-cluster variant kept in this file with the base Rubin BF16 kernel.
@@ -291,6 +292,50 @@ class PersistentDenseGemmKernelPreferredCluster(PersistentDenseGemmKernel):
         self.preferred_cluster_shape_mn = preferred_cluster_shape_mn
         self.fallback_cluster_shape_mn = fallback_cluster_shape_mn
 
+    @staticmethod
+    def can_implement(
+        ab_dtype: Type[cutlass.Numeric],
+        acc_dtype: Type[cutlass.Numeric],
+        c_dtype: Type[cutlass.Numeric],
+        use_2cta_instrs: bool,
+        mma_tiler_mn: Tuple[int, int],
+        preferred_cluster_shape_mn: Tuple[int, int],
+        fallback_cluster_shape_mn: Tuple[int, int],
+        m: int,
+        n: int,
+        k: int,
+        batch_size: int,
+        a_major: str,
+        b_major: str,
+        c_major: str,
+    ) -> bool | cutlass.Boolean:
+        """Check feasibility for both clusters, including their shape relationship."""
+        if fallback_cluster_shape_mn[0] <= 0 or fallback_cluster_shape_mn[1] <= 0:
+            return False
+        if (
+            preferred_cluster_shape_mn[0] % fallback_cluster_shape_mn[0] != 0
+            or preferred_cluster_shape_mn[1] % fallback_cluster_shape_mn[1] != 0
+        ):
+            return False
+        feasible = True
+        for cluster_shape_mn in (fallback_cluster_shape_mn, preferred_cluster_shape_mn):
+            feasible = feasible & PersistentDenseGemmKernel.can_implement(
+                ab_dtype,
+                acc_dtype,
+                c_dtype,
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                m,
+                n,
+                k,
+                batch_size,
+                a_major,
+                b_major,
+                c_major,
+            )
+        return feasible
+
     def _kernel_tactic_name(self) -> str:
         return (
             f"preferred_cluster_2cta{int(self.use_2cta_instrs)}"
@@ -369,6 +414,36 @@ class PersistentDenseGemmKernelPreferredCluster(PersistentDenseGemmKernel):
 
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
+
+        can_implement = self.can_implement(
+            self.a_dtype,
+            self.acc_dtype,
+            self.c_dtype,
+            self.use_2cta_instrs,
+            self.mma_tiler_mn,
+            self.preferred_cluster_shape_mn,
+            self.fallback_cluster_shape_mn,
+            cute.size(a.shape[0]),
+            cute.size(b.shape[0]),
+            cute.size(a.shape[1]),
+            cute.size(c.shape[2]),
+            "m" if self.a_major_mode == tcgen05.OperandMajorMode.MN else "k",
+            "n" if self.b_major_mode == tcgen05.OperandMajorMode.MN else "k",
+            "m" if self.c_layout.is_m_major_c() else "n",
+        )
+        if cutlass.const_expr(isinstance(can_implement, bool)):
+            if cutlass.const_expr(not can_implement):
+                raise testing.CantImplementError(
+                    "Problem is not feasible for both preferred and fallback cluster shapes"
+                )
+        else:
+            # CuTe assertions are disabled by default. A host trap must remain
+            # active even without --enable-assertions to prevent unsafe launches.
+            if not can_implement:
+                cute.printf(
+                    "Problem is not feasible for both preferred and fallback cluster shapes"
+                )
+                llvm.intr_trap()
 
         self._setup_attributes()
 

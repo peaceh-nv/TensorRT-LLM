@@ -9398,13 +9398,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     and preferred_kernel_class.can_implement(
                         cutlass.BFloat16, cutlass.Float32, c_dtype_cutlass,
                         use_2cta_instrs, mma_tiler_mn,
-                        fallback_cluster_shape_mn, m, n, k, batch_size, a_major,
-                        b_major, c_major)
-                    and preferred_kernel_class.can_implement(
-                        cutlass.BFloat16, cutlass.Float32, c_dtype_cutlass,
-                        use_2cta_instrs, mma_tiler_mn,
-                        preferred_cluster_shape_mn, m, n, k, batch_size,
-                        a_major, b_major, c_major)):
+                        preferred_cluster_shape_mn, fallback_cluster_shape_mn,
+                        m, n, k, batch_size, a_major, b_major, c_major)):
                 valid_tactics.append(
                     ("preferred_cluster", use_2cta_instrs, mma_tiler_mn,
                      preferred_cluster_shape_mn, fallback_cluster_shape_mn,
