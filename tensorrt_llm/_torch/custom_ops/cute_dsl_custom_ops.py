@@ -1363,6 +1363,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         (gate + up interleaved), and the output has N/2 columns after SwiGLU.
         """
         kernel_class = Sm100BlockScaledPersistentDenseGemmActFusionKernel
+        supported_sm_versions = (100, 103)
         kernel_cache = dict()
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(DynamicTensorSpec(
@@ -1398,10 +1399,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> List[Tuple[int, int]]:
             # Early exit: Check SM version
-            if (sm_version := get_sm_version()) not in (100, 103):
+            if (sm_version :=
+                    get_sm_version()) not in self.supported_sm_versions:
                 logger.debug(
                     f"CuteDSL SwiGLU: SM version {sm_version} is not supported. "
-                    f"CuteDSL NVFP4 SwiGLU only supports SM 100 (B200) and SM 103 (B300). Skipping all tactics."
+                    f"Supported SM versions: {self.supported_sm_versions}. Skipping all tactics."
                 )
                 return []
 
@@ -1913,6 +1915,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         requantization between FC1 and FC2.
         """
         kernel_class = Sm100BlockScaledPersistentDenseGemmActFusionKernel
+        min_m = 128
         kernel_cache = dict()
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(DynamicTensorSpec(
@@ -1955,10 +1958,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             a, b, a_sf, b_sf, alpha, global_sf = inputs[:6]
             m, k, n = a.shape[0], a.shape[1] * 2, b.shape[0]
 
-            # The fp4out kernel's SFC epilogue does not properly predicate
-            # writes when m < CTA tile height, causing OOB memory access.
-            # Require m >= 128 (minimum MMA tile M dimension).
-            if m < 128:
+            # Keep the Blackwell small-M restriction. Architecture-specific
+            # runners may enable smaller shapes after validating the padded
+            # FP4 output and SFC allocations in forward().
+            if m < self.min_m:
                 return []
 
             sf_vec_size = 16
@@ -13347,6 +13350,225 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
                 use_cuda_graph=True,
             )
+
+        from ..cute_dsl_kernels.rubin.dense_blockscaled_gemm_act_fusion import \
+            Sm107BlockScaledPersistentDenseGemmActFusionKernel
+
+        class CuteDSLNVFP4SwigluRubinRunner(CuteDSLNVFP4SwigluBlackwellRunner):
+            """SM107 dense SwiGLU with BF16 output and a separate compile cache."""
+
+            kernel_class = Sm107BlockScaledPersistentDenseGemmActFusionKernel
+            kernel_cache = dict()
+            supported_sm_versions = (107, )
+
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                tactics = super().get_valid_tactics(inputs, profile, **kwargs)
+                return [t for t in tactics if inputs[1].shape[0] % t[0][1] == 0]
+
+        class CuteDSLNVFP4SwigluFP4OutRubinRunner(
+                CuteDSLNVFP4SwigluFP4OutBlackwellRunner):
+            """SM107 dense SwiGLU with packed FP4 output and R128c4 scales."""
+
+            kernel_class = Sm107BlockScaledPersistentDenseGemmActFusionKernel
+            min_m = 1
+            kernel_cache = dict()
+
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                if get_sm_version() != 107:
+                    return []
+                tactics = super().get_valid_tactics(inputs, profile, **kwargs)
+                return [t for t in tactics if inputs[1].shape[0] % t[0][1] == 0]
+
+        def _validate_nvfp4_swiglu_rubin(input, weight, input_scale,
+                                         weight_scale, alpha):
+            if input.ndim != 2 or weight.ndim != 2:
+                raise ValueError("NVFP4 SwiGLU input and weight must be 2-D")
+            if input.dtype != torch.uint8 or weight.dtype != torch.uint8:
+                raise ValueError("NVFP4 SwiGLU operands must be packed uint8")
+            if input.shape[1] != weight.shape[1] or input.shape[1] % 16:
+                raise ValueError(
+                    "NVFP4 SwiGLU requires matching K divisible by 32")
+            if weight.shape[0] % 128:
+                raise ValueError(
+                    "NVFP4 SwiGLU requires 64-row interleaved up/gate blocks")
+            for tensor, name in ((input, "input"), (weight, "weight"),
+                                 (input_scale, "input_scale"),
+                                 (weight_scale, "weight_scale"), (alpha,
+                                                                  "alpha")):
+                if tensor.device != input.device or not tensor.is_contiguous():
+                    raise ValueError(
+                        f"NVFP4 SwiGLU {name} must be contiguous on the input device"
+                    )
+            for scale in (input_scale, weight_scale):
+                if scale.dtype not in (torch.uint8, torch.float8_e4m3fn):
+                    raise ValueError(
+                        "NVFP4 SwiGLU scales must contain E4M3 bytes")
+            if alpha.dtype != torch.float32 or alpha.numel() != 1:
+                raise ValueError(
+                    "NVFP4 SwiGLU alpha must be a scalar FP32 tensor")
+            _validate_16_byte_aligned_dense_tensor(input, "input")
+            _validate_16_byte_aligned_dense_tensor(weight, "weight")
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_rubin",
+            mutates_args=(),
+            device_types="cuda")
+        @_with_input_cuda_device
+        def cute_dsl_nvfp4_dense_gemm_swiglu_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            output_dtype: torch.dtype,
+            use_tvm_ffi: bool = True,
+        ) -> torch.Tensor:
+            """CuteDSL-based NVFP4 dense GEMM with SwiGLU fusion for Rubin.
+
+            Fuses the FC1 (gate_up projection) GEMM and SwiGLU activation into a
+            single kernel. Used for shared expert optimization.
+
+            Args:
+                input: Activation tensor [m, k] in FP4 format (packed in uint8)
+                weight: Weight tensor [n, k] in FP4 format (packed in uint8).
+                        n = 2 * intermediate_size (gate + up interleaved).
+                input_scale: Activation scale factors
+                weight_scale: Weight scale factors
+                alpha: Scaling factor
+                output_dtype: Output data type (must be bfloat16)
+                use_tvm_ffi: Whether to use TVM-FFI for reduced host launch overhead.
+
+            Returns:
+                Output tensor [m, n//2] in bfloat16 after SwiGLU fusion.
+            """
+            if (sm_version := get_sm_version()) != 107:
+                raise ValueError(
+                    f"CuteDSL NVFP4 SwiGLU backend requires SM107, "
+                    f"but got SM {sm_version}.")
+
+            _validate_nvfp4_swiglu_rubin(input, weight, input_scale,
+                                         weight_scale, alpha)
+            tuner = AutoTuner.get()
+
+            runner = CuteDSLNVFP4SwigluRubinRunner(output_dtype, use_tvm_ffi)
+            inputs = [input, weight, input_scale, weight_scale, alpha]
+            _, best_tactic = tuner.choose_one(
+                "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_rubin",
+                [runner],
+                runner.__class__.tuning_config,
+                inputs,
+            )
+
+            output = runner(inputs, tactic=best_tactic)
+            return output
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_rubin")
+        def _(
+            mat_a: torch.Tensor,
+            mat_b: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            output_dtype: torch.dtype,
+            use_tvm_ffi: bool = True,
+        ):
+            # [m, k]
+            shape = list(mat_a.shape)
+            # [n, k] -> output has n//2 columns after SwiGLU
+            shape[-1] = mat_b.shape[-2] // 2
+            # output is fixed as bf16
+            ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
+            return ret
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_rubin",
+            mutates_args=(),
+            device_types="cuda")
+        @_with_input_cuda_device
+        def cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            global_sf: torch.Tensor,
+            use_tvm_ffi: bool = True,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            """CuteDSL-based NVFP4 dense GEMM + SwiGLU with FP4 output for Rubin.
+
+            Same as cute_dsl_nvfp4_dense_gemm_swiglu_rubin but produces FP4
+            output with scale factors, eliminating bf16→fp4 requantization.
+
+            Args:
+                input: Activation tensor [m, k] in FP4 format (packed)
+                weight: Weight tensor [n, k] in FP4 format (packed).
+                        n = 2 * intermediate_size (gate + up interleaved).
+                input_scale: Activation scale factors
+                weight_scale: Weight scale factors
+                alpha: FC1 scaling factor
+                global_sf: FC2 input scale (norm_const for SFC quantization)
+                use_tvm_ffi: Whether to use TVM-FFI.
+
+            Returns:
+                Tuple of (fp4_output, output_sf):
+                    fp4_output: [m, n//4] in FP4 packed format
+                    output_sf: Scale factors for the output (1D)
+            """
+            if (sm_version := get_sm_version()) != 107:
+                raise ValueError(f"CuteDSL NVFP4 SwiGLU FP4Out requires SM107, "
+                                 f"but got SM {sm_version}.")
+
+            _validate_nvfp4_swiglu_rubin(input, weight, input_scale,
+                                         weight_scale, alpha)
+            if global_sf.dtype != torch.float32 or global_sf.numel() != 1:
+                raise ValueError(
+                    "NVFP4 SwiGLU global_sf must be a scalar FP32 tensor")
+            if global_sf.device != input.device:
+                raise ValueError(
+                    "NVFP4 SwiGLU global_sf must be on the input device")
+            tuner = AutoTuner.get()
+
+            runner = CuteDSLNVFP4SwigluFP4OutRubinRunner(use_tvm_ffi)
+            inputs = [
+                input, weight, input_scale, weight_scale, alpha, global_sf
+            ]
+            _, best_tactic = tuner.choose_one(
+                "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_rubin",
+                [runner],
+                runner.__class__.tuning_config,
+                inputs,
+            )
+
+            return runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_rubin")
+        def _(
+            mat_a: torch.Tensor,
+            mat_b: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            global_sf: torch.Tensor,
+            use_tvm_ffi: bool = True,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            n = mat_b.shape[-2]
+            n_out = n // 2
+            sf_vec_size = 16
+            # FP4 output packed: [m, n_out // 2]. Use new_empty with the input
+            # shape list so the SymInt for the token dim is preserved through the
+            # FX graph (matches the BF16 / nvfp4_gemm fake patterns; a positional
+            # torch.empty(m, ...) loses the SymInt link required by the piecewise
+            # CUDA graph optimizer).
+            fp4_shape = list(mat_a.shape)
+            fp4_shape[-1] = n_out // 2
+            fp4_output = mat_a.new_empty(fp4_shape)
+            # Scale factors: 1D
+            m = mat_a.shape[0]
+            sf_size = pad_up(m, 128) * pad_up(n_out // sf_vec_size, 4)
+            output_sf = input_scale.new_empty([sf_size])
+            return fp4_output, output_sf
 
         class CuteDSLMXFP8RubinLinear(CuteDSLBlockScaledRubinLinear):
             """SM107 MXFP8 runner backed by the persistent dense kernel."""

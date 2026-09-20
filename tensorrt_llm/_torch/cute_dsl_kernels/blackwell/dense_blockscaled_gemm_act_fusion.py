@@ -117,6 +117,9 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         ... )
     """
 
+    arch = "sm_100"
+    mma_inst_bits_k = 256
+
     def __init__(
         self,
         sf_vec_size: int,
@@ -177,7 +180,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -206,6 +209,26 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                     "indexer_q_fusion requires MXF8 sf_vec_size=32 and a 128-column MMA tile"
                 )
 
+    def _make_tiled_mma(
+        self, cta_group: tcgen05.CtaGroup, mma_inst_shape: Tuple[int, int, int]
+    ) -> cute.TiledMma:
+        return sm100_utils.make_blockscaled_trivial_tiled_mma(
+            self.a_dtype,
+            self.a_major_mode,
+            self.b_major_mode,
+            self.sf_dtype,
+            self.sf_vec_size,
+            cta_group,
+            mma_inst_shape[:2],
+        )
+
+    def _sf_tmem_columns(self, tiled_mma: cute.TiledMma) -> Tuple[int, int]:
+        # Blackwell uses four MMA instructions per K tile.
+        return (
+            (self.cta_tile_shape_mnk[0] // 32) * 4,
+            (self.cta_tile_shape_mnk_sfb[1] // 32) * 4,
+        )
+
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
 
@@ -221,7 +244,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         - Computing tensor memory allocation columns
         """
         # Compute mma instruction shapes
-        mma_inst_bits_k = 256
+        mma_inst_bits_k = self.mma_inst_bits_k
         # (MMA_Tile_Shape_M, MMA_Tile_Shape_N, MMA_Inst_Shape_K)
         self.mma_inst_shape_mnk = (
             self.mma_tiler[0],
@@ -235,28 +258,14 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
             self.mma_inst_shape_mnk[2],
         )
 
-        tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            self.cta_group,
-            self.mma_inst_shape_mnk[:2],
-        )
+        tiled_mma = self._make_tiled_mma(self.cta_group, self.mma_inst_shape_mnk)
 
-        tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            cute.nvgpu.tcgen05.CtaGroup.ONE,
-            self.mma_inst_shape_mnk_sfb[:2],
+        tiled_mma_sfb = self._make_tiled_mma(
+            cute.nvgpu.tcgen05.CtaGroup.ONE, self.mma_inst_shape_mnk_sfb
         )
 
         # Compute mma/cluster/tile shapes
-        mma_inst_tile_k = 4
+        mma_inst_tile_k = 1024 // mma_inst_bits_k
         self.mma_tiler = (
             self.mma_inst_shape_mnk[0],
             self.mma_inst_shape_mnk[1],
@@ -367,9 +376,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         )
 
         self.overlapping_accum = self.num_acc_stage == 1
-        sf_atom_mn = 32
-        self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
-        self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
+        self.num_sfa_tmem_cols, self.num_sfb_tmem_cols = self._sf_tmem_columns(tiled_mma)
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
         self.num_accumulator_tmem_cols = (
             self.cta_tile_shape_mnk[1] * self.num_acc_stage
@@ -475,24 +482,10 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
             sfc_layout = blockscaled_utils.tile_atom_to_shape_SF(c_tensor.shape, self.sf_vec_size)
             sfc_tensor = cute.make_tensor(sfc_tensor.iterator, sfc_layout)
 
-        tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            self.cta_group,
-            self.mma_inst_shape_mnk[:2],
-        )
+        tiled_mma = self._make_tiled_mma(self.cta_group, self.mma_inst_shape_mnk)
 
-        tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            cute.nvgpu.tcgen05.CtaGroup.ONE,
-            self.mma_inst_shape_mnk_sfb[:2],
+        tiled_mma_sfb = self._make_tiled_mma(
+            cute.nvgpu.tcgen05.CtaGroup.ONE, self.mma_inst_shape_mnk_sfb
         )
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 

@@ -1316,7 +1316,7 @@ class CuteDslFusedMoE(MoEImplBase):
                 if use_rubin else torch.ops.trtllm.
                 cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell)
 
-            finalize_inplace_op(
+            finalize_kwargs = dict(
                 input=x.view(torch.float4_e2m1fn_x2),
                 weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),
@@ -1334,11 +1334,12 @@ class CuteDslFusedMoE(MoEImplBase):
                 local_expert_offset=slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
-                expert_counts=(recv_expert_count
-                               if use_count_native_expert_metadata else None),
-                expert_capacity=(deep_ep_expert_capacity
-                                 if use_count_native_expert_metadata else 0),
             )
+            # Rubin's ordinary-routing op has no count-native parameters.
+            if use_count_native_expert_metadata:
+                finalize_kwargs["expert_counts"] = recv_expert_count
+                finalize_kwargs["expert_capacity"] = deep_ep_expert_capacity
+            finalize_inplace_op(**finalize_kwargs)
         else:
             if use_rubin:
                 # Rubin does not have a basic grouped GEMM kernel (without

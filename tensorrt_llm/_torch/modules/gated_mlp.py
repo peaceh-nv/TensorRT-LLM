@@ -229,7 +229,7 @@ class GatedMLP(nn.Module):
         must make exactly the same decision as forward dispatch.
         """
         return (self.activation == F.silu and self._is_plain_swiglu()
-                and self.gate_up_proj.can_use_cute_dsl_nvfp4_swiglu_blackwell())
+                and self.gate_up_proj.can_use_cute_dsl_nvfp4_swiglu())
 
     def _can_fuse_gate_up_swiglu_fp4out(self):
         """Check if fused GEMM + SwiGLU with FP4 output path is available.
@@ -297,18 +297,22 @@ class GatedMLP(nn.Module):
         if fp4_out:
             # FC2's input_scale serves as norm_const for SFC quantization
             global_sf = self.down_proj.input_scale
-            fp4_output, out_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell(
-                act_fp4, module.weight, act_sf, module.weight_scale, alpha,
-                global_sf)
+            op = (torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_rubin
+                  if get_sm_version() == 107 else torch.ops.trtllm.
+                  cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell)
+            fp4_output, out_sf = op(act_fp4, module.weight, act_sf,
+                                    module.weight_scale, alpha, global_sf)
             if original_shape is not None:
                 fp4_output = fp4_output.reshape(*original_shape[:-1],
                                                 fp4_output.shape[-1])
             return Fp4QuantizedTensor(fp4_output, out_sf)
 
         # BF16 output path
-        output = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
-            act_fp4, module.weight, act_sf, module.weight_scale, alpha,
-            module.dtype)
+        op = (torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_rubin
+              if get_sm_version() == 107 else
+              torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell)
+        output = op(act_fp4, module.weight, act_sf, module.weight_scale, alpha,
+                    module.dtype)
 
         # Trim padding if weight was padded beyond logical out_features
         expected_out = module.out_features // 2

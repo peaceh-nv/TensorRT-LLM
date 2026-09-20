@@ -46,6 +46,8 @@ SM107_QUANT_OPS = (
     "cute_dsl_fp8_bmm_quantize_rubin_out",
     "cute_dsl_fp8_per_tensor_gemm_rubin",
     "cute_dsl_mxfp8_gemm_rubin",
+    "cute_dsl_nvfp4_dense_gemm_swiglu_rubin",
+    "cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_rubin",
     "cute_dsl_nvfp4_gemm_inplace_rubin",
     "cute_dsl_nvfp4_gemm_locality_domain_inplace_rubin",
     "cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant",
@@ -57,6 +59,8 @@ SM107_QUANT_RUNNERS = (
     "CuteDSLFp8RubinPerTensorGemmRunner",
     "CuteDSLMXFP8RubinLinear",
     "CuteDSLNVFP4RubinLinear",
+    "CuteDSLNVFP4SwigluRubinRunner",
+    "CuteDSLNVFP4SwigluFP4OutRubinRunner",
 )
 
 
@@ -99,6 +103,22 @@ def _op_calls():
         ),
         "cute_dsl_mxfp8_gemm_rubin": lambda op: op(
             _fp8(m, k), _fp8(n, k), _u8(128 * (k // 32)), _u8(n * (k // 32))
+        ),
+        "cute_dsl_nvfp4_dense_gemm_swiglu_rubin": lambda op: op(
+            _u8(m, k // 2),
+            _u8(n, k // 2),
+            _u8(128 * (k // 16)),
+            _u8(n * (k // 16)),
+            _f32(1),
+            torch.bfloat16,
+        ),
+        "cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_rubin": lambda op: op(
+            _u8(m, k // 2),
+            _u8(n, k // 2),
+            _u8(128 * (k // 16)),
+            _u8(n * (k // 16)),
+            _f32(1),
+            _f32(1),
         ),
         "cute_dsl_nvfp4_gemm_inplace_rubin": lambda op: op(
             _u8(m, k // 2),
@@ -165,6 +185,12 @@ def test_sm107_quant_runners_offer_no_tactics_off_sm107(runner_name):
     if runner_name.endswith("Linear"):
         runner = runner_class(output_dtype=torch.bfloat16)
         inputs = [_fp8(8, 512), _fp8(256, 512), _u8(2048), _u8(4096), _f32(1)]
+    elif runner_name == "CuteDSLNVFP4SwigluRubinRunner":
+        runner = runner_class(torch.bfloat16)
+        inputs = [_u8(8, 256), _u8(256, 256), _u8(4096), _u8(8192), _f32(1)]
+    elif runner_name == "CuteDSLNVFP4SwigluFP4OutRubinRunner":
+        runner = runner_class()
+        inputs = [_u8(8, 256), _u8(256, 256), _u8(4096), _u8(8192), _f32(1), _f32(1)]
     elif runner_name == "CuteDSLFp8RubinBmmRunner":
         runner = runner_class()
         inputs = [

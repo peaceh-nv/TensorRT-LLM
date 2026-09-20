@@ -4503,3 +4503,48 @@ def test_bf16_grouped_gemm_finalize_rubin(
         f"tile_size={tile_size}: {len(failed)}/{len(tactics)} tactics failed:\n  "
         + "\n  ".join(failed)
     )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_RUBIN_AVAILABLE, reason="requires Rubin CuTe DSL")
+@pytest.mark.parametrize("sm_version", [100, 107])
+def test_nvfp4_moe_legacy_metadata_matches_finalize_schema(monkeypatch, sm_version):
+    """Ordinary routing must not pass count-native arguments to the Rubin op."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+
+    monkeypatch.setattr(fused_moe_cute_dsl, "get_sm_version", lambda: sm_version)
+    with FakeTensorMode():
+        x = torch.empty(1, 64, device="cuda", dtype=torch.uint8)
+        sf = torch.empty(1024, device="cuda", dtype=torch.uint8)
+        scale = torch.ones(1, device="cuda")
+        weights = SimpleNamespace(
+            expert_size_per_partition=2,
+            slot_start=0,
+            w3_w1_weight=torch.empty(2, 256, 64, device="cuda", dtype=torch.uint8),
+            w2_weight=torch.empty(2, 128, 64, device="cuda", dtype=torch.uint8),
+            fc1_weight_scale=sf,
+            fc2_weight_scale=sf,
+            fc1_global_scale=scale,
+            fc2_global_scale=scale,
+        )
+        moe = SimpleNamespace(
+            num_slots=2,
+            use_fused_finalize=True,
+            _has_moe_output_memset_aux_stream=lambda: False,
+            fc2_input_scale=scale,
+            activation_type=ActivationType.Swiglu,
+            act_clamp=-1.0,
+            mapping=SimpleNamespace(moe_ep_size=1),
+        )
+        output = torch.empty(1, 128, device="cuda", dtype=torch.bfloat16)
+        actual = CuteDslFusedMoE.run_moe_nvfp4_impl(
+            moe,
+            x,
+            torch.zeros(1, 1, device="cuda", dtype=torch.int32),
+            torch.ones(1, 1, device="cuda"),
+            sf,
+            output,
+            weights,
+        )
+        assert actual is output

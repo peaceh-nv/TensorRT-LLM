@@ -2057,7 +2057,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         # interleaves in 64-row groups to match the kernel layout.
         #
         # Weight scales are similarly unswizzled, interleaved, and re-swizzled.
-        if not module.can_use_cute_dsl_nvfp4_swiglu_blackwell():
+        if not module.can_use_cute_dsl_nvfp4_swiglu():
             return
 
         group_size = 64
@@ -4045,6 +4045,17 @@ class Linear(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
         )
+
+    def can_use_cute_dsl_nvfp4_swiglu(self) -> bool:
+        """Use the same fused layout for weight loading and architecture dispatch."""
+        if self.can_use_cute_dsl_nvfp4_swiglu_blackwell():
+            return True
+        return (get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+                and self.use_cute_dsl_nvfp4_swiglu_blackwell
+                and self.use_cute_dsl_blockscaling_mm
+                and self.has_nvfp4_activation_quantization and not self.has_bias
+                and self.dtype == torch.bfloat16
+                and self.out_features % 128 == 0)
 
     def can_use_cute_dsl_nvfp4_swiglu_blackwell(self) -> bool:
         """Return whether this layer can use the Blackwell NVFP4 SwiGLU op.
