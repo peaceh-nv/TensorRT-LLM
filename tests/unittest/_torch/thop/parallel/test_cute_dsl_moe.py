@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -1376,10 +1377,41 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
 # ============================================================================
 
 
+def _nvfp4_quantize_fp32_ref(
+    x: torch.Tensor, global_scale: torch.Tensor, sf_vec_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize FP32 activations to packed E2M1 and unswizzled E4M3 scales."""
+    blocks = x.reshape(x.shape[0], -1, sf_vec_size)
+    scales = (blocks.abs().amax(dim=-1) * (1.0 / 6.0) * global_scale).to(torch.float8_e4m3fn)
+    inv_scales = (scales.float().reciprocal() * global_scale).clamp(
+        max=torch.finfo(torch.float32).max
+    )
+    scaled = (blocks * inv_scales.unsqueeze(-1)).reshape_as(x)
+    magnitude = scaled.abs().contiguous()
+    midpoints = x.new_tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+    codes = torch.bucketize(magnitude, midpoints, out_int32=True).to(torch.uint8)
+    # bucketize chooses the lower code at a midpoint; odd codes round up to even.
+    round_up = (magnitude == 0.75) | (magnitude == 1.75) | (magnitude == 3.5)
+    codes += round_up.to(torch.uint8)
+    codes |= torch.signbit(scaled).to(torch.uint8) << 3
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed, scales.view(torch.uint8)
+
+
+@pytest.fixture
+def nvfp4_gather_rng() -> Iterator[None]:
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        # Keep routing and inputs independent of preceding tests, and restore their RNG state.
+        torch.default_generator.manual_seed(82)
+        torch.cuda.manual_seed(82)
+        yield
+
+
 @pytest.mark.skipif(
     get_sm_version() != 107,
     reason="This test is only supported on SM 107 (Rubin) GPUs",
 )
+@pytest.mark.usefixtures("nvfp4_gather_rng")
 @pytest.mark.parametrize(
     "activation_type",
     [ActivationType.Swiglu, ActivationType.Relu2],
@@ -1482,8 +1514,10 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
 
-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
-    a_sf_gathered = torch.empty(
+    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
+        a.dtype
+    )
+    a_sf_gathered = torch.zeros(
         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
     )
     for i in range(num_valid_permuted_tokens):
@@ -1511,12 +1545,19 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
         tile_idx_to_group_idx,
         num_non_exiting_tiles,
         tile_size=tile_size,
-        output_dtype=torch.bfloat16,
+        output_dtype=torch.float32,
         scaling_vector_size=sf_vec_size,
     )
+    # Match the fused epilogue: GEMM, activation, and scale reduction stay in FP32.
+    # BF16 rounding before Relu2 can change more than 5% of the E4M3 scales.
     c_ref = apply_activation_ref(c_ref, activation_type)
-    global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
-    c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
+    valid_token_mask = torch.zeros(num_valid_permuted_tokens, dtype=torch.bool, device="cuda")
+    for i in range(num_valid_permuted_tokens):
+        if i < tile_idx_to_mn_limit_list[i // tile_size]:
+            valid_token_mask[i] = True
+    c_ref = c_ref[:num_valid_permuted_tokens][valid_token_mask]
+    global_sf = c_ref.abs().max() / (448 * 6)
+    c_ref, c_sf_ref = _nvfp4_quantize_fp32_ref(c_ref, 1 / global_sf, sf_vec_size)
 
     # Call Rubin gather kernel
     c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
@@ -1541,35 +1582,13 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
         activation_type=activation_type,
     )
 
-    # Verify output (only compare valid tokens, skip padding)
-    valid_token_mask = torch.zeros(num_valid_permuted_tokens, dtype=torch.bool, device="cuda")
-    for i in range(num_valid_permuted_tokens):
-        if i >= tile_idx_to_mn_limit_list[i // tile_size]:
-            continue
-        valid_token_mask[i] = True
+    # Verify output and scale factors only for valid tokens.
+    c_valid = c[:num_valid_permuted_tokens].view(torch.uint8)[valid_token_mask]
+    check_accuracy(c_valid, c_ref, atol=1e-4, rtol=1e-4, percent=0.95)
 
-    num_valid_tokens = valid_token_mask.sum().item()
-    if num_valid_tokens > 0:
-        c_valid = c[:num_valid_permuted_tokens].view(torch.uint8)[valid_token_mask]
-        c_ref_valid = c_ref[:num_valid_permuted_tokens][valid_token_mask]
-        check_accuracy(c_valid, c_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
-
-        c_sf_unswizzled = unswizzle_sf(c_sf, max_num_permuted_tokens, interm_size, sf_vec_size)
-        c_sf_ref_unswizzled = unswizzle_sf(
-            c_sf_ref, max_num_permuted_tokens, interm_size, sf_vec_size
-        )
-
-        c_sf_valid = []
-        c_sf_ref_valid = []
-        for i in range(num_valid_permuted_tokens):
-            if i >= tile_idx_to_mn_limit_list[i // tile_size]:
-                continue
-            c_sf_valid.append(c_sf_unswizzled[i])
-            c_sf_ref_valid.append(c_sf_ref_unswizzled[i])
-
-        c_sf_valid = torch.cat(c_sf_valid)
-        c_sf_ref_valid = torch.cat(c_sf_ref_valid)
-        check_accuracy(c_sf_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
+    c_sf_unswizzled = unswizzle_sf(c_sf, max_num_permuted_tokens, interm_size, sf_vec_size)
+    c_sf_valid = c_sf_unswizzled[:num_valid_permuted_tokens][valid_token_mask]
+    check_accuracy(c_sf_valid, c_sf_ref, atol=1e-4, rtol=1e-4, percent=0.95)
 
 
 @pytest.mark.skipif(
