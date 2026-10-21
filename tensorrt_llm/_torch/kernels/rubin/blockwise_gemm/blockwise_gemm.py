@@ -278,6 +278,8 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         mma_inst_shape: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         fp8_quantize_1x128: bool = False,
+        swizzle_size: int = 1,
+        raster_along_m: bool = True,
     ):
         """Initialize the Rubin persistent blockwise dense GEMM kernel.
 
@@ -291,6 +293,10 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         :type mma_inst_shape: Tuple[int, int, int]
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
+        :param swizzle_size: Cluster swizzle width of the persistent tile scheduler.
+        :type swizzle_size: int
+        :param raster_along_m: Whether consecutive clusters advance along M.
+        :type raster_along_m: bool
         """
         # Call parent constructor with mma_tiler_mn (M, N only)
         super().__init__(
@@ -298,6 +304,8 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             use_2cta_instrs,
             (mma_tiler[0], mma_tiler[1]),
             cluster_shape_mn,
+            swizzle_size,
+            raster_along_m,
         )
         # Match the register split used by the Rubin source kernel's Blackwell
         # base. TRT-LLM's vendored Blackwell kernel uses a balanced 216/216
@@ -674,7 +682,12 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
 
         # Compute grid size
         self.tile_sched_params, grid = self._compute_grid(
-            c, self.cta_tile_shape_mnk, self.cluster_shape_mn, max_active_clusters
+            c,
+            self.cta_tile_shape_mnk,
+            self.cluster_shape_mn,
+            max_active_clusters,
+            self.swizzle_size,
+            self.raster_along_m,
         )
 
         self.buffer_align_bytes = 1024

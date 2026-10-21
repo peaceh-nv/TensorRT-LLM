@@ -165,6 +165,8 @@ class Sm100BlockwiseGemmKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        swizzle_size: int = 1,
+        raster_along_m: bool = True,
     ):
         """Initializes the configuration for a Blackwell blockwise dense GEMM kernel.
 
@@ -187,11 +189,17 @@ class Sm100BlockwiseGemmKernel:
         :type use_2cta_instrs: bool
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
+        :param swizzle_size: Cluster swizzle width of the persistent tile scheduler.
+        :type swizzle_size: int
+        :param raster_along_m: Whether consecutive clusters advance along M.
+        :type raster_along_m: bool
         """
 
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
+        self.swizzle_size = swizzle_size
+        self.raster_along_m = raster_along_m
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
@@ -529,7 +537,12 @@ class Sm100BlockwiseGemmKernel:
 
         # Compute grid size
         self.tile_sched_params, grid = self._compute_grid(
-            c, self.cta_tile_shape_mnk, self.cluster_shape_mn, max_active_clusters
+            c,
+            self.cta_tile_shape_mnk,
+            self.cluster_shape_mn,
+            max_active_clusters,
+            self.swizzle_size,
+            self.raster_along_m,
         )
 
         self.buffer_align_bytes = 1024
@@ -2230,6 +2243,8 @@ class Sm100BlockwiseGemmKernel:
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
+        swizzle_size: int = 1,
+        raster_along_m: bool = True,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size for the output tensor C.
 
@@ -2241,6 +2256,10 @@ class Sm100BlockwiseGemmKernel:
         :type cluster_shape_mn: tuple[int, int]
         :param max_active_clusters: Maximum number of active clusters.
         :type max_active_clusters: cutlass.Constexpr
+        :param swizzle_size: Cluster swizzle width of the persistent tile scheduler.
+        :type swizzle_size: int
+        :param raster_along_m: Whether consecutive clusters advance along M.
+        :type raster_along_m: bool
 
         :return: A tuple containing:
             - tile_sched_params: Parameters for the persistent tile scheduler.
@@ -2252,7 +2271,9 @@ class Sm100BlockwiseGemmKernel:
         num_ctas_mnl = gc[(0, (None, None, None))].shape
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
-        tile_sched_params = utils.PersistentTileSchedulerParams(num_ctas_mnl, cluster_shape_mnl)
+        tile_sched_params = utils.PersistentTileSchedulerParams(
+            num_ctas_mnl, cluster_shape_mnl, swizzle_size, raster_along_m
+        )
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters
         )
