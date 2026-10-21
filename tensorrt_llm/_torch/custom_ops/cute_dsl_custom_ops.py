@@ -667,8 +667,8 @@ def _merge_nvmmh_rankings(rankings: List[List[Tuple]]) -> List[Tuple]:
     """Merge per-orientation nvMMH rankings of (config, tactics) pairs.
 
     Each ranking keeps nvMMH's own order; across rankings (plain and A/B
-    swapped problems) the next pick is the head with the lowest nvMMH
-    runtime estimate.
+    swapped problems) the next pick is the head with the lowest nvMMH ranking
+    score.
     """
     heads = [0] * len(rankings)
     merged = []
@@ -676,8 +676,8 @@ def _merge_nvmmh_rankings(rankings: List[List[Tuple]]) -> List[Tuple]:
         best = None
         for i, ranking in enumerate(rankings):
             if heads[i] < len(ranking) and (
-                    best is None or ranking[heads[i]][0].runtime_us
-                    < rankings[best][heads[best]][0].runtime_us):
+                    best is None or ranking[heads[i]][0].score
+                    < rankings[best][heads[best]][0].score):
                 best = i
         if best is None:
             return merged
@@ -686,11 +686,12 @@ def _merge_nvmmh_rankings(rankings: List[List[Tuple]]) -> List[Tuple]:
 
 
 # Rubin block-scaled GEMMs reduce split-K partials with TMA reduce-add into the
-# zeroed output (no workspace, no reduction launch) and support both rasters.
+# zeroed output (no workspace, no reduction launch), support both rasters and
+# launch 2-CTA clusters above two CTAs with a 2x1 fallback cluster.
 _SM107_BLOCKSCALED_NVMMH_BACKEND = cutedsl_nvmmh.Backend(
     split_k_kind=cutedsl_nvmmh.SPLIT_K_IN_PLACE,
-    supports_col_major_raster=True)
-
+    supports_col_major_raster=True,
+    supports_fallback_cluster=True)
 
 if IS_CUTLASS_DSL_AVAILABLE:
 
@@ -745,8 +746,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     # SM100 BF16 and FP8 blockwise GEMMs have no split-K and support both
     # rasters.
-    _SM100_NVMMH_BACKEND = cutedsl_nvmmh.Backend(
-        split_k_kind="NONE", supports_col_major_raster=True)
+    _SM100_NVMMH_BACKEND = cutedsl_nvmmh.Backend(split_k_kind="NONE",
+                                                 supports_col_major_raster=True)
 
     def _sm100_nvmmh_tactics(kernel_class, ab_dtype, c_dtype, precision: str,
                              m: int, n: int, k: int, batch_size: int,
@@ -769,15 +770,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if (cta_k != cta_tile_k or cta_m not in (64, 128)
                     or (mma_tiler_n is not None and cta_n != mma_tiler_n)
                     or cta_n % 32 != 0 or not 32 <= cta_n <= 256
-                    or config.split_k != 1
-                    or any(c not in (1, 2, 4) for c in config.cluster)):
+                    or config.split_k != 1 or any(c not in (1, 2, 4)
+                                                  for c in config.cluster)):
                 return None
             use_2cta_instrs = cutedsl_nvmmh.pairs_ctas(config)
             mma_tiler_mn = (cta_m * (2 if use_2cta_instrs else 1), cta_n)
             if not kernel_class.can_implement(
                     ab_dtype, cutlass.Float32, c_dtype, use_2cta_instrs,
-                    mma_tiler_mn, config.cluster, m, n, k, batch_size, "k",
-                    "k", "n"):
+                    mma_tiler_mn, config.cluster, m, n, k, batch_size, "k", "k",
+                    "n"):
                 return None
             return use_2cta_instrs, mma_tiler_mn
 
@@ -793,8 +794,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raster_along = cutedsl_nvmmh.cta_order_to_raster(config.cta_order)
             scheduler = (() if raster_along == "m" and config.swizzle == 1 else
                          (raster_along, config.swizzle))
-            ranked.append((config, [(use_2cta_instrs, mma_tiler_mn,
-                                     config.cluster) + scheduler]))
+            ranked.append((config, [
+                (use_2cta_instrs, mma_tiler_mn, config.cluster) + scheduler
+            ]))
         return cutedsl_nvmmh.select_tactics(ranked, max_tactics)
 
     @functools.cache
@@ -1045,18 +1047,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 configs = cutedsl_nvmmh.query(
                     problem,
                     cutedsl_nvmmh.query_count(max_tactics),
-                    lambda config: self._nvmmh_tactic(config, m, n, real_k,
-                                                      swap_ab, False)
-                    is not None,
+                    lambda config: self._nvmmh_tactic(
+                        config, m, n, real_k, swap_ab, False) is not None,
                     cache_key=(self.__class__.__name__, swap_ab))
                 rankings.append([(config, [
                     tactic for use_prefetch in (False, True)
                     if (tactic := self._nvmmh_tactic(config, m, n, real_k,
-                                                     swap_ab, use_prefetch))
-                    is not None
+                                                     swap_ab, use_prefetch)
+                        ) is not None
                 ]) for config in configs])
-            return cutedsl_nvmmh.select_tactics(
-                _merge_nvmmh_rankings(rankings), max_tactics)
+            return cutedsl_nvmmh.select_tactics(_merge_nvmmh_rankings(rankings),
+                                                max_tactics)
 
         @staticmethod
         def _unpack_tactic(tactic):
@@ -4984,9 +4985,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             nvmmh_config = AutoTuner.get().nvmmh_config
             if nvmmh_config is not None:
                 nvmmh_tactics = _sm100_nvmmh_tactics(
-                    self.__class__.kernel_class, cutlass.Float8E4M3FN, cutlass.BFloat16,
-                    cutedsl_nvmmh.FP8_PRECISION, m, n, k, batch_size, 128, 128,
-                    nvmmh_config.max_tactics)
+                    self.__class__.kernel_class, cutlass.Float8E4M3FN,
+                    cutlass.BFloat16, cutedsl_nvmmh.FP8_PRECISION, m, n, k,
+                    batch_size, 128, 128, nvmmh_config.max_tactics)
                 if nvmmh_tactics:
                     return nvmmh_tactics
 
@@ -5311,9 +5312,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             nvmmh_config = AutoTuner.get().nvmmh_config
             if nvmmh_config is not None:
                 nvmmh_tactics = _sm100_nvmmh_tactics(
-                    self.__class__.kernel_class, cutlass.Float8E4M3FN, cutlass.BFloat16,
-                    cutedsl_nvmmh.FP8_PRECISION, m, n, k, batch_size, 128, 128,
-                    nvmmh_config.max_tactics)
+                    self.__class__.kernel_class, cutlass.Float8E4M3FN,
+                    cutlass.BFloat16, cutedsl_nvmmh.FP8_PRECISION, m, n, k,
+                    batch_size, 128, 128, nvmmh_config.max_tactics)
                 if nvmmh_tactics:
                     return nvmmh_tactics
 
@@ -9609,9 +9610,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             nvmmh_config = AutoTuner.get().nvmmh_config
             if nvmmh_config is not None:
                 nvmmh_tactics = _sm100_nvmmh_tactics(
-                    self.__class__.kernel_class, cutlass.BFloat16, cutlass.BFloat16,
-                    cutedsl_nvmmh.BF16_PRECISION, m, n, k, batch_size, None, 64,
-                    nvmmh_config.max_tactics)
+                    self.__class__.kernel_class, cutlass.BFloat16,
+                    cutlass.BFloat16, cutedsl_nvmmh.BF16_PRECISION, m, n, k,
+                    batch_size, None, 64, nvmmh_config.max_tactics)
                 if nvmmh_tactics:
                     return nvmmh_tactics
 
@@ -10037,9 +10038,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             nvmmh_config = AutoTuner.get().nvmmh_config
             if nvmmh_config is not None:
                 nvmmh_tactics = _sm100_nvmmh_tactics(
-                    self.__class__.kernel_class, cutlass.BFloat16, c_dtype_cutlass,
-                    cutedsl_nvmmh.BF16_PRECISION, m, n, k, batch_size, None, 64,
-                    nvmmh_config.max_tactics)
+                    self.__class__.kernel_class, cutlass.BFloat16,
+                    c_dtype_cutlass, cutedsl_nvmmh.BF16_PRECISION, m, n, k,
+                    batch_size, None, 64, nvmmh_config.max_tactics)
                 if nvmmh_tactics:
                     return nvmmh_tactics
 
@@ -10450,10 +10451,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0, 1, "m", 1)
 
     # SM107 BF16 GEMMs reduce split-K partials with TMA reduce-add into the
-    # zeroed output (no workspace, no reduction launch).
+    # zeroed output (no workspace, no reduction launch) and launch 2-CTA
+    # clusters above two CTAs with a 2x1 fallback cluster.
     _SM107_BF16_NVMMH_BACKEND = cutedsl_nvmmh.Backend(
         split_k_kind=cutedsl_nvmmh.SPLIT_K_IN_PLACE,
-        supports_col_major_raster=True)
+        supports_col_major_raster=True,
+        supports_fallback_cluster=True)
 
     def _sm107_bf16_nvmmh_shape(config, m: int, n: int, k: int, batch_size: int,
                                 c_dtype_cutlass, allow_split_k: bool):
@@ -10469,9 +10472,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 or not 32 <= cta_n <= 256 or cluster_m not in (1, 2, 4)
                 or cluster_n not in (1, 2, 4)
                 # CTA_N=256 with cluster_n=2 is an illegal memory access on SM107.
-                or (cta_n == 256 and cluster_n == 2)
-                or (config.split_k > 1 and
-                    (not allow_split_k or config.split_k > ceil_div(k, 64)))):
+                or (cta_n == 256 and cluster_n == 2) or
+            (config.split_k > 1 and
+             (not allow_split_k or config.split_k > ceil_div(k, 64)))):
             return None
         use_2cta_instrs = cutedsl_nvmmh.pairs_ctas(config)
         mma_tiler_mn = (cta_m * (2 if use_2cta_instrs else 1), cta_n)
@@ -10494,15 +10497,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         from nvMMH. A preferred cluster above two 2-CTA CTAs is also launched
         with a 2x1 fallback cluster, which nvMMH does not model.
         """
-        precision = (cutedsl_nvmmh.BF16_FP32_OUTPUT_PRECISION
-                     if c_dtype_cutlass == cutlass.Float32 else
-                     cutedsl_nvmmh.BF16_PRECISION)
+        precision = (cutedsl_nvmmh.BF16_FP32_OUTPUT_PRECISION if c_dtype_cutlass
+                     == cutlass.Float32 else cutedsl_nvmmh.BF16_PRECISION)
         configs = cutedsl_nvmmh.query(
             cutedsl_nvmmh.Problem(m, n, k, batch_size, precision),
             cutedsl_nvmmh.query_count(max_tactics),
             lambda config: _sm107_bf16_nvmmh_shape(
-                config, m, n, k, batch_size, c_dtype_cutlass, allow_split_k)
-            is not None,
+                config, m, n, k, batch_size, c_dtype_cutlass, allow_split_k) is
+            not None,
             backend=_SM107_BF16_NVMMH_BACKEND,
             cache_key=("sm107_bf16", allow_split_k))
         fallback_cluster_shape_mn = _SM107_BF16_FALLBACK_CLUSTER_SHAPE_MN
@@ -10514,8 +10516,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raster_along = cutedsl_nvmmh.cta_order_to_raster(config.cta_order)
             scheduler = (() if raster_along == "m" and config.swizzle == 1 else
                          (raster_along, config.swizzle))
-            split_k = ((config.split_k, ) if allow_split_k or scheduler else
-                       ())
+            split_k = ((config.split_k, ) if allow_split_k or scheduler else ())
             tactics = [("base", use_2cta_instrs, mma_tiler_mn, config.cluster,
                         max_num_ab_stage) + split_k + scheduler]
             preferred_class = _sm107_bf16_kernel_class("preferred_cluster")
@@ -10529,10 +10530,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         use_2cta_instrs, mma_tiler_mn,
                         fallback_cluster_shape_mn, m, n, k, batch_size, "k",
                         "k", "n")):
-                tactics.append(
-                    ("preferred_cluster", use_2cta_instrs, mma_tiler_mn,
-                     config.cluster, fallback_cluster_shape_mn,
-                     max_num_ab_stage) + scheduler)
+                tactics.append(("preferred_cluster", use_2cta_instrs,
+                                mma_tiler_mn, config.cluster,
+                                fallback_cluster_shape_mn, max_num_ab_stage) +
+                               scheduler)
             ranked.append((config, tactics))
         return cutedsl_nvmmh.select_tactics(ranked, max_tactics)
 
@@ -13162,23 +13163,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return tactic
             return (*tactic, True, 1)
 
-        def _sm107_fp8_blockwise_nvmmh_tactics(
-                kernel_class, m: int, n: int, k: int, batch_size: int,
-                c_dtype, cta_tile_m_only_128: bool,
-                max_tactics: int) -> List[Tuple]:
+        def _sm107_fp8_blockwise_nvmmh_tactics(kernel_class, m: int, n: int,
+                                               k: int, batch_size: int, c_dtype,
+                                               max_tactics: int) -> List[Tuple]:
             """SM107 FP8 blockwise tactics of the top ``max_tactics`` nvMMH
             configs (tile, cluster, raster and swizzle from nvMMH).
 
-            The kernel's MMA tile is N=128, K=128; a 256-row CTA tile is
-            B-reuse (two 128-row MMAs) and an even cluster M a 2-CTA MMA.
-            It has no split-K.
+            The kernel's CTA tile is 128x128 with K=128 and an even cluster M
+            means 2-CTA MMA. It has no split-K. Its 256-row B-reuse tiles are
+            not offered: the blockwise scaling keeps a full accumulator row
+            per epilogue thread in registers, which spills at 256 rows (about
+            10x slower than the 128-row tile on every measured shape).
             """
 
             def shape(config):
                 cta_m, cta_n, cta_k = config.cta
                 cluster_m, cluster_n = config.cluster
-                if (cta_k != 128 or cta_n != 128 or cta_m not in (128, 256)
-                        or (cta_tile_m_only_128 and cta_m != 128)
+                if (cta_k != 128 or cta_n != 128 or cta_m != 128
                         or config.split_k != 1 or cluster_m not in (1, 2, 4)
                         or cluster_n not in (1, 2, 4)):
                     return None
@@ -13199,7 +13200,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cutedsl_nvmmh.query_count(max_tactics),
                 lambda config: shape(config) is not None,
                 backend=_SM107_FP8_BLOCKWISE_NVMMH_BACKEND,
-                cache_key=("sm107_fp8_blockwise", cta_tile_m_only_128))
+                cache_key=("sm107_fp8_blockwise", c_dtype))
             ranked = []
             for config in configs:
                 use_2cta_instrs, mma_tiler, mma_inst_shape = shape(config)
@@ -13207,10 +13208,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     config.cta_order) == "m"
                 scheduler = (() if raster_along_m and config.swizzle == 1 else
                              (raster_along_m, config.swizzle))
-                ranked.append((config, [
-                    (use_2cta_instrs, mma_tiler, mma_inst_shape,
-                     config.cluster) + scheduler
-                ]))
+                ranked.append(
+                    (config, [(use_2cta_instrs, mma_tiler, mma_inst_shape,
+                               config.cluster) + scheduler]))
             return cutedsl_nvmmh.select_tactics(ranked, max_tactics)
 
         # The SM107 FP8 blockwise kernel has no split-K and supports both
@@ -13270,7 +13270,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if nvmmh_config is not None:
                     nvmmh_tactics = _sm107_fp8_blockwise_nvmmh_tactics(
                         self.__class__.kernel_class, m, n, k, batch_size,
-                        cutlass.BFloat16, False, nvmmh_config.max_tactics)
+                        cutlass.BFloat16, nvmmh_config.max_tactics)
                     if nvmmh_tactics:
                         return nvmmh_tactics
 
@@ -13519,9 +13519,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if nvmmh_config is not None:
                     nvmmh_tactics = _sm107_fp8_blockwise_nvmmh_tactics(
                         self.__class__.kernel_class, m, n, k, batch_size,
-                        (cutlass.Float8E4M3FN
-                         if self.fp8_quantize_1x128 else cutlass.BFloat16),
-                        self.fp8_quantize_1x128, nvmmh_config.max_tactics)
+                        (cutlass.Float8E4M3FN if self.fp8_quantize_1x128 else
+                         cutlass.BFloat16), nvmmh_config.max_tactics)
                     if nvmmh_tactics:
                         return nvmmh_tactics
 
@@ -14049,11 +14048,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 kernel_m, kernel_n, split_k, mma_tiler_mnk[:2],
                                 use_2cta, cluster_shape_mn)):
                         continue
-                    tactics.append(
-                        ("base", mma_tiler_mnk, mma_inst_shape,
-                         cluster_shape_mn, swap_ab, use_prefetch,
-                         scheduler_mode, raster_order, split_k) +
-                        swizzle_suffix)
+                    tactics.append(("base", mma_tiler_mnk, mma_inst_shape,
+                                    cluster_shape_mn, swap_ab, use_prefetch,
+                                    scheduler_mode, raster_order, split_k) +
+                                   swizzle_suffix)
                 fallback_cluster_shape_mn = (2, 1)
                 if (split_k == 1 and use_2cta
                         and math.prod(cluster_shape_mn) > 2 and
@@ -14081,11 +14079,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         scheduler = ((scheduler_mode, )
                                      if self.mixed_scheduler_mode_candidates
                                      != ("static", ) or swizzle_suffix else ())
-                        tactics.append(
-                            ("mixed_clusters", mma_tiler_mnk, mma_inst_shape,
-                             cluster_shape_mn, fallback_cluster_shape_mn,
-                             swap_ab, use_prefetch) + scheduler +
-                            (raster_order, ) + swizzle_suffix)
+                        tactics.append(("mixed_clusters", mma_tiler_mnk,
+                                        mma_inst_shape, cluster_shape_mn,
+                                        fallback_cluster_shape_mn, swap_ab,
+                                        use_prefetch) + scheduler +
+                                       (raster_order, ) + swizzle_suffix)
                 return tactics
 
             def _nvmmh_tactics(self, m: int, n: int, real_k: int,
@@ -14182,9 +14180,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 nvmmh_config = AutoTuner.get().nvmmh_config
                 if nvmmh_config is not None:
+                    # nvMMH ranks both A/B orientations; it decides which one
+                    # each kernel config runs in.
                     nvmmh_tactics = self._nvmmh_tactics(
-                        m, n, real_k, base_swap_ab_candidates,
-                        nvmmh_config.max_tactics)
+                        m, n, real_k, [False, True], nvmmh_config.max_tactics)
                     if nvmmh_tactics:
                         return nvmmh_tactics
 

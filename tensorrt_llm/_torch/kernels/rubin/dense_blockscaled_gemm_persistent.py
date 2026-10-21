@@ -1523,9 +1523,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     cur_tile_coord[2],
                 )
 
-                k_tile_start, tile_k_cnt = self._split_k_range(
-                    k_tile_cnt, mma_tile_coord_mnl[2]
-                )
+                k_tile_start, tile_k_cnt = self._split_k_range(k_tile_cnt, mma_tile_coord_mnl[2])
                 if cutlass.const_expr(self.split_k > 1):
                     mma_tile_coord_mnl = (
                         mma_tile_coord_mnl[0],

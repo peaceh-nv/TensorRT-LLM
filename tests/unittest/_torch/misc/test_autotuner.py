@@ -33,9 +33,10 @@ import tensorrt_llm
 import tensorrt_llm._torch.autotuner as autotuner
 from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
                                            DynamicDim, DynamicTensorSpec,
-                                           FakeTensor, OptimizationProfile,
-                                           StaticDim, TunableRunner,
-                                           TuningConfig, autotune)
+                                           FakeTensor, NvMMHConfig,
+                                           OptimizationProfile, StaticDim,
+                                           TunableRunner, TuningConfig,
+                                           autotune)
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.utils import (deep_gemm_jit_warmup_buckets,
                                        get_power_of_2_num_tokens_buckets,
@@ -1514,12 +1515,13 @@ def test_single_pair_shortcut_failure_is_logged_as_inf(monkeypatch):
 
 
 def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
-    """End-to-end guard for the nvMatmulHeuristics tactic pruning.
+    """End-to-end guard for the nvMatmulHeuristics tactic generation.
 
     For one representative problem size, the tactic the AutoTuner selects when
-    nvMatmulHeuristics prunes the tile/cluster candidates must be no slower (up
-    to a small tolerance) than the tactic it selects from the full CuteDSL
-    NVFP4 tactic sweep. This validates that pruning does not cost performance.
+    ``AutoTuner.nvmmh_config`` builds the candidates from nvMatmulHeuristics'
+    top configurations must be no slower (up to a small tolerance) than the
+    tactic it selects from the full CuteDSL NVFP4 tactic sweep. This validates
+    that the nvMMH guidance does not cost performance.
 
     It additionally compares the heuristic-chosen CuteDSL kernel against the
     cuBLASLt NVFP4 GEMM on the same fp4 inputs: the CuteDSL kernel-only device
@@ -1528,9 +1530,9 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
     kernel's CTA tile / cluster shape, so that is not asserted.
 
     Note: the sweep and heuristic paths do NOT profile identical candidate sets
-    -- the heuristic path is a strict validated subset of the sweep -- so the
-    exact winning tactic can differ. Only the achieved runtime is a meaningful
-    invariant, hence the tolerance comparisons.
+    -- nvMMH may also pick rasterization orders or swizzles the sweep does not
+    enumerate -- so the exact winning tactic can differ. Only the achieved
+    runtime is a meaningful invariant, hence the tolerance comparisons.
 
     Blackwell only (SM100/SM103) and requires the nvMatmulHeuristics library;
     skipped otherwise.
@@ -1602,15 +1604,13 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
                 best_name, best_total, best_count = e.key, t, max(1, e.count)
         return best_name, best_total / best_count
 
-    # Full sweep: heuristics disabled.
-    monkeypatch.delenv("TRTLLM_CUTEDSL_NVMMH_ENABLE", raising=False)
+    # Full sweep: no nvMMH guidance.
+    tuner = AutoTuner.get()
+    monkeypatch.setattr(tuner, "nvmmh_config", None)
     sweep_tactic = _best_tactic()
 
-    # Pruned: nvMatmulHeuristics drives the (coupled) tile+cluster candidates.
-    # Pin MAX_TACTICS so the tolerance below is not affected by an env override.
-    monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_ENABLE", "1")
-    monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_FIELDS", "tile,cluster")
-    monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS", "5")
+    # nvMatmulHeuristics builds the candidates from its top 5 configurations.
+    monkeypatch.setattr(tuner, "nvmmh_config", NvMMHConfig(max_tactics=5))
     heuristic_tactic = _best_tactic()
 
     # cuBLASLt runs its own heuristic auto-tuning; warm it under autotune().
@@ -1629,10 +1629,10 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
         lambda: runner(inputs, tactic=heuristic_tactic))
     _, cublas_us = _dominant_kernel(_cublas_call)
 
-    # Pruning must not degrade the achieved kernel runtime beyond this tolerance.
-    # With the default MAX_TACTICS=5 the heuristic set includes the empirical
-    # best tile (its cluster ranking can still be slightly off, ~2-3% on square
-    # 4096), so a tight bound catches gross regressions while allowing that.
+    # The guidance must not degrade the achieved kernel runtime beyond this
+    # tolerance. With the default max_tactics=5 the nvMMH set includes the
+    # empirical best tile (its cluster ranking can still be slightly off, ~2-3%
+    # on square 4096), so a tight bound catches gross regressions.
     tolerance = 1.05
     assert heuristic_us <= sweep_us * tolerance, (
         f"heuristic-pruned tactic {heuristic_tactic} ({heuristic_us:.2f} us) is "
@@ -1649,6 +1649,49 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
         f"CuteDSL heuristic kernel ({heuristic_us:.2f} us) is "
         f">{cublas_tolerance:.2f}x slower than cuBLAS NVFP4 "
         f"({cublas_us:.2f} us) for M={m}, N={n}, K={k}")
+
+
+def test_tactic_space_key_separates_cache_entries(tmp_path):
+    """Entries tuned over a policy-dependent tactic space carry the policy.
+
+    nvMMH-guided runners report ("nvmmh", version, max_tactics) through
+    TunableRunner.tactic_space_key(); their profiling-cache entries must not
+    be reused by the full sweep or another policy, and must survive a cache
+    file round trip.
+    """
+
+    class PolicyRunner(GemmRunner):
+        policy = None
+
+        def tactic_space_key(self):
+            return type(self).policy
+
+    tuner = AutoTuner.get()
+    tuning_config = TuningConfig()
+    shapes = ((16, 64), (64, 128))
+    runner = PolicyRunner()
+
+    def cache_key(policy):
+        PolicyRunner.policy = policy
+        return tuner.profiling_cache.get_cache_key("test_tactic_space_key",
+                                                   runner, shapes,
+                                                   tuning_config)
+
+    sweep = cache_key(None)
+    guided = cache_key(("nvmmh", "0.1.0.27", 5))
+    other = cache_key(("nvmmh", "0.1.0.27", 3))
+    assert len({sweep, guided, other}) == 3
+    assert guided[:-1] == sweep
+    assert guided[-1] == ("nvmmh", "0.1.0.27", 5)
+
+    src = autotuner.AutoTuner().profiling_cache
+    src.cache[guided] = (0, 1, 0.5)
+    path = str(tmp_path / "cache.json")
+    src.save_cache(path, rank=0)
+    dst = autotuner.AutoTuner().profiling_cache
+    dst.load_cache(path, rank=0)
+    assert dst.cache[guided][1] == 1
+    assert sweep not in dst.cache
 
 
 @pytest.mark.parametrize("distribution", ["random", "balanced"])

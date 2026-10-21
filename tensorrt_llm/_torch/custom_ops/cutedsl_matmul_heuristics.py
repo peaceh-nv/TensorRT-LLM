@@ -67,7 +67,11 @@ class KernelConfig(NamedTuple):
     ``cta`` is the per-CTA (M, N, K) tile. On Blackwell-class GPUs nvMMH runs
     2-CTA MMA instructions whenever ``cluster[0]`` is even (see
     :func:`pairs_ctas`). ``cta_order`` 0 rasterizes along M and 1 along N.
+    ``score`` is the value nvMMH ranks configurations by (lower is better),
+    comparable across problems that compute the same product (see
+    :func:`query`).
     """
+
     cta: Tuple[int, int, int]
     cluster: Tuple[int, int]
     split_k: int
@@ -76,12 +80,13 @@ class KernelConfig(NamedTuple):
     stages: int
     warp: Tuple[int, int, int]
     instr: Tuple[int, int, int]
-    runtime_us: float
+    score: float
 
 
 @dataclass(frozen=True)
 class Problem:
     """A GEMM/BMM problem in nvMMH terms (after any A/B swap)."""
+
     m: int
     n: int
     k: int
@@ -96,9 +101,12 @@ class Backend:
 
     Properties left as None keep nvMMH's CUTLASS3 defaults.
     """
+
     split_k_kind: Optional[str] = None
     supports_col_major_raster: Optional[bool] = None
     supports_odd_cluster_n: Optional[bool] = None
+    # The kernel launches a 2-CTA cluster above two CTAs with a 2x1 fallback
+    # cluster (preferred-cluster launch).
     supports_fallback_cluster: Optional[bool] = None
     cta_tile_m_div: Optional[int] = None
     cta_tile_n_div: Optional[int] = None
@@ -200,23 +208,30 @@ def _set_validity_check(interface, backend, accept: Callable[[object], bool]) ->
         return
     # 0.1.0.x passes a configuration pointer and an unused problem pointer.
     interface.setBackendCallbackProperty(
-        backend, kind, lambda config_ptr, _problem_ptr: int(bool(accept(config_ptr.contents))))
+        backend, kind, lambda config_ptr, _problem_ptr: int(bool(accept(config_ptr.contents)))
+    )
 
 
 def _configure_backend(interface, backend, spec: Backend) -> None:
     if spec.split_k_kind is not None:
-        _set_property(interface, backend, "SPLIT_K_KIND",
-                      int(getattr(_nvmmh.NvMatmulHeuristicsSplitKKind, spec.split_k_kind)))
-    for name, value in (("HAS_COL_MAJOR_RASTER", spec.supports_col_major_raster),
-                        ("SUPPORTS_ODD_CLUSTER_N", spec.supports_odd_cluster_n),
-                        ("SUPPORTS_FALLBACK_CLUSTER", spec.supports_fallback_cluster),
-                        ("CTA_TILE_M_DIV_REQUIREMENT", spec.cta_tile_m_div),
-                        ("CTA_TILE_N_DIV_REQUIREMENT", spec.cta_tile_n_div)):
+        _set_property(
+            interface,
+            backend,
+            "SPLIT_K_KIND",
+            int(getattr(_nvmmh.NvMatmulHeuristicsSplitKKind, spec.split_k_kind)),
+        )
+    for name, value in (
+        ("HAS_COL_MAJOR_RASTER", spec.supports_col_major_raster),
+        ("SUPPORTS_ODD_CLUSTER_N", spec.supports_odd_cluster_n),
+        ("SUPPORTS_FALLBACK_CLUSTER", spec.supports_fallback_cluster),
+        ("CTA_TILE_M_DIV_REQUIREMENT", spec.cta_tile_m_div),
+        ("CTA_TILE_N_DIV_REQUIREMENT", spec.cta_tile_n_div),
+    ):
         if value is not None:
             _set_property(interface, backend, name, int(value))
 
 
-def _to_kernel_config(raw, runtime_s: float) -> KernelConfig:
+def _to_kernel_config(raw, score: float) -> KernelConfig:
     return KernelConfig(
         cta=tuple(int(v) for v in raw.cta),
         cluster=(max(1, int(raw.cluster[0])), max(1, int(raw.cluster[1]))),
@@ -226,29 +241,54 @@ def _to_kernel_config(raw, runtime_s: float) -> KernelConfig:
         stages=int(raw.loadStages),
         warp=tuple(int(v) for v in raw.warp),
         instr=tuple(int(v) for v in raw.instr),
-        runtime_us=float(runtime_s) * 1e6,
+        score=float(score),
     )
 
 
-def _query_uncached(problem: Problem, count: int, backend_spec: Backend,
-                    is_valid: Callable[[KernelConfig], bool]) -> List[KernelConfig]:
+def _ranking_score(interface, backend, nv_problem, raw, precision: str, fallback: float) -> float:
+    """The score nvMMH ranks ``raw`` by, with this backend's properties.
+
+    Libraries with ``RANKING_SCORE`` report it directly; older libheuristics
+    builds approximate it with ``RUNTIME_RELATIVE_FAST_S`` (their ranking
+    metric without the Rubin L2 simulation). 0.1.0.x has no per-backend
+    estimate: ``fallback`` is the wrapper's ``runtime`` field, a default-backend
+    absolute runtime.
+    """
+    estimate = getattr(interface, "estimateSiliconMetricEx", None)
+    if estimate is None or not hasattr(interface, "setBackendPropertyValue"):
+        return fallback
+    metrics = _nvmmh.NvMatmulHeuristicsSiliconMetric
+    metric = getattr(metrics, "RANKING_SCORE", metrics.RUNTIME_RELATIVE_FAST_S)
+    try:
+        value = estimate(precision, backend, nv_problem, raw, int(metric))
+    except Exception:  # noqa: BLE001 - only orders merged rankings
+        return fallback
+    return float(value) if value and value > 0 else fallback
+
+
+def _query_uncached(
+    problem: Problem, count: int, backend_spec: Backend, is_valid: Callable[[KernelConfig], bool]
+) -> List[KernelConfig]:
     interface = _get_interface(problem.precision)
     backend = interface.createBackend(_nvmmh.NvMatmulHeuristicsTarget.CUTLASS3)
     try:
         _configure_backend(interface, backend, backend_spec)
-        _set_validity_check(interface, backend,
-                            lambda raw: is_valid(_to_kernel_config(raw, 0.0)))
+        _set_validity_check(interface, backend, lambda raw: is_valid(_to_kernel_config(raw, 0.0)))
         nv_problem = _make_problem(interface, problem)
         configs = interface.getEx(nv_problem, int(count), backend, problem.precision)
+        ranked = []
+        for entry in configs:
+            raw = entry["nvmmhKernelConfiguration"]
+            score = _ranking_score(
+                interface, backend, nv_problem, raw, problem.precision, entry.get("runtime", 0.0)
+            )
+            config = _to_kernel_config(raw, score)
+            # Wrappers that drop the callback's verdict still return only
+            # nvMMH-ranked configs; re-check them here.
+            if is_valid(config):
+                ranked.append(config)
     finally:
         interface.destroyBackend(backend)
-    ranked = []
-    for entry in configs:
-        config = _to_kernel_config(entry["nvmmhKernelConfiguration"], entry.get("runtime", 0.0))
-        # Wrappers that drop the callback's verdict still return only
-        # nvMMH-ranked configs; re-check them here.
-        if is_valid(config):
-            ranked.append(config)
     return ranked
 
 
@@ -256,15 +296,18 @@ _query_cache: Dict[Hashable, List[KernelConfig]] = {}
 _query_cache_lock = threading.Lock()
 
 
-def query(problem: Problem,
-          count: int,
-          is_valid: Callable[[KernelConfig], bool],
-          backend: Backend = Backend(),
-          cache_key: Optional[Hashable] = None) -> List[KernelConfig]:
+def query(
+    problem: Problem,
+    count: int,
+    is_valid: Callable[[KernelConfig], bool],
+    backend: Backend = Backend(),
+    cache_key: Optional[Hashable] = None,
+) -> List[KernelConfig]:
     """Return up to ``count`` valid nvMMH configs in nvMMH's ranking order.
 
-    nvMMH's own order is kept: its estimated ``runtime_us`` is informative
-    only (Rubin ranks candidates with an L2 simulator on top of it).
+    nvMMH's own order is kept. Each config carries its ranking ``score``, so
+    rankings of several problems computing the same product (e.g. both A/B
+    orientations) can be merged consistently with that order.
     ``cache_key`` identifies the validity check; results are memoized per
     (problem, count, backend, cache_key) when it is given. Failures are
     logged once and yield an empty list.
@@ -298,8 +341,7 @@ def query_count(max_tactics: int) -> int:
     return max(MIN_QUERY_COUNT, QUERY_OVERSAMPLING * int(max_tactics))
 
 
-def select_tactics(ranked: List[Tuple[KernelConfig, List[tuple]]],
-                   max_tactics: int) -> List[tuple]:
+def select_tactics(ranked: List[Tuple[KernelConfig, List[tuple]]], max_tactics: int) -> List[tuple]:
     """Expand the top ``max_tactics`` nvMMH configs into runner tactics.
 
     ``ranked`` pairs each config (nvMMH order) with the tactics realizing it:
