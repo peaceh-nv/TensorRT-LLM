@@ -32,6 +32,7 @@ from tensorrt_llm.mapping import Mapping
 from ..attention.backends.interface import (AttentionMetadata,
                                             AttentionRuntimeFeatures)
 from ..attention.backends.utils import get_attention_backend
+from ..autotuner import AutoTuner, NvMMHConfig
 from ..compilation.backend import Backend
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
@@ -161,6 +162,19 @@ def _configure_deep_gemm_pdl() -> None:
     _DEEP_GEMM_PDL_CONFIGURED = True
 
 
+def _configure_autotuner_nvmmh(llm_args: TorchLlmArgs) -> None:
+    """Install the engine's nvMatmulHeuristics policy on the process AutoTuner.
+
+    Runs before model construction because CuTe DSL runners may enumerate
+    tactics while modules are built. Engines of one process (e.g. target and
+    draft) share the LLM args and therefore the policy.
+    """
+    # Partial test doubles of TorchLlmArgs may omit the field.
+    config = getattr(llm_args, "autotuner_nvmmh_config", None)
+    AutoTuner.get().nvmmh_config = (None if config is None else NvMMHConfig(
+        max_tactics=config.max_tactics))
+
+
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -178,6 +192,7 @@ class PyTorchModelEngine(ModelEngine):
         model_weights_restore_mode=None,
     ):
         _configure_deep_gemm_pdl()
+        _configure_autotuner_nvmmh(llm_args)
 
         self._metrics: dict[str, float] = defaultdict(float)
         self._cleanup_done = False
