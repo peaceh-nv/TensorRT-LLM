@@ -685,6 +685,11 @@ def _merge_nvmmh_rankings(rankings: List[List[Tuple]]) -> List[Tuple]:
         heads[best] += 1
 
 
+# The Blackwell block-scaled GEMM reduces split-K partials with TMA reduce-add
+# into the zeroed output and supports both rasters.
+_SM100_BLOCKSCALED_NVMMH_BACKEND = cutedsl_nvmmh.Backend(
+    split_k_kind=cutedsl_nvmmh.SPLIT_K_IN_PLACE, supports_col_major_raster=True)
+
 # Rubin block-scaled GEMMs reduce split-K partials with TMA reduce-add into the
 # zeroed output (no workspace, no reduction launch), support both rasters and
 # launch 2-CTA clusters above two CTAs with a 2x1 fallback cluster.
@@ -1040,17 +1045,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def tactic_space_key(self):
             return _nvmmh_tactic_space_key()
 
+        # K extent of one MMA tile (FP4 A/B)
+        mma_tiler_k = 256
+
         def _nvmmh_tactic(self, config, m: int, n: int, real_k: int,
                           swap_ab: bool, use_prefetch: bool):
             """Map an nvMMH config onto this kernel, or None if it cannot run it.
 
             Blackwell block-scaled MMAs are 128 rows per CTA; an even nvMMH
             cluster M means a 2-CTA MMA, which this kernel encodes as
-            mma_tiler_m == 256. The kernel has no split-K and a fixed K tile.
+            mma_tiler_m == 256. The K tile is fixed; split-K slices take
+            balanced K-tile ranges, so any split up to the K-tile count runs.
             """
             cta_m, cta_n, cta_k = config.cta
             # Cheap rejections first: can_implement prints every refusal.
-            if (cta_m != 128 or cta_k != 256 or config.split_k != 1
+            if (cta_m != 128 or cta_k != self.mma_tiler_k
+                    or config.split_k > real_k // self.mma_tiler_k
                     or cta_n not in (64, 128, 192, 256)
                     or any(c not in (1, 2, 4) for c in config.cluster)):
                 return None
@@ -1062,6 +1072,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return None
             raster_along_m = cutedsl_nvmmh.cta_order_to_raster(
                 config.cta_order) == "m"
+            if config.split_k > 1:
+                return (mma_tiler_mn, config.cluster, swap_ab, use_prefetch,
+                        config.swizzle, raster_along_m, config.split_k)
             if config.swizzle == 1 and raster_along_m:
                 return (mma_tiler_mn, config.cluster, swap_ab, use_prefetch)
             return (mma_tiler_mn, config.cluster, swap_ab, use_prefetch,
@@ -1087,6 +1100,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cutedsl_nvmmh.query_count(max_tactics),
                     lambda config: self._nvmmh_tactic(
                         config, m, n, real_k, swap_ab, False) is not None,
+                    backend=_SM100_BLOCKSCALED_NVMMH_BACKEND,
                     cache_key=(self.__class__.__name__, swap_ab))
                 rankings.append([(config, [
                     tactic for use_prefetch in (False, True)
@@ -1102,21 +1116,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Unpack a tactic into the full knob set with back-compat defaults.
 
             The base tactic is (mma_tiler_mn, cluster_shape_mn, swap_ab,
-            use_prefetch). The heuristic path may append two tile-scheduler
-            knobs (swizzle_size, raster_along_m); older 4-tuples (and the full
-            sweep) default to the kernel's neutral values (no swizzle, M-major
-            raster). Non-tuple tactics use the default kernel tactic.
+            use_prefetch). Two tile-scheduler knobs (swizzle_size,
+            raster_along_m) and the split-K factor may follow; shorter tuples
+            default to the kernel's neutral values (no swizzle, M-major
+            raster, no split-K). Non-tuple tactics use the default tactic.
             """
             if not isinstance(tactic, (tuple, list)):
-                return (128, 128), (1, 1), False, False, 1, True
+                return (128, 128), (1, 1), False, False, 1, True, 1
             mma_tiler_mn = tactic[0]
             cluster_shape_mn = tactic[1]
             swap_ab = tactic[2]
             use_prefetch = tactic[3]
             swizzle_size = int(tactic[4]) if len(tactic) > 4 else 1
             raster_along_m = bool(tactic[5]) if len(tactic) > 5 else True
+            split_k = int(tactic[6]) if len(tactic) > 6 else 1
             return (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
-                    swizzle_size, raster_along_m)
+                    swizzle_size, raster_along_m, split_k)
 
         def _tactic_is_supported(self, mma_tiler_mn, cluster_shape_mn, swap_ab,
                                  use_prefetch, m, n, real_k) -> bool:
@@ -1168,9 +1183,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> bool:
             # get_valid_tactics emits (mma_tiler_mn, cluster_shape_mn, swap_ab,
-            # use_prefetch), plus (swizzle_size, raster_along_m) for nvMMH
-            # configs with a non-default scheduler.
-            return isinstance(tactic, tuple) and len(tactic) in (4, 6)
+            # use_prefetch), plus (swizzle_size, raster_along_m) for a
+            # non-default scheduler and the split-K factor.
+            return isinstance(tactic, tuple) and len(tactic) in (4, 6, 7)
 
         def make_cute_dsl_global_pointer(self, tensor: torch.Tensor, dtype,
                                          assumed_align: int):
@@ -1208,7 +1223,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sf_vec_size = 16
 
             (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
-             swizzle_size, raster_along_m) = self._unpack_tactic(tactic)
+             swizzle_size, raster_along_m,
+             split_k) = self._unpack_tactic(tactic)
 
             a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs
             m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
@@ -1271,7 +1287,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 stream = cuda.CUstream(torch_stream.cuda_stream)
 
             cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab,
-                         use_prefetch, swizzle_size, raster_along_m,
+                         use_prefetch, swizzle_size, raster_along_m, split_k,
                          self.use_tvm_ffi)
             if swap_ab:
                 kernel_m = n
@@ -1341,6 +1357,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     use_prefetch,
                     swizzle_size,
                     raster_along_m,
+                    split_k=split_k,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -1374,6 +1391,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # Split-K slices reduce-add into C through TMA; zero it on the
+            # launch stream right before the GEMM so CUDA graph replay is safe.
+            if split_k > 1:
+                c_tensor.zero_()
 
             # launch gemm kernel
             if self.use_tvm_ffi:

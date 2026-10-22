@@ -1020,6 +1020,55 @@ def test_nvfp4_gemm_cutedsl(m, with_bias, monkeypatch, tmp_path):
     tuner.clear_cache()
 
 
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE
+                    or get_sm_version() not in (100, 103),
+                    reason="Requires SM100/SM103 CuTe DSL")
+@pytest.mark.parametrize("m", [1, 64, 300])
+def test_nvfp4_gemm_cutedsl_blackwell_split_k(m, monkeypatch):
+    """Split-K slices of the SM100 block-scaled GEMM reduce into the zeroed
+    output: they match the unsplit tactic up to the BF16 reduction order."""
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLNVFP4BlackwellRunner
+
+    torch.manual_seed(2026)
+    dtype = torch.bfloat16
+    # 7 K tiles of 256: split 3 gives slices of 2, 2 and 3 K tiles.
+    n, k = 512, 1792
+    x = torch.randn(m, k, dtype=dtype, device="cuda")
+    w = torch.randn(n, k, dtype=dtype, device="cuda")
+    x_scale = 2688 / x.abs().max().float()
+    w_scale = 2688 / w.abs().max().float()
+    x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(x, x_scale, 16, False)
+    w_fp4, w_sf = torch.ops.trtllm.fp4_quantize(w, w_scale, 16, False)
+    alpha = (1 / (x_scale * w_scale)).reshape(1)
+    inputs = [x_fp4, w_fp4, x_sf, w_sf, alpha]
+    reference = torch.ops.trtllm.nvfp4_gemm_cutlass(*inputs, dtype)
+
+    monkeypatch.setattr(AutoTuner.get(), "nvmmh_config", None)
+    runner = CuteDSLNVFP4BlackwellRunner(dtype)
+    swap_ab = m <= 128
+    for mma_tiler_mn, cluster_shape_mn in (((128, 128), (1, 1)), ((256, 128),
+                                                                  (2, 1))):
+        base = (mma_tiler_mn, cluster_shape_mn, swap_ab, False)
+        unsplit = runner(inputs, tactic=base)
+        torch.testing.assert_close(unsplit, reference, rtol=1e-2, atol=0.15)
+        for split_k in (2, 3, 7):
+            tactic = base + (1, True, split_k)
+            # Every slice rounds its partial to BF16 before the atomic add.
+            output = runner(inputs, tactic=tactic)
+            torch.testing.assert_close(output, unsplit, rtol=2e-2, atol=1.5)
+
+            # Zeroing happens inside the captured launch.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = runner(inputs, tactic=tactic)
+            captured.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(captured, unsplit, rtol=2e-2, atol=1.5)
+
+
 def _skip_if_no_locality_domain():
     if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
         pytest.skip("CuTe DSL package with Rubin support is not available")
