@@ -736,13 +736,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         The 5-field form appends the scheduler's raster ("m" or "n") and
         swizzle width to (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn);
-        the 3-field form rasterizes along M without swizzle.
+        the 3-field form rasterizes along M without swizzle. The 6-field form
+        of the BF16 GEMM adds the split-K factor (see _sm100_tactic_split_k).
         """
         if not isinstance(tactic, tuple):
             return False, (128, 128), (1, 1), "m", 1
-        if len(tactic) == 5:
-            return tactic
+        if len(tactic) >= 5:
+            return tactic[:5]
         return (*tactic, "m", 1)
+
+    def _sm100_tactic_split_k(tactic) -> int:
+        """Split-K factor of an SM100 BF16 GEMM tactic (1 unless 6 fields)."""
+        if isinstance(tactic, tuple) and len(tactic) == 6:
+            return int(tactic[5])
+        return 1
 
     def _sm100_fp8_blockwise_mma_tiler_candidates(
             m: int) -> List[Tuple[int, int]]:
@@ -757,22 +764,35 @@ if IS_CUTLASS_DSL_AVAILABLE:
                       for tile_m in (64, 128, 256)]
         return tiles
 
-    # SM100 BF16 and FP8 blockwise GEMMs have no split-K and support both
-    # rasters.
+    # SM100 BF16 and FP8 blockwise GEMMs support both rasters. Only the BF16
+    # GEMM splits K: every slice reduce-adds its partial into the zeroed output
+    # with TMA (no workspace, no reduction launch).
     _SM100_NVMMH_BACKEND = cutedsl_nvmmh.Backend(split_k_kind="NONE",
                                                  supports_col_major_raster=True)
+    _SM100_SPLIT_K_NVMMH_BACKEND = cutedsl_nvmmh.Backend(
+        split_k_kind=cutedsl_nvmmh.SPLIT_K_IN_PLACE,
+        supports_col_major_raster=True)
 
-    def _sm100_nvmmh_tactics(kernel_class, ab_dtype, c_dtype, precision: str,
-                             m: int, n: int, k: int, batch_size: int,
-                             mma_tiler_n: Optional[int], cta_tile_k: int,
-                             max_tactics: int) -> List[Tuple]:
+    def _sm100_nvmmh_tactics(kernel_class,
+                             ab_dtype,
+                             c_dtype,
+                             precision: str,
+                             m: int,
+                             n: int,
+                             k: int,
+                             batch_size: int,
+                             mma_tiler_n: Optional[int],
+                             cta_tile_k: int,
+                             max_tactics: int,
+                             allow_split_k: bool = False) -> List[Tuple]:
         """SM100 BF16 / FP8 blockwise tactics of the top ``max_tactics``
-        nvMMH configs (tile, cluster, raster and swizzle from nvMMH).
+        nvMMH configs (tile, cluster, raster, swizzle and split-K from nvMMH).
 
         Blackwell MMAs are at most 128 rows per CTA; an even nvMMH cluster M
         means a 2-CTA MMA, whose MMA tile covers both CTAs. ``mma_tiler_n``
-        pins the kernel's tile N (None: any multiple of 32 up to 256) and
-        ``cta_tile_k`` is the kernel's fixed K tile.
+        pins the kernel's tile N (None: any N the kernel implements) and
+        ``cta_tile_k`` is the kernel's fixed K tile. ``allow_split_k`` lets
+        nvMMH split K (in place) up to one K tile per slice.
         """
         if (c_dtype == cutlass.Float32
                 and precision == cutedsl_nvmmh.BF16_PRECISION):
@@ -783,8 +803,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if (cta_k != cta_tile_k or cta_m not in (64, 128)
                     or (mma_tiler_n is not None and cta_n != mma_tiler_n)
                     or cta_n % 32 != 0 or not 32 <= cta_n <= 256
-                    or config.split_k != 1 or any(c not in (1, 2, 4)
-                                                  for c in config.cluster)):
+                    or (config.split_k != 1 and
+                        (not allow_split_k
+                         or config.split_k > ceil_div(k, cta_tile_k)))
+                    or any(c not in (1, 2, 4) for c in config.cluster)):
                 return None
             use_2cta_instrs = cutedsl_nvmmh.pairs_ctas(config)
             mma_tiler_mn = (cta_m * (2 if use_2cta_instrs else 1), cta_n)
@@ -799,17 +821,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cutedsl_nvmmh.Problem(m, n, k, batch_size, precision),
             cutedsl_nvmmh.query_count(max_tactics),
             lambda config: shape(config) is not None,
-            backend=_SM100_NVMMH_BACKEND,
+            backend=(_SM100_SPLIT_K_NVMMH_BACKEND
+                     if allow_split_k else _SM100_NVMMH_BACKEND),
             cache_key=(kernel_class.__name__, mma_tiler_n, str(c_dtype)))
         ranked = []
         for config in configs:
             use_2cta_instrs, mma_tiler_mn = shape(config)
             raster_along = cutedsl_nvmmh.cta_order_to_raster(config.cta_order)
-            scheduler = (() if raster_along == "m" and config.swizzle == 1 else
+            scheduler = (() if raster_along == "m" and config.swizzle == 1
+                         and config.split_k == 1 else
                          (raster_along, config.swizzle))
-            ranked.append((config, [
-                (use_2cta_instrs, mma_tiler_mn, config.cluster) + scheduler
-            ]))
+            split_k = (config.split_k, ) if config.split_k > 1 else ()
+            ranked.append(
+                (config, [(use_2cta_instrs, mma_tiler_mn, config.cluster) +
+                          scheduler + split_k]))
         return cutedsl_nvmmh.select_tactics(ranked, max_tactics)
 
     @functools.cache
@@ -10048,12 +10073,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             b_major = "k"
             c_major = "n"
 
+            # Split-K reduce-adds into the whole [M, N] output; dynamic tuning
+            # may bucket input M while leaving the output at the full M.
+            allow_split_k = inputs[2].shape[0] == m
+
             nvmmh_config = AutoTuner.get().nvmmh_config
             if nvmmh_config is not None:
                 nvmmh_tactics = _sm100_nvmmh_tactics(
                     self.__class__.kernel_class, cutlass.BFloat16,
                     c_dtype_cutlass, cutedsl_nvmmh.BF16_PRECISION, m, n, k,
-                    batch_size, None, 64, nvmmh_config.max_tactics)
+                    batch_size, None, 64, nvmmh_config.max_tactics,
+                    allow_split_k)
                 if nvmmh_tactics:
                     return nvmmh_tactics
 
@@ -10070,8 +10100,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
+            # Split-K pays off for long K with few output tiles. The full
+            # sweep offers it only for FP32 output, where the TMA reduce-add
+            # of the slices does not round partial sums to BF16.
+            split_k_candi = [1]
+            if (allow_split_k and c_dtype_cutlass == cutlass.Float32
+                    and k >= 4096 and n <= 512):
+                split_k_candi = [1, 2, 4, 8]
             return [
-                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn) +
+                (("m", 1, split_k) if split_k > 1 else ())
                 for use_2cta_instrs in use_2cta_instrs_candi
                 for mma_tiler_mn in mma_tiler_mn_candi
                 for cluster_shape_mn in cluster_shape_mn_candi
@@ -10089,7 +10127,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     a_major,
                     b_major,
                     c_major,
-                )
+                ) for split_k in split_k_candi
             ]
 
         def forward(
@@ -10110,6 +10148,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """
             (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_along,
              swizzle_size) = _parse_sm100_tactic(tactic)
+            split_k_slices = _sm100_tactic_split_k(tactic)
 
             a_tensor, b_tensor, c_tensor = inputs
 
@@ -10117,6 +10156,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a_tensor.shape[0], a_tensor.shape[1]
             n = b_tensor.shape[0]
             batch_size = 1
+            if split_k_slices > 1 and tuple(c_tensor.shape) != (m, n):
+                raise RuntimeError(
+                    "BF16 split-K GEMM requires an [M, N] output, got "
+                    f"output.shape={tuple(c_tensor.shape)}, expected={(m, n)}.")
 
             # Ensure inputs are contiguous
             a_tensor = a_tensor.contiguous()
@@ -10162,6 +10205,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cluster_shape_mn,
                 raster_along,
                 swizzle_size,
+                split_k_slices,
                 self.use_tvm_ffi,
                 c_dtype_cutlass,
             )
@@ -10191,6 +10235,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn=cluster_shape_mn,
                     swizzle_size=swizzle_size,
                     raster_along=raster_along,
+                    split_k_slices=split_k_slices,
+                    use_direct_split_k_reduce=split_k_slices > 1,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -10213,6 +10259,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # TMA ADD accumulates the split-K slices into C; zero it on the
+            # launch stream right before the GEMM so CUDA graph replay is safe.
+            if split_k_slices > 1:
+                c_buf.zero_()
 
             # launch gemm kernel
             if self.use_tvm_ffi:
