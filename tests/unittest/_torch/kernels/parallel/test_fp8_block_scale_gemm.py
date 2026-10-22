@@ -163,6 +163,54 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n, use_tvm_ffi):
 
 
 @pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100 and SM103 only. Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("m", [7, 200])
+def test_cute_dsl_fp8_block_scale_gemm_tile_shapes(m, monkeypatch):
+    """Every MMA tile of the SM100 blockwise GEMM, including the N = 32 / 64
+    tiles that lie inside one 128-column scale block of B."""
+    # 8 K tiles wrap the scale pipeline; 3 scale blocks of N give the narrow
+    # tiles several N tiles per block.
+    k, n = 1024, 384
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / k
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / k
+    a_fp8, a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
+    b_fp8, b_sf = per_block_cast_to_fp8(b)
+    output_expected = a @ b.t()
+
+    monkeypatch.setattr(AutoTuner.get(), "nvmmh_config", None)
+    runner = cute_dsl_custom_ops.CuteDSLFp8BlackwellRunner()
+    inputs = [a_fp8, b_fp8, a_sf, b_sf]
+    clusters = {False: (1, 1), True: (2, 1)}
+    tactics = [
+        tactic for tactic in runner.get_valid_tactics(inputs, None)
+        if tactic[2] == clusters[tactic[0]]
+    ]
+    assert {tactic[1][1] for tactic in tactics} == {32, 64, 128}
+    assert len(tactics) == 12
+
+    # A narrow tile runs the same MMAs and FP32 promotion per element as the
+    # 128-wide tile of its MMA M.
+    outputs_128_wide = {}
+    for tactic in sorted(tactics, key=lambda t: -t[1][1]):
+        use_2cta_instrs, mma_tiler_mn, _ = tactic
+        output = runner(inputs, tactic=tactic)
+        torch.cuda.synchronize()
+        assert calc_diff(output, output_expected) < 1e-3, tactic
+        key = (use_2cta_instrs, mma_tiler_mn[0])
+        if mma_tiler_mn[1] == 128:
+            outputs_128_wide[key] = output
+        else:
+            torch.testing.assert_close(output,
+                                       outputs_128_wide[key],
+                                       rtol=0,
+                                       atol=0)
+
+
+@pytest.mark.skipif(
     getSMVersion() != 90 and getSMVersion() != 89 and getSMVersion() != 120,
     reason="The test is for Hopper and Ada only. Current SM is %d." %
     getSMVersion(),

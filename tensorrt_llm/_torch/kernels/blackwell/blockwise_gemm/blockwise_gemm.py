@@ -113,7 +113,7 @@ Constraints are same as dense_gemm.py:
   see detailed valid dtype combinations in below Sm100BlockwiseGemmKernel class documentation
 * A/B tensor must have the same data type
 * Mma tiler M must be 64/128/256
-* Mma tiler N must be 128, align with the scaleB requirement
+* Mma tiler N must be 32, 64 or 128, so that a tile never spans two scaleB blocks
 * Cluster shape M/N must be positive and power of 2, total cluster size <= 16
 * Cluster shape M must be multiple of 2
 * The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned
@@ -145,7 +145,7 @@ class Sm100BlockwiseGemmKernel:
 
     :note: Constraints:
         - MMA tiler M must be 64/128/256
-        - MMA tiler N must be 128
+        - MMA tiler N must be 32, 64 or 128
         - Cluster shape M must be multiple of 2
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
 
@@ -303,8 +303,11 @@ class Sm100BlockwiseGemmKernel:
         self.scale_granularity_m = 1
         self.scale_granularity_n = 128
         self.scale_granularity_k = 128
+        # A CTA tile narrower than a scale block (N = 32 or 64) lies inside one
+        # 128-column block of B and applies that block's scale to all columns.
+        self.sfb_tile_granularity_n = min(self.scale_granularity_n, self.cta_tile_shape_mnk[1])
         self.scale_m_per_tile = self.cta_tile_shape_mnk[0] // self.scale_granularity_m
-        self.scale_n_per_tile = self.cta_tile_shape_mnk[1] // self.scale_granularity_n
+        self.scale_n_per_tile = self.cta_tile_shape_mnk[1] // self.sfb_tile_granularity_n
         self.scale_k_per_tile = self.cta_tile_shape_mnk[2] // self.scale_granularity_k
 
         if self.scale_k_per_tile != 1:
@@ -384,7 +387,7 @@ class Sm100BlockwiseGemmKernel:
         )
         self.sfb_smem_layout_staged = cute.make_layout(
             (
-                (self.scale_granularity_n, self.scale_n_per_tile),
+                (self.sfb_tile_granularity_n, self.scale_n_per_tile),
                 (self.scale_granularity_k, self.scale_k_per_tile),
                 self.num_scale_stage,
             ),
@@ -878,7 +881,7 @@ class Sm100BlockwiseGemmKernel:
         sSFB_view_as_C_layout = cute.make_layout(
             (
                 self.cta_tile_shape_mnk[0],
-                (self.scale_granularity_n, self.scale_n_per_tile),
+                (self.sfb_tile_granularity_n, self.scale_n_per_tile),
                 self.num_scale_stage,
             ),
             stride=(0, (0, 1), self.scale_n_per_tile),
@@ -1914,27 +1917,38 @@ class Sm100BlockwiseGemmKernel:
         :rtype: Tuple[cute.TiledCopy, cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor,
                   cute.Tensor, cute.Tensor, cute.Tensor]
         """
-        # Make tiledCopy for tensor memory load
+        # Make tiledCopy for tensor memory load/store. The warps split an
+        # epilogue subtile as in sm100_utils.get_tmem_load_op; an atom spans at
+        # most a warp's share of it (16 datapaths x 64 or 32 x 32 FP32
+        # columns), so narrow tiles (N = 32) use fewer repetitions.
+        tmem_warp_shape_mn = (
+            (2, 2) if (self.cta_tile_shape_mnk[0] == 64 and self.use_2cta_instrs) else (4, 1)
+        )
+        epi_warp_tile_mn = cute.shape_div(
+            cute.product_each(cute.shape(epi_tile)), tmem_warp_shape_mn
+        )
+        num_warp_cols = cute.size(epi_warp_tile_mn[1])
         tmem_load_atom = None
         tmem_store_atom = None
         if cutlass.const_expr(self.mma_tiler[0] == 64):
+            # 256 bits = 8 FP32 columns per repetition
+            num_rep = min(8, num_warp_cols * self.acc_dtype.width // 256)
             tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)),
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(num_rep)),
+                self.acc_dtype,
+            )
+            tmem_store_atom = cute.make_copy_atom(
+                tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(num_rep)),
                 self.acc_dtype,
             )
         else:
+            num_rep = min(32, num_warp_cols)
             tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(num_rep)),
                 self.acc_dtype,
             )
-        if cutlass.const_expr(self.mma_tiler[0] == 64):
             tmem_store_atom = cute.make_copy_atom(
-                tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(8)),
-                self.acc_dtype,
-            )
-        else:
-            tmem_store_atom = cute.make_copy_atom(
-                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)),
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(num_rep)),
                 self.acc_dtype,
             )
 
@@ -2365,8 +2379,9 @@ class Sm100BlockwiseGemmKernel:
             or (use_2cta_instrs and mma_tiler_mn[0] in [128, 256])
         ):
             is_valid = False
-        # Skip invalid mma tile n
-        if mma_tiler_mn[1] not in (128,):
+        # Skip invalid mma tile n: a tile covers one 128-column scale block of B
+        # or lies inside one.
+        if mma_tiler_mn[1] not in (32, 64, 128):
             is_valid = False
         # Skip illegal cluster shape
         if cluster_shape_mn[0] % (2 if use_2cta_instrs else 1) != 0:

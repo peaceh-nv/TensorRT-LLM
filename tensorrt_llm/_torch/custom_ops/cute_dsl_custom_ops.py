@@ -744,6 +744,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return tactic
         return (*tactic, "m", 1)
 
+    def _sm100_fp8_blockwise_mma_tiler_candidates(
+            m: int) -> List[Tuple[int, int]]:
+        """Full-sweep MMA tiles of the SM100 FP8 blockwise GEMM / BMM.
+
+        Tiles narrower than a 128-column scale block of B (N = 32, 64) put more
+        CTAs on the weight stream of decode-sized M; they are swept only there.
+        """
+        tiles = [(64, 128), (128, 128), (256, 128)]
+        if m <= 256:
+            tiles += [(tile_m, tile_n) for tile_n in (32, 64)
+                      for tile_m in (64, 128, 256)]
+        return tiles
+
     # SM100 BF16 and FP8 blockwise GEMMs have no split-K and support both
     # rasters.
     _SM100_NVMMH_BACKEND = cutedsl_nvmmh.Backend(split_k_kind="NONE",
@@ -4987,12 +5000,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 nvmmh_tactics = _sm100_nvmmh_tactics(
                     self.__class__.kernel_class, cutlass.Float8E4M3FN,
                     cutlass.BFloat16, cutedsl_nvmmh.FP8_PRECISION, m, n, k,
-                    batch_size, 128, 128, nvmmh_config.max_tactics)
+                    batch_size, None, 128, nvmmh_config.max_tactics)
                 if nvmmh_tactics:
                     return nvmmh_tactics
 
             use_2cta_instrs_candi = [False, True]
-            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            mma_tiler_mn_candi = _sm100_fp8_blockwise_mma_tiler_candidates(m)
             cluster_shape_mn_candi = [
                 (1, 1),
                 (1, 2),
@@ -5314,12 +5327,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 nvmmh_tactics = _sm100_nvmmh_tactics(
                     self.__class__.kernel_class, cutlass.Float8E4M3FN,
                     cutlass.BFloat16, cutedsl_nvmmh.FP8_PRECISION, m, n, k,
-                    batch_size, 128, 128, nvmmh_config.max_tactics)
+                    batch_size, None, 128, nvmmh_config.max_tactics)
                 if nvmmh_tactics:
                     return nvmmh_tactics
 
             use_2cta_instrs_candi = [False, True]
-            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            mma_tiler_mn_candi = _sm100_fp8_blockwise_mma_tiler_candidates(m)
             cluster_shape_mn_candi = [
                 (1, 1),
                 (1, 2),
