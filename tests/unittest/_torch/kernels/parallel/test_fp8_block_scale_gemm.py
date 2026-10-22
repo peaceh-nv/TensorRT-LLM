@@ -211,6 +211,66 @@ def test_cute_dsl_fp8_block_scale_gemm_tile_shapes(m, monkeypatch):
 
 
 @pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100 and SM103 only. Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("m", [7, 200])
+def test_cute_dsl_fp8_block_scale_gemm_split_k(m):
+    """Split-K slices of the SM100 blockwise GEMM/BMM reduce-add into the
+    zeroed output: they match the unsplit tactic up to the BF16 rounding of
+    the partials, also under CUDA graph replay."""
+    # 8 K tiles: split 3 gives slices of 2, 3 and 3 K tiles.
+    k, n, num_groups = 1024, 384, 3
+    torch.random.manual_seed(0)
+    a = torch.randn((m, num_groups, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+    a_fp8, a_sf = torch.ops.trtllm.fp8_quantize_1x128(a[:, 0].contiguous())
+    b_fp8, b_sf = per_block_cast_to_fp8(b[0])
+    bmm_a_fp8, bmm_a_sf = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+        a)
+    bmm_b_fp8 = torch.empty_like(b, dtype=torch.float8_e4m3fn)
+    bmm_b_sf = torch.empty((num_groups, n // 128, k // 128),
+                           device="cuda",
+                           dtype=torch.float32)
+    for group_idx in range(num_groups):
+        bmm_b_fp8[group_idx], bmm_b_sf[group_idx] = per_block_cast_to_fp8(
+            b[group_idx])
+    bmm_output = torch.empty((num_groups, m, n),
+                             device="cuda",
+                             dtype=torch.bfloat16)
+
+    gemm = cute_dsl_custom_ops.CuteDSLFp8BlackwellRunner()
+    bmm = cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner()
+    gemm_inputs = [a_fp8, b_fp8, a_sf, b_sf]
+    bmm_inputs = [bmm_a_fp8, bmm_b_fp8, bmm_a_sf, bmm_b_sf, bmm_output]
+    for base in ((False, (128, 128), (1, 1)), (True, (256, 128), (2, 1))):
+        unsplit = gemm(gemm_inputs, tactic=base)
+        bmm(bmm_inputs, tactic=base)
+        unsplit_bmm = bmm_output.clone()
+        for split_k in (2, 3, 8):
+            tactic = base + ("m", 1, split_k)
+            # Every slice rounds its partial to BF16 before the atomic add
+            # (outputs are ~32 here, one BF16 ulp is 0.25).
+            output = gemm(gemm_inputs, tactic=tactic)
+            assert calc_diff(output, unsplit) < 1e-4, tactic
+            torch.testing.assert_close(output, unsplit, rtol=2e-2, atol=1.0)
+
+            bmm_output.fill_(float("nan"))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                bmm(bmm_inputs, tactic=tactic)
+            bmm_output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert calc_diff(bmm_output, unsplit_bmm) < 1e-4, tactic
+            torch.testing.assert_close(bmm_output,
+                                       unsplit_bmm,
+                                       rtol=2e-2,
+                                       atol=1.0)
+
+
+@pytest.mark.skipif(
     getSMVersion() != 90 and getSMVersion() != 89 and getSMVersion() != 120,
     reason="The test is for Hopper and Ada only. Current SM is %d." %
     getSMVersion(),

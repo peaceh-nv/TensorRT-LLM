@@ -742,7 +742,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         The 5-field form appends the scheduler's raster ("m" or "n") and
         swizzle width to (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn);
         the 3-field form rasterizes along M without swizzle. The 6-field form
-        of the BF16 GEMM adds the split-K factor (see _sm100_tactic_split_k).
+        adds the split-K factor (see _sm100_tactic_split_k).
         """
         if not isinstance(tactic, tuple):
             return False, (128, 128), (1, 1), "m", 1
@@ -751,7 +751,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return (*tactic, "m", 1)
 
     def _sm100_tactic_split_k(tactic) -> int:
-        """Split-K factor of an SM100 BF16 GEMM tactic (1 unless 6 fields)."""
+        """Split-K factor of an SM100 BF16 / FP8 blockwise tactic (1 unless
+        6 fields)."""
         if isinstance(tactic, tuple) and len(tactic) == 6:
             return int(tactic[5])
         return 1
@@ -769,9 +770,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                       for tile_m in (64, 128, 256)]
         return tiles
 
-    # SM100 BF16 and FP8 blockwise GEMMs support both rasters. Only the BF16
-    # GEMM splits K: every slice reduce-adds its partial into the zeroed output
-    # with TMA (no workspace, no reduction launch).
+    # SM100 BF16 and FP8 blockwise GEMMs support both rasters. The BF16 GEMM
+    # and the FP8 blockwise GEMM/BMM split K: every slice reduce-adds its
+    # partial into the zeroed output with TMA (no workspace, no reduction
+    # launch).
     _SM100_NVMMH_BACKEND = cutedsl_nvmmh.Backend(split_k_kind="NONE",
                                                  supports_col_major_raster=True)
     _SM100_SPLIT_K_NVMMH_BACKEND = cutedsl_nvmmh.Backend(
@@ -5044,10 +5046,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             nvmmh_config = AutoTuner.get().nvmmh_config
             if nvmmh_config is not None:
+                # forward allocates the whole [M, N] output, so nvMMH may
+                # split K.
                 nvmmh_tactics = _sm100_nvmmh_tactics(
-                    self.__class__.kernel_class, cutlass.Float8E4M3FN,
-                    cutlass.BFloat16, cutedsl_nvmmh.FP8_PRECISION, m, n, k,
-                    batch_size, None, 128, nvmmh_config.max_tactics)
+                    self.__class__.kernel_class,
+                    cutlass.Float8E4M3FN,
+                    cutlass.BFloat16,
+                    cutedsl_nvmmh.FP8_PRECISION,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    None,
+                    128,
+                    nvmmh_config.max_tactics,
+                    allow_split_k=True)
                 if nvmmh_tactics:
                     return nvmmh_tactics
 
@@ -5107,6 +5120,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """
             (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_along,
              swizzle_size) = _parse_sm100_tactic(tactic)
+            split_k = _sm100_tactic_split_k(tactic)
             a_tensor, b_tensor, a_sf_tensor, b_sf_tensor = inputs
             m, n, k = a_tensor.shape[0], b_tensor.shape[0], b_tensor.shape[1]
             sf_m = m
@@ -5155,6 +5169,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cluster_shape_mn,
                 raster_along,
                 swizzle_size,
+                split_k,
                 self.use_tvm_ffi,
             )
             if cache_key not in self.__class__.kernel_cache:
@@ -5196,6 +5211,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn=cluster_shape_mn,
                     swizzle_size=swizzle_size,
                     raster_along_m=raster_along == "m",
+                    split_k=split_k,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -5224,6 +5240,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # Split-K slices reduce-add into C through TMA; zero it on the
+            # launch stream right before the GEMM.
+            if split_k > 1:
+                c_tensor.zero_()
 
             # launch gemm kernel
             if self.use_tvm_ffi:
@@ -5371,10 +5392,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             nvmmh_config = AutoTuner.get().nvmmh_config
             if nvmmh_config is not None:
+                # Split-K reduce-adds into the whole [B, M, N] output.
                 nvmmh_tactics = _sm100_nvmmh_tactics(
-                    self.__class__.kernel_class, cutlass.Float8E4M3FN,
-                    cutlass.BFloat16, cutedsl_nvmmh.FP8_PRECISION, m, n, k,
-                    batch_size, None, 128, nvmmh_config.max_tactics)
+                    self.__class__.kernel_class,
+                    cutlass.Float8E4M3FN,
+                    cutlass.BFloat16,
+                    cutedsl_nvmmh.FP8_PRECISION,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    None,
+                    128,
+                    nvmmh_config.max_tactics,
+                    allow_split_k=inputs[4].shape[1] == m)
                 if nvmmh_tactics:
                     return nvmmh_tactics
 
@@ -5434,6 +5465,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """
             (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_along,
              swizzle_size) = _parse_sm100_tactic(tactic)
+            split_k = _sm100_tactic_split_k(tactic)
 
             a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, c_tensor = inputs
             c_tmp = c_tensor.permute(1, 2, 0)
@@ -5483,6 +5515,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cluster_shape_mn,
                 raster_along,
                 swizzle_size,
+                split_k,
                 self.use_tvm_ffi,
             )
             if cache_key not in self.__class__.kernel_cache:
@@ -5525,6 +5558,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn=cluster_shape_mn,
                     swizzle_size=swizzle_size,
                     raster_along_m=raster_along == "m",
+                    split_k=split_k,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -5553,6 +5587,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # Split-K slices reduce-add into C through TMA; zero it on the
+            # launch stream right before the GEMM.
+            if split_k > 1:
+                c_tensor.zero_()
 
             # launch gemm kernel
             if self.use_tvm_ffi:

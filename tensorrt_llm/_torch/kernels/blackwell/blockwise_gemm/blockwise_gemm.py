@@ -167,6 +167,7 @@ class Sm100BlockwiseGemmKernel:
         cluster_shape_mn: Tuple[int, int],
         swizzle_size: int = 1,
         raster_along_m: bool = True,
+        split_k: int = 1,
     ):
         """Initializes the configuration for a Blackwell blockwise dense GEMM kernel.
 
@@ -193,6 +194,10 @@ class Sm100BlockwiseGemmKernel:
         :type swizzle_size: int
         :param raster_along_m: Whether consecutive clusters advance along M.
         :type raster_along_m: bool
+        :param split_k: Number of K slices per output tile. Every slice
+            reduce-adds its partial into C through TMA, so callers must zero C
+            before every launch.
+        :type split_k: int
         """
 
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
@@ -200,6 +205,9 @@ class Sm100BlockwiseGemmKernel:
         self.cluster_shape_mn = cluster_shape_mn
         self.swizzle_size = swizzle_size
         self.raster_along_m = raster_along_m
+        if split_k < 1:
+            raise ValueError(f"split_k must be >= 1, got {split_k}")
+        self.split_k = split_k
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
@@ -255,6 +263,20 @@ class Sm100BlockwiseGemmKernel:
         self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         # TMEM offset for final accumulator
         self.tmem_final_offset = 384
+
+    def _split_k_range(self, k_tile_cnt, l_coord):
+        """Return ``(k_tile_begin, k_tiles)`` of the split-K slice at scheduler L ``l_coord``.
+
+        Slices take balanced ranges, ``[floor(k_tile_cnt * s / split_k),
+        floor(k_tile_cnt * (s + 1) / split_k))`` for slice ``s = l_coord % split_k``,
+        so any ``split_k <= k_tile_cnt`` gives every slice at least one K tile.
+        """
+        if cutlass.const_expr(self.split_k == 1):
+            return 0, k_tile_cnt
+        split_idx = l_coord % self.split_k
+        k_tile_begin = (k_tile_cnt * split_idx) // self.split_k
+        k_tile_end = (k_tile_cnt * (split_idx + 1)) // self.split_k
+        return k_tile_begin, k_tile_end - k_tile_begin
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -500,8 +522,11 @@ class Sm100BlockwiseGemmKernel:
         tma_tensor_c = None
         c_cta_v_layout = cute.composition(cute.make_identity_layout(c.shape), self.epi_tile)
         epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
+        c_store_op = cpasync.CopyBulkTensorTileS2GOp()
+        if cutlass.const_expr(self.split_k > 1):
+            c_store_op = cpasync.CopyReduceBulkTensorTileS2GOp()
         tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
+            c_store_op,
             c,
             epi_smem_layout,
             c_cta_v_layout,
@@ -546,6 +571,7 @@ class Sm100BlockwiseGemmKernel:
             max_active_clusters,
             self.swizzle_size,
             self.raster_along_m,
+            self.split_k,
         )
 
         self.buffer_align_bytes = 1024
@@ -1049,6 +1075,16 @@ class Sm100BlockwiseGemmKernel:
                     tile_info[1],
                     tile_info[2],
                 )
+                # The scheduler's L enumerates (batch, split-K slice) pairs.
+                k_tile_begin, tile_k_tile_cnt = self._split_k_range(
+                    k_tile_cnt, mma_tile_coord_mnl[2]
+                )
+                if cutlass.const_expr(self.split_k > 1):
+                    mma_tile_coord_mnl = (
+                        mma_tile_coord_mnl[0],
+                        mma_tile_coord_mnl[1],
+                        mma_tile_coord_mnl[2] // self.split_k,
+                    )
                 #
                 # Slice to per mma tile index
                 #
@@ -1060,14 +1096,17 @@ class Sm100BlockwiseGemmKernel:
                 # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
-                if ab_producer_state.count < k_tile_cnt:
+                if ab_producer_state.count < tile_k_tile_cnt:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
                 #
                 # Tma load loop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    tAgA_k = tAgA_slice[(None, ab_producer_state.count)]
-                    tBgB_k = tBgB_slice[(None, ab_producer_state.count)]
+                for k_tile in cutlass.range(0, tile_k_tile_cnt, 1, unroll=1):
+                    k_coord = ab_producer_state.count
+                    if cutlass.const_expr(self.split_k > 1):
+                        k_coord = k_tile_begin + ab_producer_state.count
+                    tAgA_k = tAgA_slice[(None, k_coord)]
+                    tBgB_k = tBgB_slice[(None, k_coord)]
                     tAsA_pipe = tAsA[(None, ab_producer_state.index)]
                     tBsB_pipe = tBsB[(None, ab_producer_state.index)]
 
@@ -1079,7 +1118,7 @@ class Sm100BlockwiseGemmKernel:
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
-                    if ab_producer_state.count < k_tile_cnt:
+                    if ab_producer_state.count < tile_k_tile_cnt:
                         peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
 
                     # TMA load A/B
@@ -1153,6 +1192,10 @@ class Sm100BlockwiseGemmKernel:
             is_valid_tile = tile_info[3] == 1
 
             while is_valid_tile:
+                k_tile_begin, tile_k_tile_cnt = self._split_k_range(k_tile_cnt, tile_info[2])
+                l_coord = tile_info[2]
+                if cutlass.const_expr(self.split_k > 1):
+                    l_coord = tile_info[2] // self.split_k
                 #
                 # Prepare the mask for scaleA/scaleB
                 #
@@ -1172,7 +1215,7 @@ class Sm100BlockwiseGemmKernel:
                 # Peek (try_wait) SCALE buffer empty
                 scale_producer_state.reset_count()
                 peek_scale_empty_status = cutlass.Boolean(1)
-                if scale_producer_state.count < k_tile_cnt:
+                if scale_producer_state.count < tile_k_tile_cnt:
                     peek_scale_empty_status = scale_pipeline.producer_try_acquire(
                         scale_producer_state
                     )
@@ -1180,7 +1223,10 @@ class Sm100BlockwiseGemmKernel:
                 #
                 # load loop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for k_tile in cutlass.range(0, tile_k_tile_cnt, 1, unroll=1):
+                    k_coord = scale_producer_state.count
+                    if cutlass.const_expr(self.split_k > 1):
+                        k_coord = k_tile_begin + scale_producer_state.count
                     #
                     # Slice to per mma tile index
                     #
@@ -1197,8 +1243,8 @@ class Sm100BlockwiseGemmKernel:
                                 None,
                                 None,
                                 tile_info[0],
-                                scale_producer_state.count,
-                                tile_info[2],
+                                k_coord,
+                                l_coord,
                             )
                         ]
                     )
@@ -1209,8 +1255,8 @@ class Sm100BlockwiseGemmKernel:
                                 None,
                                 None,
                                 tile_info[1],
-                                scale_producer_state.count,
-                                tile_info[2],
+                                k_coord,
+                                l_coord,
                             )
                         ]
                     )
@@ -1223,8 +1269,8 @@ class Sm100BlockwiseGemmKernel:
                                 None,
                                 None,
                                 tile_info[0],
-                                scale_producer_state.count,
-                                tile_info[2],
+                                k_coord,
+                                l_coord,
                             ),
                         )
                     )
@@ -1236,8 +1282,8 @@ class Sm100BlockwiseGemmKernel:
                                 None,
                                 None,
                                 tile_info[1],
-                                scale_producer_state.count,
-                                tile_info[2],
+                                k_coord,
+                                l_coord,
                             ),
                         )
                     )
@@ -1262,7 +1308,7 @@ class Sm100BlockwiseGemmKernel:
                     # Peek (try_wait) Scale buffer empty
                     scale_producer_state.advance()
                     peek_scale_empty_status = cutlass.Boolean(1)
-                    if scale_producer_state.count < k_tile_cnt:
+                    if scale_producer_state.count < tile_k_tile_cnt:
                         peek_scale_empty_status = scale_pipeline.producer_try_acquire(
                             scale_producer_state
                         )
@@ -1336,22 +1382,23 @@ class Sm100BlockwiseGemmKernel:
             is_valid_tile = tile_info[3] == 1
 
             while is_valid_tile:
+                _, tile_k_tile_cnt = self._split_k_range(k_tile_cnt, tile_info[2])
                 # Peek (try_wait) AB buffer full for k_tile = 0
                 ab_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
-                if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
+                if ab_consumer_state.count < tile_k_tile_cnt and is_leader_cta:
                     peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
                 # Peek (try_wait) Acc buffer empty for k_tile = 0
                 acc_producer_state.reset_count()
                 peek_acc_empty_status = cutlass.Boolean(1)
-                if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
+                if ab_consumer_state.count < tile_k_tile_cnt and is_leader_cta:
                     peek_acc_empty_status = acc_pipeline.producer_try_acquire(acc_producer_state)
 
                 #
                 # Mma mainloop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for k_tile in cutlass.range(0, tile_k_tile_cnt, 1, unroll=1):
                     # Set tensor memory buffer for current tile
                     # (MMA, MMA_M, MMA_N)
                     tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
@@ -1397,7 +1444,7 @@ class Sm100BlockwiseGemmKernel:
                     # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
                     ab_consumer_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
-                    if ab_consumer_state.count < k_tile_cnt:
+                    if ab_consumer_state.count < tile_k_tile_cnt:
                         if is_leader_cta:
                             peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
@@ -1409,7 +1456,7 @@ class Sm100BlockwiseGemmKernel:
 
                     # Peek (try_wait) Acc buffer empty for k_tile = k_tile + 1
                     acc_producer_state.advance()
-                    if acc_producer_state.count < k_tile_cnt:
+                    if acc_producer_state.count < tile_k_tile_cnt:
                         if is_leader_cta:
                             peek_acc_empty_status = acc_pipeline.producer_try_acquire(
                                 acc_producer_state
@@ -1514,6 +1561,7 @@ class Sm100BlockwiseGemmKernel:
             is_valid_tile = tile_info[3] == 1
 
             while is_valid_tile:
+                _, tile_k_tile_cnt = self._split_k_range(k_tile_cnt, tile_info[2])
                 # initialize the final accumulator
                 tTR_rAcc_final.fill(0.0)
 
@@ -1528,15 +1576,15 @@ class Sm100BlockwiseGemmKernel:
 
                 scale_consumer_state.reset_count()
                 peek_scale_full_status = cutlass.Boolean(1)
-                if scale_consumer_state.count < k_tile_cnt:
+                if scale_consumer_state.count < tile_k_tile_cnt:
                     peek_scale_full_status = scale_pipeline.consumer_try_wait(scale_consumer_state)
 
                 acc_consumer_state.reset_count()
                 peek_acc_full_status = cutlass.Boolean(1)
-                if acc_consumer_state.count < k_tile_cnt:
+                if acc_consumer_state.count < tile_k_tile_cnt:
                     peek_acc_full_status = acc_pipeline.consumer_try_wait(acc_consumer_state)
 
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for k_tile in cutlass.range(0, tile_k_tile_cnt, 1, unroll=1):
                     # Set tensor memory buffer for current tile
                     # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
                     tTR_tAcc = tTR_tAcc_base[
@@ -1607,7 +1655,7 @@ class Sm100BlockwiseGemmKernel:
                     scale_consumer_state.advance()
 
                     peek_scale_full_status = cutlass.Boolean(1)
-                    if scale_consumer_state.count < k_tile_cnt:
+                    if scale_consumer_state.count < tile_k_tile_cnt:
                         peek_scale_full_status = scale_pipeline.consumer_try_wait(
                             scale_consumer_state
                         )
@@ -1619,7 +1667,7 @@ class Sm100BlockwiseGemmKernel:
                     acc_consumer_state.advance()
 
                     peek_acc_full_status = cutlass.Boolean(1)
-                    if acc_consumer_state.count < k_tile_cnt:
+                    if acc_consumer_state.count < tile_k_tile_cnt:
                         peek_acc_full_status = acc_pipeline.consumer_try_wait(acc_consumer_state)
 
                 tRT_tAcc = tRT_tAcc_base[(None, None, None, None, None, 0)]
@@ -1754,6 +1802,12 @@ class Sm100BlockwiseGemmKernel:
                     tile_info[1],
                     tile_info[2],
                 )
+                if cutlass.const_expr(self.split_k > 1):
+                    mma_tile_coord_mnl = (
+                        mma_tile_coord_mnl[0],
+                        mma_tile_coord_mnl[1],
+                        mma_tile_coord_mnl[2] // self.split_k,
+                    )
                 #
                 # Slice to per mma tile index
                 #
@@ -2259,6 +2313,7 @@ class Sm100BlockwiseGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         swizzle_size: int = 1,
         raster_along_m: bool = True,
+        split_k: int = 1,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size for the output tensor C.
 
@@ -2274,6 +2329,9 @@ class Sm100BlockwiseGemmKernel:
         :type swizzle_size: int
         :param raster_along_m: Whether consecutive clusters advance along M.
         :type raster_along_m: bool
+        :param split_k: K slices per output tile; the scheduler's L enumerates
+            (batch, slice) pairs.
+        :type split_k: int
 
         :return: A tuple containing:
             - tile_sched_params: Parameters for the persistent tile scheduler.
@@ -2283,6 +2341,12 @@ class Sm100BlockwiseGemmKernel:
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
+        if split_k > 1:
+            num_ctas_mnl = (
+                num_ctas_mnl[0],
+                num_ctas_mnl[1],
+                num_ctas_mnl[2] * split_k,
+            )
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = utils.PersistentTileSchedulerParams(
