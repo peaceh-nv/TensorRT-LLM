@@ -4999,11 +4999,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_class = Sm100BlockwiseGemmKernel
         kernel_cache = dict()
 
+        # Profile with a cold L2 like the other CuTe DSL GEMMs: a decode-sized
+        # weight fits in L2 and would otherwise rank tactics by L2 bandwidth.
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(DynamicTensorSpec(
                 0, 0, get_last_power_of_2_num_tokens_buckets,
                 last_positive_power_of_2), ),
             constraint_specs=(ConstraintSpec(2, 1, fp8_scale_infer_shape), ),
+            use_cold_l2_cache=True,
         )
 
         def __init__(self,
@@ -5349,6 +5352,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                               ConstraintSpec(
                                   4, 1,
                                   lambda input_shapes: input_shapes[0][1])),
+            use_cold_l2_cache=True,
         )
 
         def __init__(self,
@@ -9679,6 +9683,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 last_positive_power_of_2), ),
             constraint_specs=(ConstraintSpec(
                 2, 1, lambda input_shapes: input_shapes[0][1]), ),
+            use_cold_l2_cache=True,
         )
 
         def __init__(self, use_tvm_ffi: bool = True):
@@ -10110,6 +10115,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 last_positive_power_of_2), ),
             constraint_specs=(ConstraintSpec(
                 2, 0, lambda input_shapes: input_shapes[0][0]), ),
+            use_cold_l2_cache=True,
         )
 
         def __init__(self, use_tvm_ffi: bool = True):
