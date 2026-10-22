@@ -81,6 +81,44 @@ def test_merge_rankings_follows_the_ranking_score():
     assert [tactics for _, tactics in merged] == [["u0"], ["u1"]]
 
 
+def test_sm107_fp8_blockwise_tactics_map_256_row_tiles(monkeypatch):
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+    if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("The test requires SM107 CuTe DSL support.")
+    import cutlass
+
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
+
+    configs = [
+        _config(1.0, cta=(256, 128, 128), cluster=(2, 1)),
+        _config(2.0, cta=(256, 128, 128), cluster=(1, 1)),
+        _config(3.0, cta=(128, 128, 128), cluster=(2, 1)),
+    ]
+
+    def fake_query(problem, count, is_valid, backend=None, cache_key=None):
+        return [config for config in configs if is_valid(config)]
+
+    nvmmh._pairs_only_cluster_m_2.cache_clear()
+    monkeypatch.setattr(nvmmh, "library_version", lambda: "0.2.0")
+    monkeypatch.setattr(nvmmh, "query", fake_query)
+    try:
+        args = (ops.SM107BlockwiseGemmKernel, 4096, 1024, 4096, 8)
+        # A 256-row CTA tile is two 128-row MMAs sharing B (2-CTA when the
+        # cluster M is even).
+        assert ops._sm107_fp8_blockwise_nvmmh_tactics(*args, cutlass.BFloat16, 5) == [
+            (True, (512, 128, 128), (256, 128, 64), (2, 1)),
+            (False, (256, 128, 128), (128, 128, 64), (1, 1)),
+            (True, (256, 128, 128), (256, 128, 64), (2, 1)),
+        ]
+        # The fused FP8 1x128 output needs 128x128 CTA tiles.
+        assert ops._sm107_fp8_blockwise_nvmmh_tactics(
+            *args, cutlass.Float8E4M3FN, 5, fp8_quantize_1x128=True
+        ) == [(True, (256, 128, 128), (256, 128, 64), (2, 1))]
+    finally:
+        nvmmh._pairs_only_cluster_m_2.cache_clear()
+
+
 def test_query_without_library(monkeypatch):
     monkeypatch.setattr(nvmmh, "IS_NVMMH_AVAILABLE", False)
     problem = nvmmh.Problem(128, 128, 128, 1, nvmmh.BF16_PRECISION)

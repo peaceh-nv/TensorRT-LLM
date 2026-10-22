@@ -13163,23 +13163,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return tactic
             return (*tactic, True, 1)
 
-        def _sm107_fp8_blockwise_nvmmh_tactics(kernel_class, m: int, n: int,
-                                               k: int, batch_size: int, c_dtype,
-                                               max_tactics: int) -> List[Tuple]:
+        def _sm107_fp8_blockwise_nvmmh_tactics(
+                kernel_class,
+                m: int,
+                n: int,
+                k: int,
+                batch_size: int,
+                c_dtype,
+                max_tactics: int,
+                fp8_quantize_1x128: bool = False) -> List[Tuple]:
             """SM107 FP8 blockwise tactics of the top ``max_tactics`` nvMMH
             configs (tile, cluster, raster and swizzle from nvMMH).
 
-            The kernel's CTA tile is 128x128 with K=128 and an even cluster M
-            means 2-CTA MMA. It has no split-K. Its 256-row B-reuse tiles are
-            not offered: the blockwise scaling keeps a full accumulator row
-            per epilogue thread in registers, which spills at 256 rows (about
-            10x slower than the 128-row tile on every measured shape).
+            The kernel's CTA tile is 128x128 or 256x128 (two 128-row MMAs
+            sharing B) with K=128, and an even cluster M means 2-CTA MMA. It
+            has no split-K. The fused FP8 1x128 output needs 128x128 tiles.
             """
 
             def shape(config):
                 cta_m, cta_n, cta_k = config.cta
                 cluster_m, cluster_n = config.cluster
-                if (cta_k != 128 or cta_n != 128 or cta_m != 128
+                if (cta_k != 128 or cta_n != 128 or cta_m not in (128, 256)
                         or config.split_k != 1 or cluster_m not in (1, 2, 4)
                         or cluster_n not in (1, 2, 4)):
                     return None
@@ -13190,7 +13194,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         cutlass.Float8E4M3FN, cutlass.Float8E4M3FN,
                         cutlass.Float32, c_dtype, use_2cta_instrs, mma_tiler,
                         mma_inst_shape, config.cluster, m, n, k, batch_size,
-                        "k", "k", "n"):
+                        "k", "k", "n", fp8_quantize_1x128):
                     return None
                 return use_2cta_instrs, mma_tiler, mma_inst_shape
 
@@ -13200,7 +13204,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cutedsl_nvmmh.query_count(max_tactics),
                 lambda config: shape(config) is not None,
                 backend=_SM107_FP8_BLOCKWISE_NVMMH_BACKEND,
-                cache_key=("sm107_fp8_blockwise", c_dtype))
+                cache_key=("sm107_fp8_blockwise", c_dtype, fp8_quantize_1x128))
             ranked = []
             for config in configs:
                 use_2cta_instrs, mma_tiler, mma_inst_shape = shape(config)
@@ -13519,8 +13523,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if nvmmh_config is not None:
                     nvmmh_tactics = _sm107_fp8_blockwise_nvmmh_tactics(
                         self.__class__.kernel_class, m, n, k, batch_size,
-                        (cutlass.Float8E4M3FN if self.fp8_quantize_1x128 else
-                         cutlass.BFloat16), nvmmh_config.max_tactics)
+                        (cutlass.Float8E4M3FN
+                         if self.fp8_quantize_1x128 else cutlass.BFloat16),
+                        nvmmh_config.max_tactics, self.fp8_quantize_1x128)
                     if nvmmh_tactics:
                         return nvmmh_tactics
 
