@@ -9670,9 +9670,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # Output element type; subclasses override (see the FP8-out runner).
         c_dtype = cutlass.BFloat16
 
-        tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 1, get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2), ), )
+        # The output's M (inputs[2] dim 1) tracks input0's bucketed M, so the
+        # profiling-cache key does not embed the raw tuning-time M (which every
+        # other runtime M would miss).
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 1, get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2), ),
+            constraint_specs=(ConstraintSpec(
+                2, 1, lambda input_shapes: input_shapes[0][1]), ),
+        )
 
         def __init__(self, use_tvm_ffi: bool = True):
             super().__init__()
@@ -10096,9 +10103,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_class = PersistentDenseGemmKernel
         kernel_cache = dict()
 
-        tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2), ), )
+        # See CuteDSLBf16BlackwellBmmRunner.tuning_config.
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 0, get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2), ),
+            constraint_specs=(ConstraintSpec(
+                2, 0, lambda input_shapes: input_shapes[0][0]), ),
+        )
 
         def __init__(self, use_tvm_ffi: bool = True):
             super().__init__()
@@ -10134,8 +10146,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             b_major = "k"
             c_major = "n"
 
-            # Split-K reduce-adds into the whole [M, N] output; dynamic tuning
-            # may bucket input M while leaving the output at the full M.
+            # Split-K reduce-adds into the whole [M, N] output, so the output
+            # must hold exactly the M rows of A.
             allow_split_k = inputs[2].shape[0] == m
 
             nvmmh_config = AutoTuner.get().nvmmh_config
