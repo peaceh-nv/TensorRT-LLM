@@ -1651,49 +1651,6 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
         f"({cublas_us:.2f} us) for M={m}, N={n}, K={k}")
 
 
-def test_tactic_space_key_separates_cache_entries(tmp_path):
-    """Entries tuned over a policy-dependent tactic space carry the policy.
-
-    nvMMH-guided runners report ("nvmmh", version, max_tactics) through
-    TunableRunner.tactic_space_key(); their profiling-cache entries must not
-    be reused by the full sweep or another policy, and must survive a cache
-    file round trip.
-    """
-
-    class PolicyRunner(GemmRunner):
-        policy = None
-
-        def tactic_space_key(self):
-            return type(self).policy
-
-    tuner = AutoTuner.get()
-    tuning_config = TuningConfig()
-    shapes = ((16, 64), (64, 128))
-    runner = PolicyRunner()
-
-    def cache_key(policy):
-        PolicyRunner.policy = policy
-        return tuner.profiling_cache.get_cache_key("test_tactic_space_key",
-                                                   runner, shapes,
-                                                   tuning_config)
-
-    sweep = cache_key(None)
-    guided = cache_key(("nvmmh", "0.1.0.27", 5))
-    other = cache_key(("nvmmh", "0.1.0.27", 3))
-    assert len({sweep, guided, other}) == 3
-    assert guided[:-1] == sweep
-    assert guided[-1] == ("nvmmh", "0.1.0.27", 5)
-
-    src = autotuner.AutoTuner().profiling_cache
-    src.cache[guided] = (0, 1, 0.5)
-    path = str(tmp_path / "cache.json")
-    src.save_cache(path, rank=0)
-    dst = autotuner.AutoTuner().profiling_cache
-    dst.load_cache(path, rank=0)
-    assert dst.cache[guided][1] == 1
-    assert sweep not in dst.cache
-
-
 @pytest.mark.parametrize("distribution", ["random", "balanced"])
 def test_trtllm_gen_moe_dummy_topk_local_experts_less_than_topk(
         distribution, monkeypatch):

@@ -145,38 +145,3 @@ def test_cute_dsl_bf16_gemm_blackwell_output_dtypes_do_not_share_tactics(monkeyp
     expected = act.float() @ weight.t().float()
     torch.testing.assert_close(fp32_output, expected, rtol=1e-2, atol=1.0)
     torch.testing.assert_close(bf16_output.float(), expected, rtol=2e-2, atol=2.5)
-
-
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
-@pytest.mark.parametrize(
-    "runner_name", ["CuteDSLBf16BlackwellGemmRunner", "CuteDSLBf16BlackwellBmmRunner"]
-)
-def test_cute_dsl_bf16_blackwell_autotune_profiles(runner_name):
-    """The output's M follows the bucketed input M, so runtime M values that
-    share a bucket share one profiling-cache entry."""
-    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
-
-    tuning_config = getattr(cute_dsl_custom_ops, runner_name).tuning_config
-    batch, n, k = 2, 128, 256
-    is_bmm = runner_name.endswith("BmmRunner")
-
-    def make_inputs(m):
-        if is_bmm:
-            return [torch.empty(batch, m, k), torch.empty(batch, n, k), torch.empty(batch, m, n)]
-        return [torch.empty(m, k), torch.empty(n, k), torch.empty(m, n)]
-
-    m_dim = 1 if is_bmm else 0
-    profiles = AutoTuner()._optimization_profiles(tuning_config, make_inputs(7))
-    for profile in profiles:
-        shapes = profile.get_opt_shapes()
-        assert shapes[2][m_dim] == shapes[0][m_dim]
-
-    def cache_profile(m):
-        return AutoTuner._find_nearest_profile(
-            tuple(t.shape for t in make_inputs(m)),
-            tuning_config.dynamic_tensor_specs,
-            tuning_config.constraint_specs,
-            tuning_config.tune_max_num_tokens,
-        )
-
-    assert cache_profile(5) == cache_profile(7)

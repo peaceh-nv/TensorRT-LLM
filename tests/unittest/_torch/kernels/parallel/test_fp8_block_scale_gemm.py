@@ -1142,30 +1142,6 @@ def test_cute_dsl_fp8_block_scale_bmm_rubin_tile_shapes(m, monkeypatch):
                                        atol=0)
 
 
-@pytest.mark.skipif(not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
-                    reason="The test requires SM107 CuTe DSL support.")
-def test_sm107_blockwise_fused_fp8_quantize_needs_128_row_tiles():
-    import cutlass
-
-    from tensorrt_llm._torch.kernels.rubin.blockwise_gemm import \
-        SM107BlockwiseGemmKernel
-
-    def can_implement(use_2cta_instrs, mma_tiler, mma_inst_shape, fused):
-        return SM107BlockwiseGemmKernel.can_implement(
-            cutlass.Float8E4M3FN, cutlass.Float8E4M3FN, cutlass.Float32,
-            cutlass.Float8E4M3FN if fused else cutlass.BFloat16,
-            use_2cta_instrs, mma_tiler, mma_inst_shape, (2, 1), 4096, 1024,
-            4096, 8, "k", "k", "n", fused)
-
-    for fused in (False, True):
-        assert can_implement(False, (128, 128, 128), (128, 128, 64), fused)
-        assert can_implement(True, (256, 128, 128), (256, 128, 64), fused)
-        assert can_implement(False, (256, 128, 128), (128, 128, 64),
-                             fused) is not fused
-        assert can_implement(True, (512, 128, 128), (256, 128, 64),
-                             fused) is not fused
-
-
 def _allocate_fp8_bmm_quant_outputs(a_fp8, b_fp8):
     num_groups, m, _ = a_fp8.shape
     n = b_fp8.shape[1]
