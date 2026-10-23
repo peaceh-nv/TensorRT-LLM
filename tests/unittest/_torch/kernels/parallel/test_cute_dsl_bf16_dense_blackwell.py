@@ -103,6 +103,50 @@ def test_cute_dsl_bf16_split_k_gemm_blackwell_full_sweep(monkeypatch):
     assert all(_split_k(t) == 1 for t in runner.get_valid_tactics([bucketed, weight, output], None))
 
 
+_BF16_GEMM_OP = "trtllm::cute_dsl_bf16_gemm_blackwell::gemm"
+
+
+@skip_not_sm100f
+def test_cute_dsl_bf16_gemm_blackwell_output_dtypes_do_not_share_tactics(monkeypatch):
+    """A split-K tactic tuned for FP32 output is not replayed for BF16 output
+    of the same shape, whose full sweep never splits K."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLBf16BlackwellGemmRunner
+
+    tuner = AutoTuner.get()
+    monkeypatch.setattr(tuner, "nvmmh_config", None)
+    act, weight, fp32_output = _gemm_operands(64, 256, 7168, torch.float32)
+    bf16_output = torch.empty_like(fp32_output, dtype=torch.bfloat16)
+    split_tactic = (True, (128, 128), (2, 1), "m", 1, 8)
+    fp32_runner = CuteDSLBf16BlackwellGemmRunner(output_dtype=torch.float32)
+    fp32_key = tuner.profiling_cache.get_cache_key(
+        _BF16_GEMM_OP,
+        fp32_runner,
+        tuple(t.shape for t in (act, weight, fp32_output)),
+        fp32_runner.tuning_config,
+    )
+    monkeypatch.setitem(tuner.profiling_cache.cache, fp32_key, (0, split_tactic, 1.0))
+
+    launched = []
+    forward = CuteDSLBf16BlackwellGemmRunner.forward
+
+    def recording_forward(self, inputs, tactic):
+        launched.append((inputs[2].dtype, tactic))
+        return forward(self, inputs, tactic=tactic)
+
+    monkeypatch.setattr(CuteDSLBf16BlackwellGemmRunner, "forward", recording_forward)
+    torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(act, weight, fp32_output)
+    torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(act, weight, bf16_output)
+    torch.cuda.synchronize()
+
+    assert launched[0] == (torch.float32, split_tactic)
+    bf16_dtype, bf16_tactic = launched[1]
+    assert bf16_dtype == torch.bfloat16
+    assert not isinstance(bf16_tactic, tuple) or _split_k(bf16_tactic) == 1
+    expected = act.float() @ weight.t().float()
+    torch.testing.assert_close(fp32_output, expected, rtol=1e-2, atol=1.0)
+    torch.testing.assert_close(bf16_output.float(), expected, rtol=2e-2, atol=2.5)
+
+
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
 @pytest.mark.parametrize(
     "runner_name", ["CuteDSLBf16BlackwellGemmRunner", "CuteDSLBf16BlackwellBmmRunner"]

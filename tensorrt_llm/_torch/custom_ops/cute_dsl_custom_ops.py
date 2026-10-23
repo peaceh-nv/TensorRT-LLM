@@ -10118,9 +10118,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             use_cold_l2_cache=True,
         )
 
-        def __init__(self, use_tvm_ffi: bool = True):
+        def __init__(self,
+                     use_tvm_ffi: bool = True,
+                     output_dtype: Optional[torch.dtype] = None):
             super().__init__()
             self.use_tvm_ffi = use_tvm_ffi
+            # The tactic space depends on the output dtype (the full sweep
+            # splits K only for FP32 output, and nvMMH models the output
+            # type), so unique_id() keys the profiling cache on it.
+            self.output_dtype = output_dtype
+
+        def unique_id(self):
+            return (self.use_tvm_ffi, self.output_dtype)
 
         def tactic_space_key(self):
             return _nvmmh_tactic_space_key()
@@ -10396,7 +10405,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         tuner = AutoTuner.get()
 
-        runner = CuteDSLBf16BlackwellGemmRunner(use_tvm_ffi=use_tvm_ffi)
+        runner = CuteDSLBf16BlackwellGemmRunner(use_tvm_ffi=use_tvm_ffi,
+                                                output_dtype=output.dtype)
 
         inputs = [input, weight, output]
 
