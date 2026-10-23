@@ -801,9 +801,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ``cta_tile_k`` is the kernel's fixed K tile. ``allow_split_k`` lets
         nvMMH split K (in place) up to one K tile per slice.
         """
-        if (c_dtype == cutlass.Float32
-                and precision == cutedsl_nvmmh.BF16_PRECISION):
-            precision = cutedsl_nvmmh.BF16_FP32_OUTPUT_PRECISION
+        if precision == cutedsl_nvmmh.BF16_PRECISION:
+            if c_dtype == cutlass.Float32:
+                precision = cutedsl_nvmmh.BF16_FP32_OUTPUT_PRECISION
+            elif c_dtype == cutlass.Float8E4M3FN:
+                precision = cutedsl_nvmmh.BF16_FP8_OUTPUT_PRECISION
 
         def shape(config):
             cta_m, cta_n, cta_k = config.cta
@@ -9722,8 +9724,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if nvmmh_config is not None:
                 nvmmh_tactics = _sm100_nvmmh_tactics(
                     self.__class__.kernel_class, cutlass.BFloat16,
-                    cutlass.BFloat16, cutedsl_nvmmh.BF16_PRECISION, m, n, k,
-                    batch_size, None, 64, nvmmh_config.max_tactics)
+                    self.__class__.c_dtype, cutedsl_nvmmh.BF16_PRECISION, m, n,
+                    k, batch_size, None, 64, nvmmh_config.max_tactics)
                 if nvmmh_tactics:
                     return nvmmh_tactics
 
