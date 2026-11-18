@@ -29,6 +29,7 @@ speculation or with vanilla MTP to the split target (``no-spec``,
 ``vanilla-mtp``).
 """
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -38,6 +39,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm._torch.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import AUTOTUNER_NVMMH_MAX_TACTICS_ENV
 
 from ....conftest import llm_models_root
 from .._env import scoped_env_overrides
@@ -49,8 +51,11 @@ _MODEL_PATH = f"{llm_models_root()}/GLM-5.3-Flash-NVFP4"
 @contextmanager
 def _llm(model_path: str, speculative_config=None, **llm_kwargs) -> Iterator[LLM]:
     """The engine at TP4/EP4, with the targets' step contract checked on the ranks."""
+    overrides = {MODELING_V2_VALIDATE_ENV: "1"}
+    if AUTOTUNER_NVMMH_MAX_TACTICS_ENV not in os.environ:
+        overrides[AUTOTUNER_NVMMH_MAX_TACTICS_ENV] = "5"
     with (
-        scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
+        scoped_env_overrides(overrides) as rank_env,
         LLM(
             model_path,
             tensor_parallel_size=4,

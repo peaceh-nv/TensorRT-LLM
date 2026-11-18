@@ -33,6 +33,7 @@ from tensorrt_llm.llmapi.llm_args import (
     PrefillCudaGraphBackend,
     TorchCompileConfig,
     TorchLlmArgs,
+    autotuner_nvmmh_config_from_env,
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -405,6 +406,8 @@ def configure_autotuner_nvmmh(llm_args: TorchLlmArgs) -> None:
     """
     # Partial test doubles of TorchLlmArgs may omit the field.
     config = getattr(llm_args, "autotuner_nvmmh_config", None)
+    if config is None:
+        config = autotuner_nvmmh_config_from_env()
     if config is None and AutoTuner._instance is None:
         return
     if config is not None:

@@ -241,6 +241,8 @@ class EPDVariant:
 class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
     """VideoMME accuracy over llmapi encode / prefill-decode (E/PD) disaggregation."""
 
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
+
     SAMPLING_PARAMS = SamplingParams(
         max_tokens=VideoMME.MAX_OUTPUT_LEN,
         truncate_prompt_tokens=VideoMME.MAX_INPUT_LEN,

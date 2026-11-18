@@ -2631,6 +2631,9 @@ class Nvfp4GemmConfig(StrictBaseModel):
         description="List of backends to consider for auto-selection.")
 
 
+AUTOTUNER_NVMMH_MAX_TACTICS_ENV = "TLLM_AUTOTUNER_NVMMH_MAX_TACTICS"
+
+
 class AutoTunerNvMMHConfig(StrictBaseModel):
     """nvMatmulHeuristics (nvMMH) guidance for the CuTe DSL GEMM/BMM autotuner.
 
@@ -2647,6 +2650,30 @@ class AutoTunerNvMMHConfig(StrictBaseModel):
         "Each configuration expands into one tactic per combination of the knobs nvMatmulHeuristics "
         "does not model (e.g. SM107 prefetch, scheduler and mixed-cluster variants), so the number "
         "of profiled tactics can be several times max_tactics.")
+
+
+def autotuner_nvmmh_config_from_env() -> Optional[AutoTunerNvMMHConfig]:
+    """Read an optional fallback nvMatmulHeuristics policy from the environment.
+
+    Unset, empty, or ``"0"`` disables the fallback and leaves full-sweep
+    autotuning active; a positive integer selects ``max_tactics``.
+    """
+    raw = os.environ.get(AUTOTUNER_NVMMH_MAX_TACTICS_ENV)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        max_tactics = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"{AUTOTUNER_NVMMH_MAX_TACTICS_ENV} must be a non-negative "
+            f"integer, got {raw!r}.") from exc
+    if max_tactics < 0:
+        raise ValueError(
+            f"{AUTOTUNER_NVMMH_MAX_TACTICS_ENV} must be a non-negative "
+            f"integer, got {raw!r}.")
+    if max_tactics == 0:
+        return None
+    return AutoTunerNvMMHConfig(max_tactics=max_tactics)
 
 
 class AttentionDpConfig(StrictBaseModel):
@@ -10007,6 +10034,12 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "ray_placement_config is only supported with orchestrator_type='ray'"
             )
+        return self
+
+    @model_validator(mode='after')
+    def resolve_autotuner_nvmmh_config(self) -> 'TorchLlmArgs':
+        if self.autotuner_nvmmh_config is None:
+            self.autotuner_nvmmh_config = autotuner_nvmmh_config_from_env()
         return self
 
     @model_validator(mode='after')

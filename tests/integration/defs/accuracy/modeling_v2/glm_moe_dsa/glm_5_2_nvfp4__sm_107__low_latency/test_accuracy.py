@@ -600,6 +600,8 @@ def run_accuracy_case(
 
 
 class TestModelingV2Glm52Nvfp4Sm107LowLatency(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
+
     @skip_no_rubin
     @pytest.mark.skip_less_mpi_world_size(16)
     def test_mtp7_gsm8k_and_acceptance(self, tmp_path: Path):

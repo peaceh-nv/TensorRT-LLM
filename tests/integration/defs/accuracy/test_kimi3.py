@@ -44,6 +44,7 @@ from .accuracy_core import (
 
 @pytest.mark.timeout(10800)
 class TestKimiK3(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "moonshotai/Kimi-K3"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
     DSPARK_MODEL_PATH = f"{llm_models_root()}/RadixArk-Kimi-K3-DSpark"
@@ -447,6 +448,7 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
     the NVFP4 requant rather than TestKimiK3's MXFP4 weights.
     """
 
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "moonshotai/Kimi-K3"
     # The NVFP4 requant, not the MXFP4 weights TestKimiK3 runs: it is the
     # Blackwell deployment precision and nothing else covers it end to end.

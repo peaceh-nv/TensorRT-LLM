@@ -122,6 +122,7 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
     test_modeling_v2_deepseek_default_shards.py.
     """
 
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "deepseek-ai/DeepSeek-R1-0528"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
 

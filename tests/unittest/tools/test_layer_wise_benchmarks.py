@@ -151,6 +151,7 @@ def test_deepseek_r1_ctx_dep(llm_root, world_size):
         ],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
+            "TLLM_AUTOTUNER_NVMMH_MAX_TACTICS": "5",
             **os.environ,
             "NP": f"{world_size:d}",
             "PROFILE_DIR": profile_dir,
@@ -182,6 +183,7 @@ def test_deepseek_r1_ctx_tep(llm_root, world_size):
         ],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
+            "TLLM_AUTOTUNER_NVMMH_MAX_TACTICS": "5",
             **os.environ,
             "NP": f"{world_size:d}",
             "PROFILE_DIR": profile_dir,
@@ -391,6 +393,7 @@ def test_performance_alignment(llm_root, world_size):
         ],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
+            "TLLM_AUTOTUNER_NVMMH_MAX_TACTICS": "5",
             **os.environ,
             "MODEL": model_root / "DeepSeek-V3-Lite" / "nvfp4_moe_only",
             "NP": f"{world_size:d}",

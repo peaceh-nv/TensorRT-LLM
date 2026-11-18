@@ -1379,9 +1379,14 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
 def test_multi_nodes_eval(model_path: str, llm_api_config: Optional[dict[str,
                                                                          Any]],
                           tp_size: int, pp_size: int, ep_size: int,
-                          eval_task: str, mmlu_dataset_root: str) -> None:
+                          eval_task: str, mmlu_dataset_root: str,
+                          monkeypatch: pytest.MonkeyPatch) -> None:
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm.evaluate import MMLU
+    from tensorrt_llm.llmapi.llm_args import AUTOTUNER_NVMMH_MAX_TACTICS_ENV
+
+    if AUTOTUNER_NVMMH_MAX_TACTICS_ENV not in os.environ:
+        monkeypatch.setenv(AUTOTUNER_NVMMH_MAX_TACTICS_ENV, "5")
 
     mmlu_threshold = 81.5
     llm_kwargs = dict(llm_api_config or {})

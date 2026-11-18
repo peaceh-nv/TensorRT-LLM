@@ -1120,6 +1120,7 @@ def run_parallel_test(model_name: str,
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_hopper
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
@@ -2277,6 +2278,7 @@ class TestGPTOSS20B(LlmapiAccuracyTestHarness):
 @pytest.mark.timeout(10800)
 @skip_pre_blackwell
 class TestKimiK25(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "moonshotai/Kimi-K2.5"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
 
@@ -2666,6 +2668,7 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "zai-org/GLM-5.2"
     MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
 
@@ -2811,6 +2814,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_blackwell
 class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash"
 
@@ -2994,6 +2998,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(140000)
 class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     # Same target model as TestDeepSeekV4Flash above (identical architecture,
     # 43 layers), so the accuracy reference is looked up under the plain
     # V4-Flash entry. This checkpoint additionally ships the DSpark drafter

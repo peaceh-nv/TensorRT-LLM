@@ -43,7 +43,11 @@ import requests
 from test_common.cluster_env import apply_ucx_env
 
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
-from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, LlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    AUTOTUNER_NVMMH_MAX_TACTICS_ENV,
+    DSparkDecodingConfig,
+    LlmArgs,
+)
 from tensorrt_llm.llmapi.tokenizer import DeepseekV4Tokenizer
 
 from ..conftest import llm_models_root, skip_pre_blackwell
@@ -198,6 +202,7 @@ def _worker_env() -> dict[str, str]:
             "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET": "1073741824",
         }
     )
+    env.setdefault(AUTOTUNER_NVMMH_MAX_TACTICS_ENV, "5")
     apply_ucx_env(
         env,
         cluster_name=os.environ.get("SLURM_CLUSTER_NAME", ""),

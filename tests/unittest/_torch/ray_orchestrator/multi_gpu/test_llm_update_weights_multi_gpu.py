@@ -1644,7 +1644,11 @@ def test_llm_partial_update_weights_qwen35_mxfp8():
         "fp8",
     ],
 )
-def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
+def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype, monkeypatch):
+    from tensorrt_llm.llmapi.llm_args import AUTOTUNER_NVMMH_MAX_TACTICS_ENV
+
+    if AUTOTUNER_NVMMH_MAX_TACTICS_ENV not in os.environ:
+        monkeypatch.setenv(AUTOTUNER_NVMMH_MAX_TACTICS_ENV, "5")
     model_dir = str(llm_models_root() / model_dir)
     num_hidden_layers = 1
     hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
@@ -1705,7 +1709,11 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
         "fp8",
     ],
 )
-def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
+def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype, monkeypatch):
+    from tensorrt_llm.llmapi.llm_args import AUTOTUNER_NVMMH_MAX_TACTICS_ENV
+
+    if AUTOTUNER_NVMMH_MAX_TACTICS_ENV not in os.environ:
+        monkeypatch.setenv(AUTOTUNER_NVMMH_MAX_TACTICS_ENV, "5")
     model_dir = str(llm_models_root() / model_dir)
     num_hidden_layers = 1
     hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)

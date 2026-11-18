@@ -209,6 +209,8 @@ def _drain_adp_stats(llm: LLM) -> list[dict]:
 
 
 class TestModelingV2Glm52Nvfp4Sm107HighThroughput(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
+
     @skip_no_rubin
     @pytest.mark.skip_less_mpi_world_size(_TP_SIZE)
     @pytest.mark.parametrize("batch_size,draft_len,al_reference", _HIGH_THROUGHPUT_POINTS)

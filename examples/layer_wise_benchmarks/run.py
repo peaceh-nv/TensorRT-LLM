@@ -12,13 +12,14 @@ import nvtx
 import torch
 import yaml
 
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, NvMMHConfig, autotune
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.nccl_window_graph import (
     nccl_window_graph_capture,
     release_nccl_window_graph_owner,
 )
 from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
+from tensorrt_llm.llmapi.llm_args import autotuner_nvmmh_config_from_env
 from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.layer_wise_benchmarks.mark_utils import mark_ranges
@@ -352,6 +353,10 @@ run_pack = runner.create_run_pack(
 )
 if args.enable_autotuner:
     cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
+    nvmmh_cfg = autotuner_nvmmh_config_from_env()
+    AutoTuner.get().nvmmh_config = (
+        None if nvmmh_cfg is None else NvMMHConfig(max_tactics=nvmmh_cfg.max_tactics)
+    )
     AutoTuner.get().setup_distributed_state(mapping)
     with autotune(cache_path=cache_path):
         run_pack()

@@ -30,7 +30,8 @@ from tensorrt_llm.evaluate.audio_asr import AudioASREvaluator
 from tensorrt_llm.evaluate.interface import Evaluator
 from tensorrt_llm.llmapi import (GuidedDecodingParams, SamplingParams,
                                  SchedulingParams)
-from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+from tensorrt_llm.llmapi.llm_args import (AUTOTUNER_NVMMH_MAX_TACTICS_ENV,
+                                          DecodingBaseConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import LogitsProcessor
 
@@ -779,6 +780,7 @@ class LlmapiAccuracyTestHarness:
     # Model
     MODEL_NAME = None
     MODEL_PATH = None
+    AUTOTUNER_NVMMH_MAX_TACTICS: Optional[int] = None
 
     @pytest.fixture(autouse=True, scope="class")
     @classmethod
@@ -787,6 +789,13 @@ class LlmapiAccuracyTestHarness:
         logger.set_level("info")
         yield
         logger.set_level(original_level)
+
+    @pytest.fixture(autouse=True)
+    def _configure_autotuner_nvmmh(self, monkeypatch: pytest.MonkeyPatch):
+        if (self.AUTOTUNER_NVMMH_MAX_TACTICS is not None
+                and AUTOTUNER_NVMMH_MAX_TACTICS_ENV not in os.environ):
+            monkeypatch.setenv(AUTOTUNER_NVMMH_MAX_TACTICS_ENV,
+                               str(self.AUTOTUNER_NVMMH_MAX_TACTICS))
 
     @pytest.fixture(autouse=True)
     def _cleanup_cuda_between_tests(self):

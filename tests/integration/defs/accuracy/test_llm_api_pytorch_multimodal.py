@@ -135,6 +135,7 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
 
 @pytest.mark.skip_device_not_contain(["B200", "GB10"])
 class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "google/gemma-4-26B-A4B-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/nvidia-Gemma-4-26B-A4B-NVFP4"
     MTP_MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-26B-A4B-it-assistant"
@@ -303,6 +304,7 @@ class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
 
 
 class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "mistral/Mistral-Large-3-675B"
     MODEL_PATH = (
         f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-NVFP4/"
@@ -469,6 +471,7 @@ class TestQwen3VL(LlmapiAccuracyTestHarness):
 class TestQwen3_8_Flash_Next_VL(LlmapiAccuracyTestHarness):
     """MMMU accuracy for the composite Qwen4-Exp vision + text model."""
 
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
     MAX_NUM_TOKENS = 8192
     MAX_BATCH_SIZE = 16
@@ -599,6 +602,7 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
 
 
 class TestKimiK3(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "moonshotai/Kimi-K3"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
     MAX_NUM_TOKENS = 16384
@@ -717,6 +721,7 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
 # * GB300 may not be entirely up to date for `llm-models`, leading to repo-wide CI errors.
 @skip_post_blackwell_ultra
 class TestNanoV3Omni(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     # The score here may be lower than VLMEvalKitMcore (official) runs. This path uses
     # lm_eval's MMMU task, prompt formatting, and scoring, while VLMEvalKitMcore
     # uses MMMU_DEV_VAL with its own MCQ prompt builder, answer extraction, and

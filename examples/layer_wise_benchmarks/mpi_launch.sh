@@ -9,6 +9,9 @@ extra_args=()
 if [ -v TLLM_AUTOTUNER_CACHE_PATH ]; then
     extra_args+=(-x TLLM_AUTOTUNER_CACHE_PATH)
 fi
+if [ -v TLLM_AUTOTUNER_NVMMH_MAX_TACTICS ]; then
+    extra_args+=(-x TLLM_AUTOTUNER_NVMMH_MAX_TACTICS)
+fi
 
 set -x
 mpirun --allow-run-as-root --np $NP ${extra_args[@]+"${extra_args[@]}"} "$@"

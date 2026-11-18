@@ -231,6 +231,7 @@ class TestApertus1p5_8B(LlmapiAccuracyTestHarness):
 # Normally we should not parameterize test methods so extensively -- just test on the typical/important feature combinations.
 @skip_pre_hopper
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
@@ -1528,6 +1529,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(80000)
 class TestDeepSeekR1(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "deepseek-ai/DeepSeek-R1"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1"
 
@@ -2127,6 +2129,7 @@ DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB = 250000
 @pytest.mark.skip_device_not_contain(["GB300"])
 @pytest.mark.timeout(GSM8K_TEST_TIMEOUT)
 class TestDeepSeekV41(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4.1-Flash"
 
     @pytest.mark.parametrize("tp_size,attention_dp,nvfp4", [
@@ -2364,6 +2367,7 @@ def _run_deepseekv4_eplb(model_name,
 @pytest.mark.skip_less_device_memory(140000)
 @skip_pre_blackwell
 class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash"
 
@@ -2574,6 +2578,7 @@ _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
 @pytest.mark.skip_less_device_memory(140000)
 @skip_pre_blackwell
 class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Pro"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Pro"
     EXTRA_EVALUATOR_KWARGS = dict(
@@ -2606,6 +2611,7 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
 @pytest.mark.skip_less_device_memory(140000)
 @skip_pre_blackwell
 class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Pro"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Pro-DSpark"
     # NVFP4 export (nvidia/deepseek-v4-pro-nvfp4-dspark) with the embedded
@@ -2929,6 +2935,7 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
 @pytest.mark.timeout(10800)
 @pytest.mark.skip_less_device_memory(100000)
 class TestKimiK25(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
@@ -3493,6 +3500,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
 
 class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "Qwen3/Qwen3-30B-A3B"
 
     @skip_pre_blackwell
@@ -3842,6 +3850,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
 
 class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "Qwen3/Qwen3-235B-A22B"
 
     @skip_pre_hopper
@@ -5198,6 +5207,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 @skip_pre_hopper
 @pytest.mark.skip_less_device_memory(80000)
 class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_PATH = f"{llm_models_root()}/Qwen3-Next"
     MODEL_NAME = "Qwen3/Qwen3-Next-80B-A3B-Instruct"
 
@@ -5346,6 +5356,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
 
 
 class TestLagunaXS(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "poolside/laguna-XS.2"
     MODEL_PATH = f"{llm_models_root()}/Laguna-XS.2"
     FP8_MODEL_PATH = f"{llm_models_root()}/Laguna-XS.2-FP8"
@@ -5400,6 +5411,7 @@ class TestLagunaXS(LlmapiAccuracyTestHarness):
 
 
 class TestLagunaXS_2_1(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "poolside/Laguna-XS-2.1"
     POOLSIDE_PATH = f"{llm_models_root()}/poolside"
 
@@ -5831,6 +5843,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
 @pytest.mark.skip_less_device_memory(80000)
 @skip_pre_blackwell
 class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "Qwen/Qwen3.6-35B-A3B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3.6-35B-A3B-NVFP4"
     EXTRA_EVALUATOR_KWARGS = dict(
@@ -5930,6 +5943,7 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
 @pytest.mark.skip_less_device_memory(183000)
 @pytest.mark.timeout(14400)
 class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
     GSM8K_MAX_OUTPUT_LEN = 512
     EXTRA_EVALUATOR_KWARGS = dict(
@@ -6099,6 +6113,7 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
 
 @pytest.mark.timeout(28800)
 class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "Qwen/Qwen3.8-2.4T-A95B"
     GSM8K_MAX_OUTPUT_LEN = 512
     EXTRA_EVALUATOR_KWARGS = dict(
@@ -6243,6 +6258,7 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
 class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
     """Qwen3.8-Flash-Next: Gated-DeltaNet + QSA hybrid with MoE, PLE, and MTP3."""
 
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
     MAX_NUM_TOKENS = 8192
     MAX_BATCH_SIZE = 16
@@ -6735,6 +6751,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
 
 
 class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "mistral/Mistral-Large-3-675B"
 
     @skip_pre_blackwell
@@ -6915,6 +6932,7 @@ class TestNemotronV3Nano(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronV3Super(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
     # No thinking mode for now.
     EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
@@ -7405,6 +7423,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 # an hour before evaluation starts. A test-list TIMEOUT still takes precedence.
 @pytest.mark.timeout(7200)
 class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
+    AUTOTUNER_NVMMH_MAX_TACTICS = 5
     MODEL_NAME = "nvidia/Nemotron-Ultra-V3"
     MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"
     # No thinking mode for now.

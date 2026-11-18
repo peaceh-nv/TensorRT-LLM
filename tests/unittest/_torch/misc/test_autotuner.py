@@ -2024,16 +2024,40 @@ def test_locality_domain_runner_forwards_the_tactic_space_key():
 def test_configure_autotuner_nvmmh_installs_the_engine_policy(monkeypatch):
     from tensorrt_llm._torch.pyexecutor.engine.model_setup import \
         configure_autotuner_nvmmh
-    from tensorrt_llm.llmapi.llm_args import AutoTunerNvMMHConfig
+    from tensorrt_llm.llmapi.llm_args import (AUTOTUNER_NVMMH_MAX_TACTICS_ENV,
+                                              AutoTunerNvMMHConfig,
+                                              autotuner_nvmmh_config_from_env)
 
     tuner = AutoTuner.get()
     monkeypatch.setattr(tuner, "nvmmh_config", None)
+    monkeypatch.delenv(AUTOTUNER_NVMMH_MAX_TACTICS_ENV, raising=False)
     configure_autotuner_nvmmh(
         SimpleNamespace(autotuner_nvmmh_config=AutoTunerNvMMHConfig(
             max_tactics=7)))
     assert tuner.nvmmh_config == NvMMHConfig(max_tactics=7)
     configure_autotuner_nvmmh(SimpleNamespace(autotuner_nvmmh_config=None))
     assert tuner.nvmmh_config is None
+
+    monkeypatch.setenv(AUTOTUNER_NVMMH_MAX_TACTICS_ENV, "5")
+    assert autotuner_nvmmh_config_from_env() == AutoTunerNvMMHConfig(
+        max_tactics=5)
+    configure_autotuner_nvmmh(SimpleNamespace(autotuner_nvmmh_config=None))
+    assert tuner.nvmmh_config == NvMMHConfig(max_tactics=5)
+
+    configure_autotuner_nvmmh(
+        SimpleNamespace(autotuner_nvmmh_config=AutoTunerNvMMHConfig(
+            max_tactics=3)))
+    assert tuner.nvmmh_config == NvMMHConfig(max_tactics=3)
+
+    monkeypatch.setenv(AUTOTUNER_NVMMH_MAX_TACTICS_ENV, "0")
+    assert autotuner_nvmmh_config_from_env() is None
+    configure_autotuner_nvmmh(SimpleNamespace(autotuner_nvmmh_config=None))
+    assert tuner.nvmmh_config is None
+
+    for bad_val in ("-1", "abc"):
+        monkeypatch.setenv(AUTOTUNER_NVMMH_MAX_TACTICS_ENV, bad_val)
+        with pytest.raises(ValueError, match=AUTOTUNER_NVMMH_MAX_TACTICS_ENV):
+            autotuner_nvmmh_config_from_env()
 
 
 def test_merge_nvmmh_rankings_picks_the_lowest_scoring_head():
